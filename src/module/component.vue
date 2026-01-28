@@ -203,7 +203,8 @@ const showCleanupDialog = ref(false);
 const logs = ref<LogEntry[]>([]);
 const lastResult = ref<LastResult | null>(null);
 const presetsList = ref<Preset[]>([]);
-let abortController: AbortController | null = null;
+let sseAbortController: AbortController | null = null;
+let jobStartTime: number | null = null;
 
 const stats = ref({
 	totalFiles: 0,
@@ -264,105 +265,189 @@ async function loadStats() {
 	}
 }
 
+// Check if there's an existing job and connect to it
+async function checkExistingJob() {
+	try {
+		const response = await api.get('/thumbnails/regenerate/status');
+		const data = response.data;
+
+		if (data.status === 'running') {
+			addLog('Found running job, reconnecting...', 'info');
+			jobStartTime = new Date(data.startedAt).getTime();
+			connectToSSE();
+		} else if (data.status === 'completed' || data.status === 'cancelled' || data.status === 'error') {
+			// Show last result
+			const duration = data.completedAt
+				? Math.round((new Date(data.completedAt).getTime() - new Date(data.startedAt).getTime()) / 1000)
+				: 0;
+			lastResult.value = {
+				generated: data.progress?.generated || 0,
+				skipped: data.progress?.skipped || 0,
+				errors: data.progress?.errors || 0,
+				duration,
+			};
+			if (data.status === 'error') {
+				addLog(`Previous job ended with error: ${data.error}`, 'error');
+			}
+		}
+	} catch {
+		// No existing job or endpoint not available
+	}
+}
+
+// Connect to SSE stream for progress updates
+function connectToSSE() {
+	if (sseAbortController) {
+		sseAbortController.abort();
+	}
+
+	sseAbortController = new AbortController();
+	isRunning.value = true;
+	progress.value = 0;
+	progressText.value = 'Connecting...';
+
+	fetch('/thumbnails/regenerate/status?sse=true', {
+		credentials: 'include',
+		signal: sseAbortController.signal,
+	})
+		.then(async (response) => {
+			if (!response.ok) {
+				throw new Error(`HTTP ${response.status}`);
+			}
+
+			const reader = response.body?.getReader();
+			if (!reader) throw new Error('No response body');
+
+			const decoder = new TextDecoder();
+			let buffer = '';
+
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+
+				buffer += decoder.decode(value, { stream: true });
+				const lines = buffer.split('\n');
+				buffer = lines.pop() || '';
+
+				for (const line of lines) {
+					if (line.startsWith('data: ')) {
+						try {
+							const data = JSON.parse(line.slice(6));
+							handleSSEData(data);
+						} catch {
+							// Ignore parse errors
+						}
+					}
+				}
+			}
+		})
+		.catch((err) => {
+			if ((err as Error).name !== 'AbortError') {
+				addLog(`SSE connection failed: ${err}`, 'error');
+			}
+		})
+		.finally(() => {
+			isRunning.value = false;
+			sseAbortController = null;
+		});
+}
+
+function handleSSEData(data: any) {
+	if (data.status === 'idle') {
+		isRunning.value = false;
+		return;
+	}
+
+	if (data.status === 'completed' || data.status === 'cancelled' || data.status === 'error') {
+		isRunning.value = false;
+
+		const duration = jobStartTime
+			? Math.round((Date.now() - jobStartTime) / 1000)
+			: 0;
+
+		lastResult.value = {
+			generated: data.generated || 0,
+			skipped: data.skipped || 0,
+			errors: data.errors || 0,
+			duration,
+		};
+
+		if (data.status === 'completed') {
+			addLog(`Completed: ${data.generated} generated, ${data.skipped} skipped, ${data.errors} errors`, 'success');
+		} else if (data.status === 'cancelled') {
+			addLog('Job cancelled', 'info');
+		} else if (data.status === 'error') {
+			addLog(`Job failed: ${data.error}`, 'error');
+		}
+
+		// Log individual errors
+		if (data.failed?.length) {
+			for (const f of data.failed.slice(0, 10)) {
+				addLog(`Error: ${f.id} - ${f.error}`, 'error');
+			}
+			if (data.failed.length > 10) {
+				addLog(`... and ${data.failed.length - 10} more errors`, 'error');
+			}
+		}
+
+		return;
+	}
+
+	// Running state — update progress
+	progress.value = data.percent || 0;
+	progressText.value = `Processing ${data.processed || 0}/${data.total || 0}`;
+}
+
 async function regenerateAll() {
-	await runRegeneration({ force: forceRegenerate.value });
+	await startRegeneration({ force: forceRegenerate.value });
 }
 
 async function regeneratePreset(preset: string) {
-	await runRegeneration({ preset, force: true });
+	await startRegeneration({ preset, force: true });
 }
 
-async function runRegeneration(options: { preset?: string; force?: boolean }) {
-	isRunning.value = true;
-	progress.value = 0;
-	progressText.value = 'Starting...';
+async function startRegeneration(options: { preset?: string; force?: boolean }) {
 	lastResult.value = null;
-	abortController = new AbortController();
-
-	const startTime = Date.now();
-	let generated = 0;
-	let skipped = 0;
-	let errors = 0;
+	jobStartTime = Date.now();
 
 	addLog(`Starting regeneration${options.preset ? ` for preset "${options.preset}"` : ''}...`);
 
 	try {
-		const response = await fetch('/thumbnails/regenerate', {
-			method: 'POST',
-			headers: {
-				'Content-Type': 'application/json',
-			},
-			credentials: 'include',
-			body: JSON.stringify({
-				...options,
-				sse: true,
-			}),
-			signal: abortController.signal,
-		});
+		const response = await api.post('/thumbnails/regenerate', options);
 
-		if (!response.ok) {
-			throw new Error(`HTTP ${response.status}`);
+		if (response.status === 409) {
+			// Job already running — connect to it
+			addLog('Job already running, connecting...', 'info');
+			connectToSSE();
+			return;
 		}
 
-		const reader = response.body?.getReader();
-		if (!reader) throw new Error('No response body');
+		const { jobId, status, total } = response.data;
 
-		const decoder = new TextDecoder();
-		let buffer = '';
-
-		while (true) {
-			const { done, value } = await reader.read();
-			if (done) break;
-
-			buffer += decoder.decode(value, { stream: true });
-			const lines = buffer.split('\n');
-			buffer = lines.pop() || '';
-
-			for (const line of lines) {
-				if (line.startsWith('data: ')) {
-					try {
-						const data = JSON.parse(line.slice(6));
-
-						// Endpoint sends: { processed, total, generated, skipped, errors, percent, done?, failed? }
-						progress.value = data.percent || 0;
-						progressText.value = `Processing ${data.processed}/${data.total}`;
-						generated = data.generated || 0;
-						skipped = data.skipped || 0;
-						errors = data.errors || 0;
-
-						if (data.done) {
-							// Log errors from failed array
-							if (data.failed?.length) {
-								for (const f of data.failed) {
-									addLog(`Error: ${f.id} - ${f.error}`, 'error');
-								}
-							}
-						}
-					} catch {
-						// Ignore parse errors
-					}
-				}
-			}
+		if (status === 'completed') {
+			addLog(response.data.message || 'No files to process', 'info');
+			return;
 		}
 
-		const duration = Math.round((Date.now() - startTime) / 1000);
-		lastResult.value = { generated, skipped, errors, duration };
-		addLog(`Completed: ${generated} generated, ${skipped} skipped, ${errors} errors`, 'success');
-	} catch (err) {
-		if ((err as Error).name === 'AbortError') {
-			addLog('Operation cancelled', 'info');
-		} else {
-			addLog(`Regeneration failed: ${err}`, 'error');
+		addLog(`Job ${jobId} started: ${total} files`, 'info');
+		connectToSSE();
+	} catch (err: any) {
+		if (err.response?.status === 409) {
+			// Job already running — connect to it
+			addLog('Job already running, connecting...', 'info');
+			connectToSSE();
+			return;
 		}
-	} finally {
-		isRunning.value = false;
-		abortController = null;
+		addLog(`Failed to start regeneration: ${err}`, 'error');
 	}
 }
 
-function cancelOperation() {
-	if (abortController) {
-		abortController.abort();
+async function cancelOperation() {
+	try {
+		await api.delete('/thumbnails/regenerate');
+		addLog('Cancellation requested...', 'info');
+	} catch (err) {
+		addLog(`Failed to cancel: ${err}`, 'error');
 	}
 }
 
@@ -396,11 +481,12 @@ async function executeCleanup() {
 
 onMounted(() => {
 	loadStats();
+	checkExistingJob();
 });
 
 onUnmounted(() => {
-	if (abortController) {
-		abortController.abort();
+	if (sseAbortController) {
+		sseAbortController.abort();
 	}
 });
 </script>
