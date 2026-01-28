@@ -1,7 +1,6 @@
 import type { Router, Request, Response } from 'express';
 import type { Knex } from 'knex';
 import { loadConfig } from '../utils/config.js';
-import { isImage } from '../utils/mime.js';
 import { generateThumbnailsForFile } from '../hooks/on-upload.js';
 import { withRetry } from '../services/s3.js';
 
@@ -9,6 +8,14 @@ interface Logger {
 	info: (msg: string) => void;
 	warn: (msg: string) => void;
 	error: (msg: string) => void;
+}
+
+interface HookContext {
+	database: Knex;
+	env: Record<string, string>;
+	logger: Logger;
+	services: any;
+	getSchema: () => Promise<any>;
 }
 
 interface RegenerateRequest {
@@ -31,12 +38,9 @@ interface RegenerateProgress {
 /**
  * Register regenerate endpoint
  */
-export function registerRegenerateEndpoint(
-	router: Router,
-	database: Knex,
-	env: Record<string, string>,
-	logger: Logger
-) {
+export function registerRegenerateEndpoint(router: Router, context: HookContext) {
+	const { database, env, logger } = context;
+
 	router.post('/regenerate', async (req: Request, res: Response) => {
 		const useSSE = req.query.sse === 'true';
 		const body = req.body as RegenerateRequest;
@@ -71,12 +75,19 @@ export function registerRegenerateEndpoint(
 				: config.presets;
 
 			if (presetsToProcess.length === 0) {
-				const error = preset
-					? `Preset "${preset}" not found`
-					: 'No presets configured';
+				const error = preset ? `Preset "${preset}" not found` : 'No presets configured';
 
 				if (useSSE) {
-					sendProgress({ processed: 0, total: 0, generated: 0, skipped: 0, errors: 0, percent: 100, done: true, failed: [] });
+					sendProgress({
+						processed: 0,
+						total: 0,
+						generated: 0,
+						skipped: 0,
+						errors: 0,
+						percent: 100,
+						done: true,
+						failed: [],
+					});
 					res.end();
 				} else {
 					res.json({ error, processed: 0, generated: 0 });
@@ -146,9 +157,7 @@ export function registerRegenerateEndpoint(
 												filename_download: file.filename_download,
 												type: file.type,
 											},
-											database,
-											env,
-											logger,
+											context,
 											{ force, presets: presetsToProcess }
 										),
 									3

@@ -40,19 +40,27 @@ interface Logger {
 	error: (msg: string) => void;
 }
 
+interface HookContext {
+	database: Knex;
+	env: Record<string, string>;
+	logger: Logger;
+	services: any;
+	getSchema: () => Promise<any>;
+}
+
 /**
- * Generate thumbnails for a single file using Directus Transform API
+ * Generate thumbnails for a single file using Directus AssetsService
  */
 export async function generateThumbnailsForFile(
 	file: FilePayload,
-	database: Knex,
-	env: Record<string, string>,
-	logger: Logger,
+	context: HookContext,
 	options: { force?: boolean; presets?: ThumbnailPreset[] } = {}
 ): Promise<{ generated: number; skipped: number }> {
+	const { database, env, logger, services, getSchema } = context;
 	const config = await loadConfig(database, env);
 	const s3Config = getS3Config(env);
 	const s3Client = createS3Client(s3Config);
+	const schema = await getSchema();
 
 	const basename = getBasename(file.filename_disk);
 
@@ -62,8 +70,7 @@ export async function generateThumbnailsForFile(
 	// Use provided presets or all presets from config
 	const presetsToProcess = options.presets || config.presets;
 
-	// Generate thumbnails for each preset using Directus Transform API
-	// Format comes from preset.format (set in Directus Settings)
+	// Generate thumbnails for each preset using Directus AssetsService
 	for (const preset of presetsToProcess) {
 		const format = getPresetFormat(preset);
 		const thumbnailKey = buildThumbnailKey(s3Config.root, preset.key, basename, format);
@@ -77,20 +84,26 @@ export async function generateThumbnailsForFile(
 			continue;
 		}
 
-		// Generate thumbnail via Directus Transform API (uses built-in sharp)
-		const thumbnail = await generateThumbnail(
-			file.id,
-			preset,
-			format as 'webp' | 'jpg' | 'png' | 'avif',
-			env
-		);
+		try {
+			// Generate thumbnail via Directus AssetsService (internal API)
+			const thumbnail = await generateThumbnail(
+				file.id,
+				preset,
+				format as 'webp' | 'jpg' | 'png' | 'avif',
+				services,
+				schema
+			);
 
-		// Upload to S3
-		await uploadToS3(s3Client, s3Config.bucket, thumbnailKey, thumbnail.buffer, getMimeType(format));
+			// Upload to S3
+			await uploadToS3(s3Client, s3Config.bucket, thumbnailKey, thumbnail.buffer, getMimeType(format));
 
-		generated++;
-		if (config.verbose) {
-			logger.info(`[thumbnails] Generated: ${thumbnailKey} (${thumbnail.width}x${thumbnail.height})`);
+			generated++;
+			if (config.verbose) {
+				logger.info(`[thumbnails] Generated: ${thumbnailKey} (${thumbnail.width}x${thumbnail.height})`);
+			}
+		} catch (error: unknown) {
+			const message = error instanceof Error ? error.message : String(error);
+			logger.error(`[thumbnails] Failed to generate ${thumbnailKey}: ${message}`);
 		}
 	}
 
@@ -100,7 +113,9 @@ export async function generateThumbnailsForFile(
 /**
  * Create upload handler for files.upload hook
  */
-export function createUploadHandler(database: Knex, env: Record<string, string>, logger: Logger) {
+export function createUploadHandler(context: HookContext) {
+	const { database, env, logger } = context;
+
 	return async ({ payload, key, collection }: { payload: FilePayload; key: string; collection: string }) => {
 		try {
 			// Only handle directus_files collection
@@ -126,9 +141,7 @@ export function createUploadHandler(database: Knex, env: Record<string, string>,
 			// Use key as id (items.create provides the created record's key)
 			const file = { ...payload, id: key };
 
-			const result = await withRetry(() =>
-				generateThumbnailsForFile(file, database, env, logger)
-			);
+			const result = await withRetry(() => generateThumbnailsForFile(file, context));
 
 			logger.info(
 				`[thumbnails] Completed: ${payload.filename_disk} (generated: ${result.generated}, skipped: ${result.skipped})`
@@ -147,7 +160,9 @@ export function createUploadHandler(database: Knex, env: Record<string, string>,
  * NOTE: This handler runs AFTER the database update. Old file data
  * must be captured in the filter hook and stored via cacheOldFileData()
  */
-export function createUpdateHandler(database: Knex, env: Record<string, string>, logger: Logger) {
+export function createUpdateHandler(context: HookContext) {
+	const { database, env, logger } = context;
+
 	return async ({ payload, keys, collection }: { payload: Partial<FilePayload>; keys: string[]; collection: string }) => {
 		try {
 			// Only handle directus_files collection
@@ -185,13 +200,9 @@ export function createUpdateHandler(database: Knex, env: Record<string, string>,
 				logger.info(`[thumbnails] Deleted old thumbnails for: ${oldFileData.filename_disk}`);
 
 				// Generate new thumbnails with new file data
-				const result = await withRetry(() =>
-					generateThumbnailsForFile(newFile, database, env, logger)
-				);
+				const result = await withRetry(() => generateThumbnailsForFile(newFile, context));
 
-				logger.info(
-					`[thumbnails] Updated: ${newFile.filename_disk} (generated: ${result.generated})`
-				);
+				logger.info(`[thumbnails] Updated: ${newFile.filename_disk} (generated: ${result.generated})`);
 			}
 		} catch (error: unknown) {
 			const message = error instanceof Error ? error.message : String(error);

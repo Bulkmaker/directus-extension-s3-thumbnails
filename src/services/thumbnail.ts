@@ -9,51 +9,65 @@ export interface ProcessedThumbnail {
 
 type OutputFormat = 'webp' | 'jpg' | 'jpeg' | 'png' | 'avif';
 
+// Directus services type (passed from hook context)
+interface DirectusServices {
+	AssetsService: new (options: { schema: any; accountability?: any }) => {
+		getAsset: (
+			id: string,
+			options: {
+				transformationParams?: {
+					width?: number;
+					height?: number;
+					fit?: string;
+					format?: string;
+					quality?: number;
+					withoutEnlargement?: boolean;
+				};
+			}
+		) => Promise<{ stream: NodeJS.ReadableStream; stat: { size: number } }>;
+	};
+}
+
 /**
- * Generate thumbnail using Directus Transform API
- * This uses Directus's built-in sharp instead of bundling our own
+ * Generate thumbnail using Directus AssetsService (internal API)
+ * This uses Directus's built-in sharp without HTTP requests
  */
 export async function generateThumbnail(
 	fileId: string,
 	preset: ThumbnailPreset,
 	format: OutputFormat,
-	env: Record<string, string>
+	services: DirectusServices,
+	schema: any
 ): Promise<ProcessedThumbnail> {
-	// Build Directus assets URL with transform parameters
-	// Always use localhost for internal requests (hooks run inside Directus container)
-	const baseUrl = 'http://localhost:8055';
-	const params = new URLSearchParams({
-		width: String(preset.width),
-		height: String(preset.height),
-		fit: preset.fit || 'cover',
-		format: format === 'jpg' ? 'jpeg' : format,
-		quality: String(preset.quality || 80),
+	const { AssetsService } = services;
+
+	// Create assets service with no accountability (internal request)
+	const assetsService = new AssetsService({
+		schema,
+		accountability: null, // null = admin access for internal operations
 	});
 
-	// withoutEnlargement is default true in Directus
-	if (preset.withoutEnlargement === false) {
-		params.set('withoutEnlargement', 'false');
+	// Build transformation parameters
+	const transformationParams = {
+		width: preset.width,
+		height: preset.height,
+		fit: preset.fit || 'cover',
+		format: format === 'jpg' ? 'jpeg' : format,
+		quality: preset.quality || 80,
+		withoutEnlargement: preset.withoutEnlargement !== false,
+	};
+
+	// Get transformed asset stream
+	const { stream } = await assetsService.getAsset(fileId, {
+		transformationParams,
+	});
+
+	// Collect stream into buffer
+	const chunks: Buffer[] = [];
+	for await (const chunk of stream) {
+		chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
 	}
-
-	const url = `${baseUrl}/assets/${fileId}?${params.toString()}`;
-
-	// Use admin token for internal requests
-	// IMPORTANT: SECRET is the JWT signing key, NOT an access token
-	const token = env['ADMIN_ACCESS_TOKEN'];
-	const headers: Record<string, string> = {};
-	if (token) {
-		headers['Authorization'] = `Bearer ${token}`;
-	}
-	// Note: If no token, request will work for public files only
-
-	const response = await fetch(url, { headers });
-
-	if (!response.ok) {
-		throw new Error(`Directus transform failed: ${response.status} ${response.statusText}`);
-	}
-
-	const arrayBuffer = await response.arrayBuffer();
-	const buffer = Buffer.from(arrayBuffer);
+	const buffer = Buffer.concat(chunks);
 
 	return {
 		buffer,

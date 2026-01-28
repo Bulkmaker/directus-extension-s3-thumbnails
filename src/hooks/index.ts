@@ -3,7 +3,7 @@ import { createUploadHandler, createUpdateHandler, cacheOldFileData } from './on
 import { createDeleteHandler } from './on-delete.js';
 import { isImage } from '../utils/mime.js';
 
-export default defineHook(({ filter, action }, { database, env, logger }) => {
+export default defineHook(({ filter, action }, { database, env, logger, services, getSchema }) => {
 	// Check if S3 storage is configured
 	if (env['STORAGE_S3_DRIVER'] !== 's3') {
 		logger.info('[thumbnails] S3 storage not configured, hook disabled');
@@ -12,8 +12,10 @@ export default defineHook(({ filter, action }, { database, env, logger }) => {
 
 	logger.info('[thumbnails] Hook initialized');
 
+	// Create shared context for all handlers
+	const context = { database, env, logger, services, getSchema };
+
 	// Use files.upload for new file uploads
-	// Add small delay to ensure file is accessible via /assets/
 	action('files.upload', async (meta) => {
 		const { payload, key } = meta as { payload: { type?: string; filename_disk?: string }; key: string };
 
@@ -24,11 +26,8 @@ export default defineHook(({ filter, action }, { database, env, logger }) => {
 			return;
 		}
 
-		// Wait for file to be fully available in DB
-		await new Promise((resolve) => setTimeout(resolve, 500));
-
-		// Call upload handler
-		const handler = createUploadHandler(database, env, logger);
+		// Call upload handler (no delay needed - we use internal API now)
+		const handler = createUploadHandler(context);
 		await handler({ payload: { ...payload, id: key } as any, key, collection: 'directus_files' });
 	});
 
@@ -75,7 +74,7 @@ export default defineHook(({ filter, action }, { database, env, logger }) => {
 	});
 
 	// Use items.update on directus_files (file replaced)
-	action('items.update', createUpdateHandler(database, env, logger));
+	action('items.update', createUpdateHandler(context));
 
 	// Use items.delete on directus_files (cleanup thumbnails)
 	action('items.delete', createDeleteHandler(database, env, logger));

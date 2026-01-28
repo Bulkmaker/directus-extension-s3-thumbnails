@@ -2,7 +2,7 @@ import { defineEndpoint } from '@directus/extensions-sdk';
 import { registerRegenerateEndpoint } from './regenerate.js';
 import { registerCleanupEndpoint } from './cleanup.js';
 
-export default defineEndpoint((router, { database, env, logger }) => {
+export default defineEndpoint((router, { database, env, logger, services, getSchema }) => {
 	// Health check
 	router.get('/', (_req, res) => {
 		res.json({
@@ -12,8 +12,11 @@ export default defineEndpoint((router, { database, env, logger }) => {
 		});
 	});
 
+	// Create shared context for handlers
+	const context = { database, env, logger, services, getSchema };
+
 	// Register endpoints
-	registerRegenerateEndpoint(router, database, env, logger);
+	registerRegenerateEndpoint(router, context);
 	registerCleanupEndpoint(router, env, logger);
 
 	logger.info('[thumbnails] Endpoints registered: /thumbnails/regenerate, /thumbnails/cleanup');
