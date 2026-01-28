@@ -444,7 +444,9 @@ async function startRegeneration(options: { preset?: string; force?: boolean }) 
 
 async function cancelOperation() {
 	try {
-		await api.delete('/thumbnails/regenerate');
+		// Try to cancel both regenerate and cleanup
+		await api.delete('/thumbnails/regenerate').catch(() => {});
+		await api.post('/thumbnails/cleanup/cancel').catch(() => {});
 		addLog('Cancellation requested...', 'info');
 	} catch (err) {
 		addLog(`Failed to cancel: ${err}`, 'error');
@@ -461,21 +463,93 @@ async function executeCleanup() {
 	showCleanupDialog.value = false;
 	if (!cleanupPreset.value) return;
 
+	const presetToCleanup = cleanupPreset.value;
+	cleanupPreset.value = null;
+
 	isRunning.value = true;
-	addLog(`Deleting thumbnails for preset "${cleanupPreset.value}"...`);
+	progress.value = 0;
+	progressText.value = 'Counting files...';
+	lastResult.value = null;
+	jobStartTime = Date.now();
+
+	addLog(`Deleting thumbnails for preset "${presetToCleanup}"...`);
+
+	if (sseAbortController) {
+		sseAbortController.abort();
+	}
+	sseAbortController = new AbortController();
 
 	try {
-		const response = await api.delete('/thumbnails/cleanup', {
-			data: { preset: cleanupPreset.value },
+		const response = await fetch('/thumbnails/cleanup', {
+			method: 'DELETE',
+			headers: {
+				'Content-Type': 'application/json',
+			},
+			credentials: 'include',
+			body: JSON.stringify({
+				preset: presetToCleanup,
+				sse: true,
+			}),
+			signal: sseAbortController.signal,
 		});
 
-		const deleted = response.data?.deleted || 0;
-		addLog(`Deleted ${deleted} thumbnails for preset "${cleanupPreset.value}"`, 'success');
+		if (!response.ok) {
+			throw new Error(`HTTP ${response.status}`);
+		}
+
+		const reader = response.body?.getReader();
+		if (!reader) throw new Error('No response body');
+
+		const decoder = new TextDecoder();
+		let buffer = '';
+		let finalDeleted = 0;
+
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+
+			buffer += decoder.decode(value, { stream: true });
+			const lines = buffer.split('\n');
+			buffer = lines.pop() || '';
+
+			for (const line of lines) {
+				if (line.startsWith('data: ')) {
+					try {
+						const data = JSON.parse(line.slice(6));
+
+						progress.value = data.percent || 0;
+						progressText.value = `Deleting ${data.deleted || 0}/${data.total || 0}`;
+						finalDeleted = data.deleted || 0;
+
+						if (data.status === 'completed') {
+							const duration = jobStartTime
+								? Math.round((Date.now() - jobStartTime) / 1000)
+								: 0;
+							lastResult.value = {
+								generated: 0,
+								skipped: 0,
+								errors: 0,
+								duration,
+							};
+							addLog(`Deleted ${finalDeleted} thumbnails for preset "${presetToCleanup}"`, 'success');
+						} else if (data.status === 'cancelled') {
+							addLog('Cleanup cancelled', 'info');
+						} else if (data.status === 'error') {
+							addLog(`Cleanup failed: ${data.error}`, 'error');
+						}
+					} catch {
+						// Ignore parse errors
+					}
+				}
+			}
+		}
 	} catch (err) {
-		addLog(`Cleanup failed: ${err}`, 'error');
+		if ((err as Error).name !== 'AbortError') {
+			addLog(`Cleanup failed: ${err}`, 'error');
+		}
 	} finally {
 		isRunning.value = false;
-		cleanupPreset.value = null;
+		sseAbortController = null;
 	}
 }
 

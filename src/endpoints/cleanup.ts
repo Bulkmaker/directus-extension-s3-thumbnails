@@ -10,7 +10,22 @@ interface Logger {
 
 interface CleanupRequest {
 	preset: string;
+	sse?: boolean;
 }
+
+interface CleanupJobState {
+	id: string;
+	status: 'running' | 'completed' | 'cancelled' | 'error';
+	preset: string;
+	deleted: number;
+	total: number;
+	percent: number;
+	error?: string;
+}
+
+// Global cleanup job state
+let cleanupJob: CleanupJobState | null = null;
+let cleanupAbortController: AbortController | null = null;
 
 /**
  * Register cleanup endpoint
@@ -20,8 +35,9 @@ export function registerCleanupEndpoint(
 	env: Record<string, string>,
 	logger: Logger
 ) {
+	// DELETE /cleanup — start cleanup job
 	router.delete('/cleanup', async (req: Request, res: Response) => {
-		const { preset } = req.body as CleanupRequest;
+		const { preset, sse } = req.body as CleanupRequest;
 
 		// Check admin permission
 		const accountability = (req as Request & { accountability?: { admin?: boolean } }).accountability;
@@ -33,29 +49,152 @@ export function registerCleanupEndpoint(
 			return res.status(400).json({ error: 'preset is required' });
 		}
 
-		try {
-			const s3Config = getS3Config(env);
-			const s3Client = createS3Client(s3Config);
-
-			// Build prefix for the preset folder
-			const prefix = s3Config.root ? `${s3Config.root}/${preset}/` : `${preset}/`;
-
-			logger.info(`[thumbnails] Cleaning up preset: ${preset} (prefix: ${prefix})`);
-
-			const deleted = await deleteS3Prefix(s3Client, s3Config.bucket, prefix);
-
-			logger.info(`[thumbnails] Cleanup completed: deleted ${deleted} files from ${preset}/`);
-
-			res.json({
-				success: true,
-				preset,
-				deleted,
-				message: `Deleted ${deleted} files from ${preset}/ folder`,
+		// Check if cleanup already running
+		if (cleanupJob?.status === 'running') {
+			return res.status(409).json({
+				error: 'Cleanup already running',
+				preset: cleanupJob.preset,
 			});
-		} catch (error: unknown) {
-			const message = error instanceof Error ? error.message : String(error);
-			logger.error(`[thumbnails] Cleanup error: ${message}`);
-			res.status(500).json({ error: message });
+		}
+
+		const jobId = `cleanup-${Date.now()}`;
+		cleanupJob = {
+			id: jobId,
+			status: 'running',
+			preset,
+			deleted: 0,
+			total: 0,
+			percent: 0,
+		};
+
+		cleanupAbortController = new AbortController();
+
+		// If SSE requested, stream progress
+		if (sse) {
+			res.setHeader('Content-Type', 'text/event-stream');
+			res.setHeader('Cache-Control', 'no-cache');
+			res.setHeader('Connection', 'keep-alive');
+			res.flushHeaders();
+
+			// Send initial state
+			res.write(`data: ${JSON.stringify(cleanupJob)}\n\n`);
+
+			// Start cleanup in background
+			runCleanup(env, logger, (progress) => {
+				if (cleanupJob) {
+					cleanupJob.deleted = progress.deleted;
+					cleanupJob.total = progress.total;
+					cleanupJob.percent = progress.percent;
+					res.write(`data: ${JSON.stringify(cleanupJob)}\n\n`);
+				}
+			})
+				.then(() => {
+					if (cleanupJob && cleanupJob.status === 'running') {
+						cleanupJob.status = 'completed';
+						res.write(`data: ${JSON.stringify(cleanupJob)}\n\n`);
+					}
+					res.end();
+				})
+				.catch((err) => {
+					if (cleanupJob) {
+						cleanupJob.status = 'error';
+						cleanupJob.error = err.message;
+						res.write(`data: ${JSON.stringify(cleanupJob)}\n\n`);
+					}
+					res.end();
+				});
+		} else {
+			// Synchronous mode — wait for completion
+			try {
+				const s3Config = getS3Config(env);
+				const s3Client = createS3Client(s3Config);
+				const prefix = s3Config.root ? `${s3Config.root}/${preset}/` : `${preset}/`;
+
+				logger.info(`[thumbnails] Cleaning up preset: ${preset} (prefix: ${prefix})`);
+
+				const deleted = await deleteS3Prefix(s3Client, s3Config.bucket, prefix);
+
+				cleanupJob.status = 'completed';
+				cleanupJob.deleted = deleted;
+				cleanupJob.percent = 100;
+
+				logger.info(`[thumbnails] Cleanup completed: deleted ${deleted} files from ${preset}/`);
+
+				res.json({
+					success: true,
+					preset,
+					deleted,
+					message: `Deleted ${deleted} files from ${preset}/ folder`,
+				});
+			} catch (error: unknown) {
+				const message = error instanceof Error ? error.message : String(error);
+				cleanupJob.status = 'error';
+				cleanupJob.error = message;
+				logger.error(`[thumbnails] Cleanup error: ${message}`);
+				res.status(500).json({ error: message });
+			}
 		}
 	});
+
+	// GET /cleanup/status — get cleanup job status
+	router.get('/cleanup/status', (req: Request, res: Response) => {
+		// Check admin permission
+		const accountability = (req as Request & { accountability?: { admin?: boolean } }).accountability;
+		if (!accountability?.admin) {
+			return res.status(403).json({ error: 'Admin access required' });
+		}
+
+		if (!cleanupJob) {
+			return res.json({ status: 'idle' });
+		}
+
+		res.json(cleanupJob);
+	});
+
+	// POST /cleanup/cancel — cancel running cleanup
+	router.post('/cleanup/cancel', (req: Request, res: Response) => {
+		// Check admin permission
+		const accountability = (req as Request & { accountability?: { admin?: boolean } }).accountability;
+		if (!accountability?.admin) {
+			return res.status(403).json({ error: 'Admin access required' });
+		}
+
+		if (!cleanupJob || cleanupJob.status !== 'running') {
+			return res.json({ cancelled: false, reason: 'No running cleanup' });
+		}
+
+		if (cleanupAbortController) {
+			cleanupAbortController.abort();
+		}
+
+		cleanupJob.status = 'cancelled';
+		logger.info(`[thumbnails] Cleanup cancelled`);
+
+		res.json({ cancelled: true });
+	});
+
+	// Helper function to run cleanup
+	async function runCleanup(
+		envConfig: Record<string, string>,
+		log: Logger,
+		onProgress: (p: { deleted: number; total: number; percent: number }) => void
+	) {
+		if (!cleanupJob) return;
+
+		const s3Config = getS3Config(envConfig);
+		const s3Client = createS3Client(s3Config);
+		const prefix = s3Config.root ? `${s3Config.root}/${cleanupJob.preset}/` : `${cleanupJob.preset}/`;
+
+		log.info(`[thumbnails] Cleaning up preset: ${cleanupJob.preset} (prefix: ${prefix})`);
+
+		const deleted = await deleteS3Prefix(
+			s3Client,
+			s3Config.bucket,
+			prefix,
+			onProgress,
+			cleanupAbortController?.signal
+		);
+
+		log.info(`[thumbnails] Cleanup completed: deleted ${deleted} files from ${cleanupJob.preset}/`);
+	}
 }

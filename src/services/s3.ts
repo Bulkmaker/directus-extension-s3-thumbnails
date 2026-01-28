@@ -185,17 +185,56 @@ export async function listS3Objects(
 }
 
 /**
+ * Progress callback for delete operations
+ */
+export interface DeleteProgressCallback {
+	(progress: { deleted: number; total: number; percent: number }): void;
+}
+
+/**
  * Delete all objects with given prefix (batch delete with pagination)
  */
 export async function deleteS3Prefix(
 	client: S3Client,
 	bucket: string,
-	prefix: string
+	prefix: string,
+	onProgress?: DeleteProgressCallback,
+	signal?: AbortSignal
 ): Promise<number> {
 	let deleted = 0;
 	let continuationToken: string | undefined;
 
+	// First, count total objects (for progress)
+	let total = 0;
+	let countToken: string | undefined;
 	do {
+		if (signal?.aborted) throw new Error('Aborted');
+
+		const response = await withRetry(() =>
+			client.send(
+				new ListObjectsV2Command({
+					Bucket: bucket,
+					Prefix: prefix,
+					ContinuationToken: countToken,
+					MaxKeys: 1000,
+				})
+			)
+		);
+		total += response.Contents?.length ?? 0;
+		countToken = response.NextContinuationToken;
+	} while (countToken);
+
+	if (total === 0) {
+		onProgress?.({ deleted: 0, total: 0, percent: 100 });
+		return 0;
+	}
+
+	onProgress?.({ deleted: 0, total, percent: 0 });
+
+	// Now delete
+	do {
+		if (signal?.aborted) throw new Error('Aborted');
+
 		const response = await withRetry(() =>
 			client.send(
 				new ListObjectsV2Command({
@@ -220,6 +259,9 @@ export async function deleteS3Prefix(
 				)
 			);
 			deleted += contents.length;
+
+			const percent = Math.round((deleted / total) * 100);
+			onProgress?.({ deleted, total, percent });
 		}
 
 		continuationToken = response.NextContinuationToken;
