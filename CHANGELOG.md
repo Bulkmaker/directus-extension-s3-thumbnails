@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-01-28
+
+### Added
+- **Persistent Job State** — состояние задачи сохраняется на сервере
+  - Прогресс регенерации переживает перезагрузку страницы
+  - При повторном открытии страницы — автоматическое подключение к текущей задаче
+  - GET `/thumbnails/regenerate/status` — получение статуса + SSE
+  - DELETE `/thumbnails/regenerate` — отмена задачи
+- **Orphan Folders Detection** — поиск и удаление "сирот" на S3
+  - GET `/thumbnails/cleanup/orphans` — сканирование S3 на папки без пресетов
+  - DELETE `/thumbnails/cleanup/orphan/:folder` — удаление конкретной orphan-папки
+  - UI секция "Orphan Folders" с кнопкой Scan S3
+  - Показывает количество файлов в каждой orphan-папке
+  - Safety check: нельзя удалить папку текущего пресета
+- **Cleanup Progress Bar** — прогресс-бар для операций удаления
+  - SSE стриминг прогресса удаления
+  - Подсчёт файлов перед удалением
+
+### Changed
+- Регенерация запускается в фоне (POST возвращает jobId сразу)
+- Улучшено логирование: debug-информация при сканировании S3
+
 ## [0.3.0] - 2026-01-28
 
 ### Added
