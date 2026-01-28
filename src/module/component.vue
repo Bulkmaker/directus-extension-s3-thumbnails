@@ -291,8 +291,8 @@ async function runRegeneration(options: { preset?: string; force?: boolean }) {
 			method: 'POST',
 			headers: {
 				'Content-Type': 'application/json',
-				Authorization: `Bearer ${api.defaults.headers.common['Authorization']?.toString().replace('Bearer ', '')}`,
 			},
+			credentials: 'include',
 			body: JSON.stringify({
 				...options,
 				sse: true,
