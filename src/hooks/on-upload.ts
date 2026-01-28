@@ -1,8 +1,11 @@
 import type { Knex } from 'knex';
-import { loadConfig, getS3Config, getPresetFormat, type ThumbnailPreset } from '../utils/config.js';
+import { loadConfig, getS3Config, getPresetFormat, getNormalizedPresetConfig, computePresetConfigHash, type ThumbnailPreset } from '../utils/config.js';
 import { isImage, getMimeType, getBasename, buildThumbnailKey } from '../utils/mime.js';
-import { createS3Client, uploadToS3, existsInS3, withRetry, deleteS3Prefix } from '../services/s3.js';
+import { createS3Client, uploadToS3, existsInS3, withRetry, deleteS3Prefix, savePresetConfig, loadPresetConfig, type StoredPresetConfig } from '../services/s3.js';
 import { generateThumbnail } from '../services/thumbnail.js';
+
+// Track which presets have had their config saved in this session
+const presetConfigSaved = new Set<string>();
 
 // Cache for old file data between filter and action hooks
 // Key: fileId, Value: { filename_disk, type }
@@ -100,6 +103,29 @@ export async function generateThumbnailsForFile(
 			generated++;
 			if (config.verbose) {
 				logger.info(`[thumbnails] Generated: ${thumbnailKey} (${thumbnail.width}x${thumbnail.height})`);
+			}
+
+			// Save preset config to S3 (once per preset per session)
+			const presetCacheKey = `${s3Config.bucket}:${preset.key}`;
+			if (!presetConfigSaved.has(presetCacheKey)) {
+				try {
+					const normalizedConfig = getNormalizedPresetConfig(preset);
+					const hash = computePresetConfigHash(preset);
+					const storedConfig: StoredPresetConfig = {
+						hash,
+						config: normalizedConfig,
+						updatedAt: new Date().toISOString(),
+					};
+					await savePresetConfig(s3Client, s3Config.bucket, s3Config.root, preset.key, storedConfig);
+					presetConfigSaved.add(presetCacheKey);
+					if (config.verbose) {
+						logger.info(`[thumbnails] Saved preset config: ${preset.key} (hash: ${hash})`);
+					}
+				} catch (configError) {
+					// Non-critical error - just log and continue
+					const msg = configError instanceof Error ? configError.message : String(configError);
+					logger.warn(`[thumbnails] Failed to save preset config for ${preset.key}: ${msg}`);
+				}
 			}
 		} catch (error: unknown) {
 			const message = error instanceof Error ? error.message : String(error);

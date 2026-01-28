@@ -90,3 +90,58 @@ export function getS3Config(env: Record<string, string>) {
 		},
 	};
 }
+
+/**
+ * Normalized preset config for comparison (only fields that affect output)
+ */
+export interface NormalizedPresetConfig {
+	width: number;
+	height: number;
+	fit: string;
+	quality: number;
+	format: string;
+}
+
+/**
+ * Get normalized preset config for hashing/comparison
+ * Only includes fields that affect the generated thumbnail
+ */
+export function getNormalizedPresetConfig(preset: ThumbnailPreset): NormalizedPresetConfig {
+	return {
+		width: preset.width || 0,
+		height: preset.height || 0,
+		fit: preset.fit || 'cover',
+		quality: preset.quality || 80,
+		format: getPresetFormat(preset),
+	};
+}
+
+/**
+ * Compute a simple hash of preset config for comparison
+ * Uses JSON string hash - simple but effective
+ */
+export function computePresetConfigHash(preset: ThumbnailPreset): string {
+	const normalized = getNormalizedPresetConfig(preset);
+	const str = JSON.stringify(normalized);
+
+	// Simple hash function (djb2)
+	let hash = 5381;
+	for (let i = 0; i < str.length; i++) {
+		hash = ((hash << 5) + hash) + str.charCodeAt(i);
+		hash = hash & hash; // Convert to 32bit integer
+	}
+	return Math.abs(hash).toString(16);
+}
+
+/**
+ * Compare two preset configs to check if they're equivalent
+ */
+export function presetConfigsMatch(a: NormalizedPresetConfig, b: NormalizedPresetConfig): boolean {
+	return (
+		a.width === b.width &&
+		a.height === b.height &&
+		a.fit === b.fit &&
+		a.quality === b.quality &&
+		a.format === b.format
+	);
+}

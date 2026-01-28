@@ -1,8 +1,8 @@
 import { defineEndpoint } from '@directus/extensions-sdk';
 import { registerRegenerateEndpoint } from './regenerate.js';
 import { registerCleanupEndpoint } from './cleanup.js';
-import { loadConfig, getS3Config, getPresetFormat } from '../utils/config.js';
-import { createS3Client, countS3Objects } from '../services/s3.js';
+import { loadConfig, getS3Config, getPresetFormat, getNormalizedPresetConfig, presetConfigsMatch } from '../utils/config.js';
+import { createS3Client, countS3Objects, loadPresetConfig } from '../services/s3.js';
 
 export default defineEndpoint((router, { database, env, logger, services, getSchema }) => {
 	// Health check
@@ -34,7 +34,7 @@ export default defineEndpoint((router, { database, env, logger, services, getSch
 				.first();
 			const totalImages = Number(imageCountResult?.count ?? 0);
 
-			// Count thumbnails per preset on S3
+			// Count thumbnails per preset on S3 and check for outdated configs
 			const presetStats = await Promise.all(
 				config.presets.map(async (preset) => {
 					const prefix = s3Config.root
@@ -42,6 +42,29 @@ export default defineEndpoint((router, { database, env, logger, services, getSch
 						: `${preset.key}/`;
 					const count = await countS3Objects(s3Client, s3Config.bucket, prefix);
 					const format = getPresetFormat(preset);
+
+					// Check if preset config has changed
+					let outdated = false;
+					let storedConfigInfo: { hash: string; updatedAt: string } | null = null;
+
+					if (count > 0) {
+						// Only check if there are existing thumbnails
+						const storedConfig = await loadPresetConfig(
+							s3Client,
+							s3Config.bucket,
+							s3Config.root,
+							preset.key
+						);
+
+						if (storedConfig) {
+							const currentConfig = getNormalizedPresetConfig(preset);
+							outdated = !presetConfigsMatch(currentConfig, storedConfig.config);
+							storedConfigInfo = {
+								hash: storedConfig.hash,
+								updatedAt: storedConfig.updatedAt,
+							};
+						}
+					}
 
 					return {
 						key: preset.key,
@@ -51,12 +74,15 @@ export default defineEndpoint((router, { database, env, logger, services, getSch
 						count,
 						expected: totalImages,
 						missing: Math.max(0, totalImages - count),
+						outdated,
+						storedConfig: storedConfigInfo,
 					};
 				})
 			);
 
 			const totalThumbnails = presetStats.reduce((sum, p) => sum + p.count, 0);
 			const totalExpected = totalImages * config.presets.length;
+			const totalOutdated = presetStats.filter((p) => p.outdated).reduce((sum, p) => sum + p.count, 0);
 
 			res.json({
 				totalImages,
@@ -64,6 +90,7 @@ export default defineEndpoint((router, { database, env, logger, services, getSch
 				totalThumbnails,
 				totalExpected,
 				totalMissing: Math.max(0, totalExpected - totalThumbnails),
+				totalOutdated,
 				presets: presetStats,
 			});
 		} catch (error: unknown) {

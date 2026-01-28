@@ -38,6 +38,10 @@
 					<div class="stat-value">{{ stats.missingThumbnails }}</div>
 					<div class="stat-label">Missing Thumbnails</div>
 				</div>
+				<div class="stat-card" :class="{ 'stat-outdated': stats.outdatedThumbnails > 0 }">
+					<div class="stat-value">{{ stats.outdatedThumbnails }}</div>
+					<div class="stat-label">Outdated Thumbnails</div>
+				</div>
 			</div>
 
 			<!-- Presets List -->
@@ -47,7 +51,7 @@
 					No presets configured. Go to Settings → Files & Storage → Storage Asset Presets.
 				</div>
 				<div v-else class="presets-list">
-					<div v-for="preset in presetsList" :key="preset.key" class="preset-item">
+					<div v-for="preset in presetsList" :key="preset.key" class="preset-item" :class="{ 'preset-outdated': preset.outdated }">
 						<div class="preset-info">
 							<span class="preset-key">{{ preset.key }}</span>
 							<span class="preset-dims">{{ preset.width || '?' }}×{{ preset.height || '?' }}</span>
@@ -56,14 +60,19 @@
 								{{ preset.count || 0 }}/{{ preset.expected || 0 }}
 								<span v-if="(preset.missing || 0) > 0" class="missing-badge">-{{ preset.missing }}</span>
 							</span>
+							<span v-if="preset.outdated" class="outdated-badge">
+								<v-icon name="warning" x-small />
+								outdated
+							</span>
 						</div>
 						<v-button
 							small
-							secondary
+							:secondary="!preset.outdated"
+							:kind="preset.outdated ? 'warning' : undefined"
 							:disabled="isRunning"
 							@click="regeneratePreset(preset.key)"
 						>
-							Regenerate
+							{{ preset.outdated ? 'Regenerate!' : 'Regenerate' }}
 						</v-button>
 					</div>
 				</div>
@@ -221,6 +230,7 @@ interface Preset {
 	count?: number;
 	expected?: number;
 	missing?: number;
+	outdated?: boolean;
 }
 
 interface LogEntry {
@@ -257,6 +267,7 @@ const stats = ref({
 	expectedThumbnails: 0,
 	actualThumbnails: 0,
 	missingThumbnails: 0,
+	outdatedThumbnails: 0,
 });
 
 const presetOptions = computed(() =>
@@ -295,9 +306,11 @@ async function loadStats() {
 			expectedThumbnails: data.totalExpected || 0,
 			actualThumbnails: data.totalThumbnails || 0,
 			missingThumbnails: data.totalMissing || 0,
+			outdatedThumbnails: data.totalOutdated || 0,
 		};
 
-		addLog(`Loaded stats: ${stats.value.totalFiles} images, ${stats.value.actualThumbnails}/${stats.value.expectedThumbnails} thumbnails`);
+		const outdatedMsg = stats.value.outdatedThumbnails > 0 ? `, ${stats.value.outdatedThumbnails} outdated` : '';
+		addLog(`Loaded stats: ${stats.value.totalFiles} images, ${stats.value.actualThumbnails}/${stats.value.expectedThumbnails} thumbnails${outdatedMsg}`);
 	} catch (err) {
 		addLog(`Failed to load stats: ${err}`, 'error');
 	} finally {
@@ -747,8 +760,29 @@ onUnmounted(() => {
 	margin-left: 4px;
 }
 
+.outdated-badge {
+	background: var(--theme--danger-background);
+	color: var(--theme--danger);
+	padding: 2px 8px;
+	border-radius: 4px;
+	font-size: 11px;
+	margin-left: 8px;
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+}
+
+.preset-item.preset-outdated {
+	border: 1px solid var(--theme--danger);
+	background: var(--theme--danger-background);
+}
+
 .stat-card.stat-warning .stat-value {
 	color: var(--theme--warning);
+}
+
+.stat-card.stat-outdated .stat-value {
+	color: var(--theme--danger);
 }
 
 .actions-grid {

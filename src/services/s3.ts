@@ -343,3 +343,84 @@ export async function countS3Objects(
 
 	return count;
 }
+
+/**
+ * Preset config stored in S3 for change detection
+ */
+export interface StoredPresetConfig {
+	hash: string;
+	config: {
+		width: number;
+		height: number;
+		fit: string;
+		quality: number;
+		format: string;
+	};
+	updatedAt: string;
+}
+
+const PRESET_CONFIG_FILENAME = '.preset-config.json';
+
+/**
+ * Get the S3 key for preset config file
+ */
+export function getPresetConfigKey(root: string, presetKey: string): string {
+	const key = `${presetKey}/${PRESET_CONFIG_FILENAME}`;
+	return root ? `${root}/${key}` : key;
+}
+
+/**
+ * Save preset config to S3
+ */
+export async function savePresetConfig(
+	client: S3Client,
+	bucket: string,
+	root: string,
+	presetKey: string,
+	config: StoredPresetConfig
+): Promise<void> {
+	const key = getPresetConfigKey(root, presetKey);
+	const body = JSON.stringify(config, null, 2);
+
+	await withRetry(() =>
+		client.send(
+			new PutObjectCommand({
+				Bucket: bucket,
+				Key: key,
+				Body: body,
+				ContentType: 'application/json',
+				// No public ACL needed - this is internal metadata
+			})
+		)
+	);
+}
+
+/**
+ * Load preset config from S3
+ * Returns null if config doesn't exist
+ */
+export async function loadPresetConfig(
+	client: S3Client,
+	bucket: string,
+	root: string,
+	presetKey: string
+): Promise<StoredPresetConfig | null> {
+	const key = getPresetConfigKey(root, presetKey);
+
+	try {
+		const response = await client.send(
+			new GetObjectCommand({
+				Bucket: bucket,
+				Key: key,
+			})
+		);
+
+		const body = await response.Body?.transformToString();
+		if (!body) return null;
+
+		return JSON.parse(body) as StoredPresetConfig;
+	} catch {
+		// File doesn't exist or parse error
+		return null;
+	}
+}
