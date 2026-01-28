@@ -2,38 +2,41 @@
 
 All notable changes to this project will be documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
-## [0.1.0-alpha.1] - 2026-01-28
+## [0.2.0] - 2026-01-28
 
 ### Added
+- **Thumbnails Panel Interface** — презентационное поле для отображения миниатюр в форме редактирования файла
+  - Превью миниатюры
+  - Название пресета и размеры
+  - Кнопка копирования URL
+  - Ссылка на S3
+- **Endpoint `/thumbnails/config`** — возвращает публичную часть S3 конфигурации для фронтенда
+- **Поддержка `FILES_DOMAIN`** — кастомный CDN домен вместо прямого S3 URL
 
-- **Hook: files.upload** — автоматическая генерация миниатюр при загрузке изображений
-- **Hook: items.update** — перегенерация при замене файла (с удалением старых миниатюр)
-- **Hook: items.delete** — удаление миниатюр при удалении файла
-- **Endpoint: POST /thumbnails/regenerate** — массовая регенерация с поддержкой SSE
-- **Endpoint: DELETE /thumbnails/cleanup** — удаление всех миниатюр конкретного пресета
-- **ACL: public-read** — миниатюры доступны напрямую с S3 без Directus
-- Использование Directus Transform API (без bundled Sharp)
-- Фильтрация пресетов > 5000px (защита от timeout)
-- Retry с exponential backoff для S3 операций
-- Пагинация в regenerate endpoint (защита от OOM)
+### Changed
+- Обновлена структура bundle: добавлен entry для interface
 
-### Architecture
+### Configuration
+Для использования кастомного домена добавьте в env:
+```env
+FILES_DOMAIN=files.example.com
+```
 
-- Миниатюры загружаются в S3 с `ACL: public-read`
-- Формат файла определяется `preset.format` из Directus Settings
-- Структура S3: `{preset}/{filename}.{format}`
+Добавьте домен в CSP (docker-compose.backend.yml):
+```yaml
+CONTENT_SECURITY_POLICY_DIRECTIVES__IMG_SRC: "'self' data: blob: https://files.example.com ..."
+```
 
-### Known Limitations
+## [0.1.0] - 2026-01-28
 
-- `ADMIN_ACCESS_TOKEN` требуется для приватных файлов
-- Hardcoded `localhost:8055` для Transform API
-- 500ms delay перед генерацией (race condition mitigation)
+### Added
+- **Hook `files.upload`** — автоматическая генерация миниатюр при загрузке изображений
+- **Hook `items.update`** — перегенерация при замене файла
+- **Hook `items.delete`** — удаление миниатюр из S3 при удалении файла
+- **Endpoint `/thumbnails/regenerate`** — массовая перегенерация с SSE прогрессом
+- **Endpoint `/thumbnails/cleanup`** — удаление миниатюр для конкретного пресета
 
-### Not Implemented (v2)
-
-- Watermark
-- Сжатие оригиналов
-- Множественные форматы на пресет
+### Technical
+- Использует внутренний Directus AssetsService для трансформации
+- S3 upload с retry логикой (exponential backoff)
+- Все миниатюры с `public-read` ACL и Cache-Control 1 год

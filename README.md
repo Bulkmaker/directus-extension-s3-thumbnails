@@ -95,29 +95,37 @@ Settings → Files & Storage → Storage Asset Presets:
 ### 2. ENV переменные
 
 ```bash
-# Обязательно для приватных файлов
-ADMIN_ACCESS_TOKEN=your-static-token
+# Кастомный CDN домен (опционально)
+FILES_DOMAIN=files.example.ru
 
-# Опционально: verbose логирование
+# Verbose логирование
 THUMBNAILS_VERBOSE=true
+```
+
+### 3. CSP Configuration
+
+Добавьте CDN домен в Content Security Policy (docker-compose.backend.yml):
+
+```yaml
+CONTENT_SECURITY_POLICY_DIRECTIVES__IMG_SRC: "'self' data: blob: https://files.example.ru ..."
 ```
 
 ---
 
 ## Архитектура
 
-### Генерация через Directus Transform API
+### Генерация через внутренний Directus AssetsService
 
-Расширение НЕ использует Sharp напрямую. Вместо этого оно вызывает встроенный Transform API Directus:
+Расширение использует внутренний Directus AssetsService напрямую (не HTTP запросы):
 
 ```
 1. Hook: files.upload срабатывает
-2. GET /assets/{id}?width=480&height=270&format=jpeg
+2. AssetsService.getAsset(id, transformationParams)
 3. Directus генерирует миниатюру через Sharp
 4. Результат загружается в S3 с ACL: public-read
 ```
 
-Это гарантирует совместимость версий Sharp с Directus.
+Это гарантирует совместимость версий Sharp с Directus и работает внутри процесса без сетевых вызовов.
 
 ### Hooks
 
@@ -132,8 +140,24 @@ THUMBNAILS_VERBOSE=true
 
 | Метод | URL | Назначение |
 |-------|-----|------------|
+| GET | `/thumbnails/` | Health check |
+| GET | `/thumbnails/config` | S3/CDN config для фронтенда |
 | POST | `/thumbnails/regenerate` | Массовая регенерация |
 | DELETE | `/thumbnails/cleanup` | Удаление пресета |
+
+### Interface (Thumbnails Panel)
+
+Presentation-поле для `directus_files` — показывает сгенерированные миниатюры прямо в форме редактирования файла:
+- Превью миниатюры
+- Название пресета и размеры
+- Кнопка копирования URL
+- Прямая ссылка на S3/CDN
+
+**Установка:**
+1. Settings → Data Model → directus_files
+2. Create Field → Presentation → "Thumbnails Panel"
+3. Key: `thumbnails`
+4. Save
 
 ---
 
@@ -267,11 +291,20 @@ curl -X POST .../thumbnails/regenerate \
 
 ## Статус реализации
 
+### v1 (MVP)
 - [x] Hook: files.upload
 - [x] Hook: items.update (с filter для старого имени)
 - [x] Hook: items.delete
 - [x] Endpoint: regenerate (с пагинацией и SSE)
 - [x] Endpoint: cleanup
+- [x] Endpoint: config (для фронтенда)
 - [x] ACL: public-read для миниатюр
-- [ ] Watermark (v2)
-- [ ] Сжатие оригиналов (v2)
+
+### v1.1 (Interface)
+- [x] Thumbnails Panel — презентационное поле
+- [x] Поддержка FILES_DOMAIN для кастомного CDN
+
+### v2 (Planned)
+- [ ] Watermark
+- [ ] Сжатие оригиналов
+- [ ] Module для массовой работы с миниатюрами

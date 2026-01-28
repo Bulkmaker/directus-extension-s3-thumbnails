@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Directus extension that auto-generates image thumbnails on file upload and stores them in S3 with public access. This removes Directus from the media delivery chain — frontend (Nuxt) fetches images directly from S3.
 
-**Type:** Bundle extension (Hook + Endpoint)
+**Type:** Bundle extension (Hook + Endpoint + Interface)
 **Directus:** ^10.0.0 || ^11.0.0
 
 ## Commands
@@ -33,12 +33,15 @@ src/
 │   ├── on-upload.ts    # files.upload + items.update handlers
 │   └── on-delete.ts    # items.delete cleanup
 ├── endpoints/
-│   ├── index.ts        # Endpoint registration
+│   ├── index.ts        # Endpoint registration + /config
 │   ├── regenerate.ts   # POST /thumbnails/regenerate (SSE progress)
 │   └── cleanup.ts      # DELETE /thumbnails/cleanup
+├── interface/
+│   ├── index.ts        # Interface registration (presentation)
+│   └── component.vue   # Vue 3 component for thumbnails panel
 ├── services/
 │   ├── s3.ts           # S3 operations with retry logic
-│   └── thumbnail.ts    # Sharp image processing
+│   └── thumbnail.ts    # Directus AssetsService wrapper
 └── utils/
     ├── config.ts       # Load presets from Directus settings
     └── mime.ts         # MIME helpers, S3 key builders
@@ -47,9 +50,9 @@ src/
 ### Workflow
 
 1. **File Upload** → `files.upload` hook triggered
-2. **Generate thumbnails** via Directus Transform API (`GET /assets/{id}?width=...`)
+2. **Generate thumbnails** via internal Directus AssetsService
 3. **Upload to S3** with `ACL: public-read`
-4. **Frontend** fetches directly from S3 (no Directus proxy)
+4. **Frontend** fetches directly from S3/CDN (no Directus proxy)
 
 ### Hooks
 
@@ -65,8 +68,23 @@ src/
 | Method | URL | Purpose |
 |--------|-----|---------|
 | GET | `/thumbnails/` | Health check |
+| GET | `/thumbnails/config` | S3 public config for frontend |
 | POST | `/thumbnails/regenerate` | Batch regenerate with SSE progress |
 | DELETE | `/thumbnails/cleanup` | Delete thumbnails for a preset |
+
+### Interface (Thumbnails Panel)
+
+Presentation-поле для `directus_files` — показывает сгенерированные миниатюры:
+- Превью миниатюры
+- Название пресета и размеры (например, `16-9mini 480×270`)
+- Кнопка копирования URL
+- Прямая ссылка на S3/CDN
+
+**Установка:**
+1. Settings → Data Model → directus_files
+2. Create Field → Presentation → "Thumbnails Panel"
+3. Key: `thumbnails`
+4. Save
 
 ## Configuration
 
@@ -86,11 +104,23 @@ Uses Directus S3 settings (`STORAGE_S3_*`). Extension-specific:
 
 ```bash
 THUMBNAILS_VERBOSE=false    # Verbose logging
-ADMIN_ACCESS_TOKEN=...      # Required for private files
+FILES_DOMAIN=files.example.com  # Custom CDN domain (optional)
+```
+
+Если `FILES_DOMAIN` указан, URL миниатюр будут `https://files.example.com/{preset}/{file}.jpg`
+вместо прямого S3 URL.
+
+### CSP Configuration
+
+Добавьте домен в Content Security Policy (docker-compose.backend.yml):
+
+```yaml
+CONTENT_SECURITY_POLICY_DIRECTIVES__IMG_SRC: "'self' data: blob: https://files.example.com ..."
 ```
 
 ## Key Implementation Details
 
+- **Internal API:** Использует Directus AssetsService напрямую (не HTTP запросы)
 - **S3 Retry:** Exponential backoff (1s → 2s → 4s, max 3 attempts)
 - **ACL:** All thumbnails `public-read`, Cache-Control 1 year
 - **Preset Filter:** Skips presets with dimensions > 5000px
@@ -101,14 +131,13 @@ ADMIN_ACCESS_TOKEN=...      # Required for private files
 
 ```bash
 # Check logs
-docker logs directus | grep thumbnails
+docker logs brusmir.ru-directus --tail 50 -f | grep thumbnails
 
-# Verify S3 structure
-aws s3 ls s3://bucket/ --recursive
+# Test config endpoint
+curl http://localhost:8055/thumbnails/config
 
-# Test regenerate endpoint
-curl -X POST https://cms.example.com/thumbnails/regenerate \
-  -H "Authorization: Bearer $TOKEN"
+# Verify thumbnail exists
+curl -I https://files.example.com/16-9mini/{file-id}.jpg
 ```
 
 ## Deployment
@@ -135,7 +164,7 @@ npm run build
 ./deploy.sh
 
 # 2. Локально: закоммитить в docker репо
-cd ../../../docker  # путь к docker репозиторию
+cd ../../docker  # путь к docker репозиторию
 git add directus/extensions/
 git commit -m "chore: update thumbnails-generator extension"
 git push origin main
@@ -144,7 +173,8 @@ git push origin main
 ssh brusmir
 cd /var/opt/docker
 git pull
-docker compose -f docker-compose.backend.yml restart directus
+cd docker
+docker compose -f docker-compose.backend.yml --env-file env/prod.env up -d directus
 ```
 
 ### SSH доступ
@@ -155,20 +185,21 @@ ssh brusmir
 
 **Структура на сервере:**
 - `/var/opt/docker/` — Docker Compose стек (клон docker репозитория)
+- `/var/opt/docker/docker/` — docker-compose файлы и extensions
 
 ### После деплоя на сервере
 
 ```bash
 # Перейти в директорию проекта
-cd /var/opt/docker
+cd /var/opt/docker/docker
 
-# Перезапустить Directus
-docker compose -f docker-compose.backend.yml restart directus
+# Пересоздать контейнер (чтобы подхватить новые env)
+docker compose -f docker-compose.backend.yml --env-file env/prod.env up -d directus
 
 # Проверить логи
-docker logs brusmir-directus --tail 50 -f | grep thumbnails
+docker logs brusmir.ru-directus --tail 50 -f | grep thumbnails
 ```
 
 ## Platform Note
 
-Расширение не использует Sharp напрямую — миниатюры генерируются через Directus Transform API. Поэтому нет нативных зависимостей и можно компилировать на любой платформе.
+Расширение использует внутренний Directus AssetsService для трансформации изображений. Нет внешних нативных зависимостей (Sharp и т.д.) — можно компилировать на любой платформе.
