@@ -191,7 +191,15 @@ export function registerCleanupEndpoint(
 			// Get folders from S3
 			const s3Config = getS3Config(env);
 			const s3Client = createS3Client(s3Config);
+
+			// Debug: log S3 config
+			logger.info(`[thumbnails] Scanning S3: bucket=${s3Config.bucket}, root="${s3Config.root || '(empty)'}"`);
+			logger.info(`[thumbnails] Configured presets: ${Array.from(presetKeys).join(', ')}`);
+
 			const s3Folders = await listS3Folders(s3Client, s3Config.bucket, s3Config.root || '');
+
+			// Debug: log found folders
+			logger.info(`[thumbnails] Found S3 folders: ${s3Folders.length > 0 ? s3Folders.join(', ') : '(none)'}`);
 
 			// Find orphans (folders that don't match any preset)
 			const orphans: Array<{ folder: string; count: number }> = [];
@@ -202,6 +210,7 @@ export function registerCleanupEndpoint(
 					const prefix = s3Config.root ? `${s3Config.root}/${folder}/` : `${folder}/`;
 					const count = await countS3Objects(s3Client, s3Config.bucket, prefix);
 					orphans.push({ folder, count });
+					logger.info(`[thumbnails] Orphan folder: ${folder} (${count} files)`);
 				}
 			}
 
@@ -211,6 +220,10 @@ export function registerCleanupEndpoint(
 				presets: Array.from(presetKeys),
 				s3Folders,
 				orphans,
+				debug: {
+					bucket: s3Config.bucket,
+					root: s3Config.root || '(empty)',
+				},
 			});
 		} catch (error: unknown) {
 			const message = error instanceof Error ? error.message : String(error);
