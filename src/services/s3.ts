@@ -269,3 +269,77 @@ export async function deleteS3Prefix(
 
 	return deleted;
 }
+
+/**
+ * List all folder prefixes in S3 bucket (one level deep)
+ */
+export async function listS3Folders(
+	client: S3Client,
+	bucket: string,
+	rootPrefix: string
+): Promise<string[]> {
+	const folders: Set<string> = new Set();
+	let continuationToken: string | undefined;
+
+	// Ensure root prefix ends with /
+	const prefix = rootPrefix ? (rootPrefix.endsWith('/') ? rootPrefix : `${rootPrefix}/`) : '';
+
+	do {
+		const response = await withRetry(() =>
+			client.send(
+				new ListObjectsV2Command({
+					Bucket: bucket,
+					Prefix: prefix,
+					Delimiter: '/',
+					ContinuationToken: continuationToken,
+				})
+			)
+		);
+
+		// CommonPrefixes contains the "folders"
+		for (const cp of response.CommonPrefixes ?? []) {
+			if (cp.Prefix) {
+				// Extract folder name from prefix
+				// e.g., "root/16-9mini/" -> "16-9mini"
+				const folderPath = cp.Prefix.replace(prefix, '').replace(/\/$/, '');
+				if (folderPath) {
+					folders.add(folderPath);
+				}
+			}
+		}
+
+		continuationToken = response.NextContinuationToken;
+	} while (continuationToken);
+
+	return Array.from(folders);
+}
+
+/**
+ * Count objects in S3 prefix
+ */
+export async function countS3Objects(
+	client: S3Client,
+	bucket: string,
+	prefix: string
+): Promise<number> {
+	let count = 0;
+	let continuationToken: string | undefined;
+
+	do {
+		const response = await withRetry(() =>
+			client.send(
+				new ListObjectsV2Command({
+					Bucket: bucket,
+					Prefix: prefix,
+					ContinuationToken: continuationToken,
+					MaxKeys: 1000,
+				})
+			)
+		);
+
+		count += response.Contents?.length ?? 0;
+		continuationToken = response.NextContinuationToken;
+	} while (continuationToken);
+
+	return count;
+}

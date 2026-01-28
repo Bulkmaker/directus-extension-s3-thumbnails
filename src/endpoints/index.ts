@@ -37,7 +37,7 @@ export default defineEndpoint((router, { database, env, logger, services, getSch
 
 	// Register endpoints
 	registerRegenerateEndpoint(router, context);
-	registerCleanupEndpoint(router, env, logger);
+	registerCleanupEndpoint(router, env, logger, database);
 
-	logger.info('[thumbnails] Endpoints registered: /thumbnails/regenerate, /thumbnails/cleanup');
+	logger.info('[thumbnails] Endpoints registered: /thumbnails/regenerate, /thumbnails/cleanup, /thumbnails/cleanup/orphans');
 });

@@ -1,6 +1,7 @@
 import type { Router, Request, Response } from 'express';
-import { getS3Config } from '../utils/config.js';
-import { createS3Client, deleteS3Prefix } from '../services/s3.js';
+import type { Knex } from 'knex';
+import { getS3Config, loadConfig } from '../utils/config.js';
+import { createS3Client, deleteS3Prefix, listS3Folders, countS3Objects } from '../services/s3.js';
 
 interface Logger {
 	info: (msg: string) => void;
@@ -33,7 +34,8 @@ let cleanupAbortController: AbortController | null = null;
 export function registerCleanupEndpoint(
 	router: Router,
 	env: Record<string, string>,
-	logger: Logger
+	logger: Logger,
+	database: Knex
 ) {
 	// DELETE /cleanup — start cleanup job
 	router.delete('/cleanup', async (req: Request, res: Response) => {
@@ -171,6 +173,97 @@ export function registerCleanupEndpoint(
 		logger.info(`[thumbnails] Cleanup cancelled`);
 
 		res.json({ cancelled: true });
+	});
+
+	// GET /cleanup/orphans — find folders on S3 that don't match any preset
+	router.get('/cleanup/orphans', async (req: Request, res: Response) => {
+		// Check admin permission
+		const accountability = (req as Request & { accountability?: { admin?: boolean } }).accountability;
+		if (!accountability?.admin) {
+			return res.status(403).json({ error: 'Admin access required' });
+		}
+
+		try {
+			// Get current presets
+			const config = await loadConfig(database, env);
+			const presetKeys = new Set(config.presets.map((p) => p.key));
+
+			// Get folders from S3
+			const s3Config = getS3Config(env);
+			const s3Client = createS3Client(s3Config);
+			const s3Folders = await listS3Folders(s3Client, s3Config.bucket, s3Config.root || '');
+
+			// Find orphans (folders that don't match any preset)
+			const orphans: Array<{ folder: string; count: number }> = [];
+
+			for (const folder of s3Folders) {
+				if (!presetKeys.has(folder)) {
+					// Count files in orphan folder
+					const prefix = s3Config.root ? `${s3Config.root}/${folder}/` : `${folder}/`;
+					const count = await countS3Objects(s3Client, s3Config.bucket, prefix);
+					orphans.push({ folder, count });
+				}
+			}
+
+			logger.info(`[thumbnails] Found ${orphans.length} orphan folders on S3`);
+
+			res.json({
+				presets: Array.from(presetKeys),
+				s3Folders,
+				orphans,
+			});
+		} catch (error: unknown) {
+			const message = error instanceof Error ? error.message : String(error);
+			logger.error(`[thumbnails] Orphan scan error: ${message}`);
+			res.status(500).json({ error: message });
+		}
+	});
+
+	// DELETE /cleanup/orphan/:folder — delete specific orphan folder
+	router.delete('/cleanup/orphan/:folder', async (req: Request, res: Response) => {
+		const { folder } = req.params;
+
+		// Check admin permission
+		const accountability = (req as Request & { accountability?: { admin?: boolean } }).accountability;
+		if (!accountability?.admin) {
+			return res.status(403).json({ error: 'Admin access required' });
+		}
+
+		if (!folder) {
+			return res.status(400).json({ error: 'folder is required' });
+		}
+
+		// Safety check: make sure it's not a current preset
+		const config = await loadConfig(database, env);
+		const presetKeys = new Set(config.presets.map((p) => p.key));
+
+		if (presetKeys.has(folder)) {
+			return res.status(400).json({
+				error: `"${folder}" is a current preset, not an orphan`,
+			});
+		}
+
+		try {
+			const s3Config = getS3Config(env);
+			const s3Client = createS3Client(s3Config);
+			const prefix = s3Config.root ? `${s3Config.root}/${folder}/` : `${folder}/`;
+
+			logger.info(`[thumbnails] Deleting orphan folder: ${folder} (prefix: ${prefix})`);
+
+			const deleted = await deleteS3Prefix(s3Client, s3Config.bucket, prefix);
+
+			logger.info(`[thumbnails] Orphan cleanup completed: deleted ${deleted} files from ${folder}/`);
+
+			res.json({
+				success: true,
+				folder,
+				deleted,
+			});
+		} catch (error: unknown) {
+			const message = error instanceof Error ? error.message : String(error);
+			logger.error(`[thumbnails] Orphan delete error: ${message}`);
+			res.status(500).json({ error: message });
+		}
 	});
 
 	// Helper function to run cleanup

@@ -98,6 +98,40 @@
 				</div>
 			</div>
 
+			<!-- Orphan Folders Section -->
+			<div class="section">
+				<h2 class="section-title">
+					Orphan Folders
+					<v-button x-small secondary :disabled="scanningOrphans" @click="scanOrphans">
+						<v-icon name="search" x-small />
+						Scan S3
+					</v-button>
+				</h2>
+				<div v-if="scanningOrphans" class="empty-state">
+					Scanning S3 folders...
+				</div>
+				<div v-else-if="orphanFolders.length === 0" class="empty-state">
+					No orphan folders found. Click "Scan S3" to check.
+				</div>
+				<div v-else class="orphans-list">
+					<div v-for="orphan in orphanFolders" :key="orphan.folder" class="orphan-item">
+						<div class="orphan-info">
+							<span class="orphan-name">{{ orphan.folder }}</span>
+							<span class="orphan-count">{{ orphan.count }} files</span>
+						</div>
+						<v-button
+							small
+							secondary
+							kind="danger"
+							:disabled="isRunning"
+							@click="deleteOrphan(orphan.folder)"
+						>
+							Delete
+						</v-button>
+					</div>
+				</div>
+			</div>
+
 			<!-- Progress Section -->
 			<div v-if="isRunning || lastResult" class="section">
 				<h2 class="section-title">Progress</h2>
@@ -215,6 +249,14 @@ const stats = ref({
 const presetOptions = computed(() =>
 	presetsList.value.map((p) => ({ text: p.key, value: p.key }))
 );
+
+// Orphan folders state
+interface OrphanFolder {
+	folder: string;
+	count: number;
+}
+const scanningOrphans = ref(false);
+const orphanFolders = ref<OrphanFolder[]>([]);
 
 function addLog(message: string, type: 'info' | 'success' | 'error' = 'info') {
 	const now = new Date();
@@ -553,6 +595,44 @@ async function executeCleanup() {
 	}
 }
 
+async function scanOrphans() {
+	scanningOrphans.value = true;
+	orphanFolders.value = [];
+
+	try {
+		const response = await api.get('/thumbnails/cleanup/orphans');
+		orphanFolders.value = response.data.orphans || [];
+
+		if (orphanFolders.value.length === 0) {
+			addLog('No orphan folders found', 'info');
+		} else {
+			addLog(`Found ${orphanFolders.value.length} orphan folder(s)`, 'info');
+		}
+	} catch (err) {
+		addLog(`Failed to scan orphans: ${err}`, 'error');
+	} finally {
+		scanningOrphans.value = false;
+	}
+}
+
+async function deleteOrphan(folder: string) {
+	isRunning.value = true;
+	addLog(`Deleting orphan folder "${folder}"...`);
+
+	try {
+		const response = await api.delete(`/thumbnails/cleanup/orphan/${encodeURIComponent(folder)}`);
+		const deleted = response.data.deleted || 0;
+		addLog(`Deleted ${deleted} files from orphan folder "${folder}"`, 'success');
+
+		// Remove from list
+		orphanFolders.value = orphanFolders.value.filter((o) => o.folder !== folder);
+	} catch (err) {
+		addLog(`Failed to delete orphan: ${err}`, 'error');
+	} finally {
+		isRunning.value = false;
+	}
+}
+
 onMounted(() => {
 	loadStats();
 	checkExistingJob();
@@ -776,5 +856,37 @@ onUnmounted(() => {
 .header-icon {
 	--v-button-background-color: var(--theme--primary-background);
 	--v-button-color: var(--theme--primary);
+}
+
+.orphans-list {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+
+.orphan-item {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 12px 16px;
+	background: var(--theme--danger-background);
+	border-radius: var(--theme--border-radius);
+	border: 1px solid var(--theme--danger);
+}
+
+.orphan-info {
+	display: flex;
+	align-items: center;
+	gap: 16px;
+}
+
+.orphan-name {
+	font-weight: 600;
+	color: var(--theme--danger);
+}
+
+.orphan-count {
+	color: var(--theme--foreground-subdued);
+	font-size: 14px;
 }
 </style>
