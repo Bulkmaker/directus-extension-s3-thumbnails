@@ -36,6 +36,11 @@
         "type": "endpoint",
         "name": "thumbnails",
         "source": "src/endpoints/index.ts"
+      },
+      {
+        "type": "interface",
+        "name": "thumbnails-panel",
+        "source": "src/interface/index.ts"
       }
     ],
     "host": "^10.0.0 || ^11.0.0"
