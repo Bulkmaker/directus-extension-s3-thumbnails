@@ -42,8 +42,8 @@ export function registerRegenerateEndpoint(router: Router, context: HookContext)
 	const { database, env, logger } = context;
 
 	router.post('/regenerate', async (req: Request, res: Response) => {
-		const useSSE = req.query.sse === 'true';
-		const body = req.body as RegenerateRequest;
+		const body = req.body as RegenerateRequest & { sse?: boolean };
+		const useSSE = req.query.sse === 'true' || body.sse === true;
 		const { preset, force = false, fileIds } = body;
 
 		// Check admin permission

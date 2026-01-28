@@ -323,20 +323,20 @@ async function runRegeneration(options: { preset?: string; force?: boolean }) {
 					try {
 						const data = JSON.parse(line.slice(6));
 
-						if (data.type === 'progress') {
-							progress.value = Math.round((data.current / data.total) * 100);
-							progressText.value = `Processing ${data.current}/${data.total}: ${data.file || ''}`;
-						} else if (data.type === 'file') {
-							if (data.status === 'generated') generated++;
-							else if (data.status === 'skipped') skipped++;
-							else if (data.status === 'error') {
-								errors++;
-								addLog(`Error: ${data.file} - ${data.error}`, 'error');
+						// Endpoint sends: { processed, total, generated, skipped, errors, percent, done?, failed? }
+						progress.value = data.percent || 0;
+						progressText.value = `Processing ${data.processed}/${data.total}`;
+						generated = data.generated || 0;
+						skipped = data.skipped || 0;
+						errors = data.errors || 0;
+
+						if (data.done) {
+							// Log errors from failed array
+							if (data.failed?.length) {
+								for (const f of data.failed) {
+									addLog(`Error: ${f.id} - ${f.error}`, 'error');
+								}
 							}
-						} else if (data.type === 'complete') {
-							generated = data.generated || generated;
-							skipped = data.skipped || skipped;
-							errors = data.errors || errors;
 						}
 					} catch {
 						// Ignore parse errors
