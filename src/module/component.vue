@@ -31,8 +31,12 @@
 					<div class="stat-label">Presets</div>
 				</div>
 				<div class="stat-card">
-					<div class="stat-value">{{ stats.expectedThumbnails }}</div>
-					<div class="stat-label">Expected Thumbnails</div>
+					<div class="stat-value">{{ stats.actualThumbnails }}</div>
+					<div class="stat-label">Generated Thumbnails</div>
+				</div>
+				<div class="stat-card" :class="{ 'stat-warning': stats.missingThumbnails > 0 }">
+					<div class="stat-value">{{ stats.missingThumbnails }}</div>
+					<div class="stat-label">Missing Thumbnails</div>
 				</div>
 			</div>
 
@@ -48,6 +52,10 @@
 							<span class="preset-key">{{ preset.key }}</span>
 							<span class="preset-dims">{{ preset.width || '?' }}×{{ preset.height || '?' }}</span>
 							<span class="preset-format">{{ preset.format || 'webp' }}</span>
+							<span class="preset-count" :class="{ 'preset-missing': (preset.missing || 0) > 0 }">
+								{{ preset.count || 0 }}/{{ preset.expected || 0 }}
+								<span v-if="(preset.missing || 0) > 0" class="missing-badge">-{{ preset.missing }}</span>
+							</span>
 						</div>
 						<v-button
 							small
@@ -210,6 +218,9 @@ interface Preset {
 	format?: string;
 	fit?: string;
 	quality?: number;
+	count?: number;
+	expected?: number;
+	missing?: number;
 }
 
 interface LogEntry {
@@ -244,6 +255,8 @@ const stats = ref({
 	totalFiles: 0,
 	presets: 0,
 	expectedThumbnails: 0,
+	actualThumbnails: 0,
+	missingThumbnails: 0,
 });
 
 const presetOptions = computed(() =>
@@ -270,36 +283,21 @@ function addLog(message: string, type: 'info' | 'success' | 'error' = 'info') {
 async function loadStats() {
 	loading.value = true;
 	try {
-		// Load presets
-		const settingsResponse = await api.get('/settings', {
-			params: { fields: ['storage_asset_presets'] },
-		});
-		const presets: Preset[] = settingsResponse.data.data?.storage_asset_presets || [];
+		// Load stats from dedicated endpoint (includes S3 thumbnail counts)
+		const statsResponse = await api.get('/thumbnails/stats');
+		const data = statsResponse.data;
 
-		// Filter valid presets (skip huge dimensions)
-		const MAX_DIMENSION = 5000;
-		presetsList.value = presets.filter((p) => {
-			const w = p.width || 0;
-			const h = p.height || 0;
-			return w < MAX_DIMENSION && h < MAX_DIMENSION;
-		});
-
-		// Count image files
-		const filesResponse = await api.get('/files', {
-			params: {
-				filter: { type: { _starts_with: 'image/' } },
-				aggregate: { count: '*' },
-			},
-		});
-		const totalFiles = filesResponse.data.data?.[0]?.count || 0;
+		presetsList.value = data.presets || [];
 
 		stats.value = {
-			totalFiles,
-			presets: presetsList.value.length,
-			expectedThumbnails: totalFiles * presetsList.value.length,
+			totalFiles: data.totalImages || 0,
+			presets: data.totalPresets || 0,
+			expectedThumbnails: data.totalExpected || 0,
+			actualThumbnails: data.totalThumbnails || 0,
+			missingThumbnails: data.totalMissing || 0,
 		};
 
-		addLog(`Loaded stats: ${totalFiles} images, ${presetsList.value.length} presets`);
+		addLog(`Loaded stats: ${stats.value.totalFiles} images, ${stats.value.actualThumbnails}/${stats.value.expectedThumbnails} thumbnails`);
 	} catch (err) {
 		addLog(`Failed to load stats: ${err}`, 'error');
 	} finally {
@@ -728,6 +726,29 @@ onUnmounted(() => {
 	border-radius: 4px;
 	font-size: 12px;
 	text-transform: uppercase;
+}
+
+.preset-count {
+	color: var(--theme--foreground-subdued);
+	font-size: 14px;
+	font-family: var(--theme--fonts--monospace--font-family);
+}
+
+.preset-count.preset-missing {
+	color: var(--theme--warning);
+}
+
+.missing-badge {
+	background: var(--theme--warning-background);
+	color: var(--theme--warning);
+	padding: 1px 6px;
+	border-radius: 4px;
+	font-size: 11px;
+	margin-left: 4px;
+}
+
+.stat-card.stat-warning .stat-value {
+	color: var(--theme--warning);
 }
 
 .actions-grid {
