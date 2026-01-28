@@ -41,6 +41,11 @@
         "type": "interface",
         "name": "thumbnails-panel",
         "source": "src/interface/index.ts"
+      },
+      {
+        "type": "module",
+        "name": "thumbnails-manager",
+        "source": "src/module/index.ts"
       }
     ],
     "host": "^10.0.0 || ^11.0.0"
