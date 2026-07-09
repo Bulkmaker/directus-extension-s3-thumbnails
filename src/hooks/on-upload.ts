@@ -129,7 +129,13 @@ export async function generateThumbnailsForFile(
 			}
 		} catch (error: unknown) {
 			const message = error instanceof Error ? error.message : String(error);
-			logger.error(`[thumbnails] Failed to generate ${thumbnailKey}: ${message}`);
+			const e = error as { name?: string; Code?: string; $metadata?: { httpStatusCode?: number } };
+			// DEBUG: сырые детали S3-ошибки + конфиг (наличие кредов, не значения)
+			logger.error(
+				`[thumbnails] Failed to generate ${thumbnailKey}: ${message} | name=${e?.name} code=${e?.Code} http=${e?.$metadata?.httpStatusCode}`
+				+ ` | creds=${!!s3Config.credentials.accessKeyId}/${!!s3Config.credentials.secretAccessKey}`
+				+ ` region=${s3Config.region} endpoint=${s3Config.endpoint} bucket=${s3Config.bucket} root="${s3Config.root}"`
+			);
 		}
 	}
 
