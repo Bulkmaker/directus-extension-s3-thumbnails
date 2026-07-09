@@ -44,7 +44,7 @@ export async function generateThumbnail(
 	// Create assets service with no accountability (internal request)
 	const assetsService = new AssetsService({
 		schema,
-		accountability: null, // null = admin access for internal operations
+		accountability: { admin: true, role: null, user: null }, // admin-bypass (null=public в Directus 11 → forbidden)
 	});
 
 	// Build transformation parameters
