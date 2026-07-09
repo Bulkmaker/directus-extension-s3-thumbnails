@@ -19398,9 +19398,7 @@ async function generateThumbnailsForFile(file, context, options = {}) {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const e = error;
-      logger.error(
-        `[thumbnails] Failed to generate ${thumbnailKey}: ${message} | name=${e?.name} code=${e?.Code} http=${e?.$metadata?.httpStatusCode} | creds=${!!s3Config.credentials.accessKeyId}/${!!s3Config.credentials.secretAccessKey} region=${s3Config.region} endpoint=${s3Config.endpoint} bucket=${s3Config.bucket} root="${s3Config.root}"`
-      );
+      logger.error(`[thumbnails] Failed to generate ${thumbnailKey}: ${message}${e?.name ? ` (${e.name})` : ""}`);
     }
   }
   return { generated, skipped };
