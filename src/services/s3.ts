@@ -44,8 +44,27 @@ export async function withRetry<T>(
 }
 
 /**
- * Upload buffer to S3 with public-read access
- * Files are publicly accessible without Directus proxy
+ * Один раз узнав, что бэкенд запрещает per-object ACL (напр. Beget S3 при
+ * включённой публичной bucket-политике), перестаём его отправлять — иначе
+ * каждый PutObject падает "AccessDenied". Кэшируем, чтобы не тормозить
+ * массовую регенерацию повторными отказами.
+ */
+let aclDenied = false;
+
+function isAccessDenied(err: unknown): boolean {
+	const e = err as { name?: string; Code?: string; $metadata?: { httpStatusCode?: number } };
+	return (
+		e?.name === 'AccessDenied' ||
+		e?.Code === 'AccessDenied' ||
+		e?.$metadata?.httpStatusCode === 403 ||
+		/permission|access denied/i.test(String((err as Error)?.message || ''))
+	);
+}
+
+/**
+ * Upload buffer to S3. Пытается выставить ACL public-read (для бакетов без
+ * bucket-политики), а если бэкенд ACL запрещает — пишет без него: объект всё
+ * равно будет публичным через bucket-политику. Backward-compatible.
  */
 export async function uploadToS3(
 	client: S3Client,
@@ -54,18 +73,28 @@ export async function uploadToS3(
 	body: Buffer,
 	contentType: string
 ): Promise<void> {
-	await withRetry(() =>
-		client.send(
-			new PutObjectCommand({
-				Bucket: bucket,
-				Key: key,
-				Body: body,
-				ContentType: contentType,
-				CacheControl: 'public, max-age=31536000', // 1 year
-				ACL: 'public-read', // Thumbnails must be publicly accessible
-			})
-		)
-	);
+	const base = {
+		Bucket: bucket,
+		Key: key,
+		Body: body,
+		ContentType: contentType,
+		CacheControl: 'public, max-age=31536000', // 1 year
+	};
+
+	if (!aclDenied) {
+		try {
+			await withRetry(() =>
+				client.send(new PutObjectCommand({ ...base, ACL: 'public-read' }))
+			);
+			return;
+		} catch (err) {
+			if (!isAccessDenied(err)) throw err;
+			// бэкенд не разрешает per-object ACL — переключаемся на запись без ACL
+			aclDenied = true;
+		}
+	}
+
+	await withRetry(() => client.send(new PutObjectCommand(base)));
 }
 
 /**
