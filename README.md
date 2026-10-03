@@ -49,7 +49,7 @@ S3 bucket должен разрешать публичное чтение фай
 files.example.ru → S3 bucket
 ```
 
-Пример: `https://files.newbrusmir.ru/16-9mini/abc123.jpg`
+Пример: `https://files.example.ru/16-9mini/abc123.jpg`
 
 ---
 
@@ -274,7 +274,7 @@ Presentation-поле для `directus_files` — показывает сген�
 export function useImageUrl() {
   const config = useRuntimeConfig()
 
-  // config.public.filesUrl = "https://files.newbrusmir.ru"
+  // config.public.filesUrl = "https://files.example.ru"
 
   function getUrl(
     file: { filename_disk: string } | null,
