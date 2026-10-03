@@ -453,3 +453,30 @@ export async function loadPresetConfig(
 		return null;
 	}
 }
+
+/**
+ * Stream-скачивание объекта в локальный файл (запасной путь для ffmpeg).
+ * Прерывается, если реально прочитано больше maxBytes.
+ */
+export async function downloadToFile(
+	client: S3Client,
+	bucket: string,
+	key: string,
+	filePath: string,
+	maxBytes: number
+): Promise<number> {
+	const { createWriteStream } = await import('node:fs');
+	const { pipeline } = await import('node:stream/promises');
+	const { Transform } = await import('node:stream');
+	const response = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+	let total = 0;
+	const limiter = new Transform({
+		transform(chunk, _enc, cb) {
+			total += chunk.length;
+			if (total > maxBytes) return cb(new Error(`object exceeds ${maxBytes} bytes`));
+			cb(null, chunk);
+		},
+	});
+	await pipeline(response.Body as NodeJS.ReadableStream, limiter, createWriteStream(filePath));
+	return total;
+}

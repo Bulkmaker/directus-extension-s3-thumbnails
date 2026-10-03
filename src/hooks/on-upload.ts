@@ -1,11 +1,10 @@
 import type { Knex } from 'knex';
-import { loadConfig, getS3Config, getPresetFormat, getNormalizedPresetConfig, computePresetConfigHash, type ThumbnailPreset } from '../utils/config.js';
-import { isImage, getMimeType, getBasename, buildThumbnailKey } from '../utils/mime.js';
-import { createS3Client, uploadToS3, existsInS3, withRetry, deleteS3Prefix, savePresetConfig, loadPresetConfig, type StoredPresetConfig } from '../services/s3.js';
+import { loadConfig, getS3Config, getPresetFormat, getVideoConfig, type ThumbnailPreset } from '../utils/config.js';
+import { isVideo, isThumbnailSource, getMimeType, getBasename, buildThumbnailKey } from '../utils/mime.js';
+import { createS3Client, uploadToS3, existsInS3, withRetry, deleteS3Prefix } from '../services/s3.js';
 import { generateThumbnail } from '../services/thumbnail.js';
-
-// Track which presets have had their config saved in this session
-const presetConfigSaved = new Set<string>();
+import { ensurePresetConfigSaved } from '../services/preset-sync.js';
+import { generateVideoPostersForFile } from '../services/video-poster.js';
 
 // Cache for old file data between filter and action hooks
 // Key: fileId, Value: { filename_disk, type }
@@ -58,8 +57,17 @@ export async function generateThumbnailsForFile(
 	file: FilePayload,
 	context: HookContext,
 	options: { force?: boolean; presets?: ThumbnailPreset[] } = {}
-): Promise<{ generated: number; skipped: number }> {
+): Promise<{ generated: number; skipped: number; errors?: number }> {
 	const { database, env, logger, services, getSchema } = context;
+
+	// Видео: постер ffmpeg-кадром (только при THUMBNAILS_VIDEO_POSTERS=true)
+	if (isVideo(file.type)) {
+		if (!getVideoConfig(env).enabled) {
+			return { generated: 0, skipped: 0 };
+		}
+		return generateVideoPostersForFile(file, context, options);
+	}
+
 	const config = await loadConfig(database, env);
 	const s3Config = getS3Config(env);
 	const s3Client = createS3Client(s3Config);
@@ -106,27 +114,7 @@ export async function generateThumbnailsForFile(
 			}
 
 			// Save preset config to S3 (once per preset per session)
-			const presetCacheKey = `${s3Config.bucket}:${preset.key}`;
-			if (!presetConfigSaved.has(presetCacheKey)) {
-				try {
-					const normalizedConfig = getNormalizedPresetConfig(preset);
-					const hash = computePresetConfigHash(preset);
-					const storedConfig: StoredPresetConfig = {
-						hash,
-						config: normalizedConfig,
-						updatedAt: new Date().toISOString(),
-					};
-					await savePresetConfig(s3Client, s3Config.bucket, s3Config.root, preset.key, storedConfig);
-					presetConfigSaved.add(presetCacheKey);
-					if (config.verbose) {
-						logger.info(`[thumbnails] Saved preset config: ${preset.key} (hash: ${hash})`);
-					}
-				} catch (configError) {
-					// Non-critical error - just log and continue
-					const msg = configError instanceof Error ? configError.message : String(configError);
-					logger.warn(`[thumbnails] Failed to save preset config for ${preset.key}: ${msg}`);
-				}
-			}
+			await ensurePresetConfigSaved(s3Client, s3Config.bucket, s3Config.root, preset, logger, config.verbose);
 		} catch (error: unknown) {
 			const message = error instanceof Error ? error.message : String(error);
 			const e = error as { name?: string };
@@ -152,8 +140,8 @@ export function createUploadHandler(context: HookContext) {
 				return;
 			}
 
-			// Skip non-images
-			if (!isImage(payload.type)) {
+			// Skip всё, кроме картинок (и видео при включённых постерах)
+			if (!isThumbnailSource(payload.type, getVideoConfig(env).enabled)) {
 				return;
 			}
 
@@ -170,7 +158,11 @@ export function createUploadHandler(context: HookContext) {
 			// Use key as id (items.create provides the created record's key)
 			const file = { ...payload, id: key };
 
-			const result = await withRetry(() => generateThumbnailsForFile(file, context));
+			// Видео не ретраим: generateVideoPostersForFile не бросает, а повтор
+			// ffmpeg по таймауту только задержал бы очередь
+			const result = isVideo(file.type)
+				? await generateThumbnailsForFile(file, context)
+				: await withRetry(() => generateThumbnailsForFile(file, context));
 
 			logger.info(
 				`[thumbnails] Completed: ${payload.filename_disk} (generated: ${result.generated}, skipped: ${result.skipped})`
@@ -211,7 +203,7 @@ export function createUpdateHandler(context: HookContext) {
 				// Get current (new) file data from DB
 				const newFile = await database('directus_files').where('id', fileId).first();
 
-				if (!newFile || !isImage(newFile.type)) {
+				if (!newFile || !isThumbnailSource(newFile.type, getVideoConfig(env).enabled)) {
 					continue;
 				}
 

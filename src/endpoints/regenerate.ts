@@ -1,7 +1,7 @@
 import type { Router, Request, Response } from 'express';
 import type { Knex } from 'knex';
 import { randomUUID } from 'crypto';
-import { loadConfig } from '../utils/config.js';
+import { loadConfig, getVideoConfig } from '../utils/config.js';
 import { generateThumbnailsForFile } from '../hooks/on-upload.js';
 import { withRetry } from '../services/s3.js';
 
@@ -87,9 +87,13 @@ export function registerRegenerateEndpoint(router: Router, context: HookContext)
 			});
 		}
 
-		// Count total files
+		// Count total files (картинки; видео — если включены постеры)
+		const includeVideo = getVideoConfig(env).enabled;
 		let countQuery = database('directus_files')
-			.where('type', 'like', 'image/%')
+			.where(function () {
+				this.where('type', 'like', 'image/%');
+				if (includeVideo) this.orWhere('type', 'like', 'video/%');
+			})
 			.count('id as total');
 
 		if (fileIds?.length) {
@@ -246,7 +250,8 @@ export function registerRegenerateEndpoint(router: Router, context: HookContext)
 	) {
 		if (!currentJob) return;
 
-		const { database } = ctx;
+		const { database, env } = ctx;
+		const includeVideo = getVideoConfig(env).enabled;
 		const { fileIds } = currentJob.options;
 		const force = currentJob.options.force;
 
@@ -260,7 +265,11 @@ export function registerRegenerateEndpoint(router: Router, context: HookContext)
 				// Fetch page of files
 				let query = database('directus_files')
 					.select('id', 'filename_disk', 'filename_download', 'type')
-					.where('type', 'like', 'image/%')
+					.where(function () {
+						this.where('type', 'like', 'image/%');
+						if (includeVideo) this.orWhere('type', 'like', 'video/%');
+					})
+					.orderBy('id')
 					.limit(PAGE_SIZE)
 					.offset(offset);
 
@@ -316,6 +325,11 @@ export function registerRegenerateEndpoint(router: Router, context: HookContext)
 							if (success && result) {
 								currentJob!.progress.generated += result.generated;
 								currentJob!.progress.skipped += result.skipped;
+								// видео-постер: ошибка ffmpeg не бросает, а возвращается счётчиком
+								if (result.errors) {
+									currentJob!.progress.errors++;
+									currentJob!.failed.push({ id: file.id, error: 'video poster failed (see server log)' });
+								}
 							} else {
 								currentJob!.progress.errors++;
 								currentJob!.failed.push({ id: file.id, error: error || 'Unknown error' });

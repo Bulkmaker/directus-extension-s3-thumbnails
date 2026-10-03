@@ -1,7 +1,8 @@
 import { defineHook } from '@directus/extensions-sdk';
 import { createUploadHandler, createUpdateHandler, cacheOldFileData } from './on-upload.js';
-import { createDeleteHandler } from './on-delete.js';
-import { isImage } from '../utils/mime.js';
+import { createDeleteHandler, createDeletePrefetch } from './on-delete.js';
+import { isThumbnailSource } from '../utils/mime.js';
+import { getVideoConfig } from '../utils/config.js';
 
 export default defineHook(({ filter, action }, { database, env, logger, services, getSchema }) => {
 	// Check if S3 storage is configured
@@ -10,7 +11,8 @@ export default defineHook(({ filter, action }, { database, env, logger, services
 		return;
 	}
 
-	logger.info('[thumbnails] Hook initialized');
+	const videoPosters = getVideoConfig(env).enabled;
+	logger.info(`[thumbnails] Hook initialized (video posters: ${videoPosters ? 'on' : 'off'})`);
 
 	// Create shared context for all handlers
 	const context = { database, env, logger, services, getSchema };
@@ -21,8 +23,8 @@ export default defineHook(({ filter, action }, { database, env, logger, services
 
 		logger.info(`[thumbnails] files.upload triggered: key=${key}, type=${payload?.type}`);
 
-		// Skip non-images
-		if (!payload?.type || !isImage(payload.type)) {
+		// Skip всё, кроме картинок (и видео при THUMBNAILS_VIDEO_POSTERS=true)
+		if (!payload?.type || !isThumbnailSource(payload.type, videoPosters)) {
 			return;
 		}
 
@@ -53,7 +55,7 @@ export default defineHook(({ filter, action }, { database, env, logger, services
 				.select('filename_disk', 'type')
 				.first();
 
-			if (oldFile && isImage(oldFile.type)) {
+			if (oldFile && isThumbnailSource(oldFile.type, videoPosters)) {
 				// Check if file content actually changed
 				const isFileChanged =
 					(p.filename_disk && p.filename_disk !== oldFile.filename_disk) ||
@@ -76,6 +78,13 @@ export default defineHook(({ filter, action }, { database, env, logger, services
 	// Use items.update on directus_files (file replaced)
 	action('items.update', createUpdateHandler(context));
 
-	// Use items.delete on directus_files (cleanup thumbnails)
-	action('items.delete', createDeleteHandler(database, env, logger));
+	// Удаление файла: для системной коллекции directus_files Directus шлёт события
+	// `files.delete` (а не `items.delete`). Filter срабатывает ДО удаления строки и
+	// запоминает filename_disk/type, action после удаления чистит миниатюры в S3.
+	filter('files.delete', createDeletePrefetch(database));
+
+	const deleteHandler = createDeleteHandler(database, env, logger);
+	action('files.delete', deleteHandler);
+	// legacy-событие оставлено для обратной совместимости
+	action('items.delete', deleteHandler);
 });

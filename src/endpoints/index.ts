@@ -1,7 +1,7 @@
 import { defineEndpoint } from '@directus/extensions-sdk';
 import { registerRegenerateEndpoint } from './regenerate.js';
 import { registerCleanupEndpoint } from './cleanup.js';
-import { loadConfig, getS3Config, getPresetFormat, getNormalizedPresetConfig, presetConfigsMatch } from '../utils/config.js';
+import { loadConfig, getS3Config, getPresetFormat, getNormalizedPresetConfig, presetConfigsMatch, getVideoConfig } from '../utils/config.js';
 import { createS3Client, countS3Objects, loadPresetConfig } from '../services/s3.js';
 
 export default defineEndpoint((router, { database, env, logger, services, getSchema }) => {
@@ -32,7 +32,19 @@ export default defineEndpoint((router, { database, env, logger, services, getSch
 				.where('type', 'like', 'image/%')
 				.count('* as count')
 				.first();
-			const totalImages = Number(imageCountResult?.count ?? 0);
+			const totalImagesOnly = Number(imageCountResult?.count ?? 0);
+
+			// Видео-постеры (только при THUMBNAILS_VIDEO_POSTERS=true)
+			let totalVideos = 0;
+			if (getVideoConfig(env).enabled) {
+				const videoCountResult = await database('directus_files')
+					.where('type', 'like', 'video/%')
+					.count('* as count')
+					.first();
+				totalVideos = Number(videoCountResult?.count ?? 0);
+			}
+			// «Файлов с миниатюрами»: картинки + видео (при выключенной опции = только картинки, как раньше)
+			const totalImages = totalImagesOnly + totalVideos;
 
 			// Count thumbnails per preset on S3 and check for outdated configs
 			const presetStats = await Promise.all(
@@ -86,6 +98,7 @@ export default defineEndpoint((router, { database, env, logger, services, getSch
 
 			res.json({
 				totalImages,
+				totalVideos,
 				totalPresets: config.presets.length,
 				totalThumbnails,
 				totalExpected,

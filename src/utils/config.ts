@@ -145,3 +145,38 @@ export function presetConfigsMatch(a: NormalizedPresetConfig, b: NormalizedPrese
 		a.format === b.format
 	);
 }
+
+/**
+ * Настройки видео-постеров (всё из ENV, по умолчанию функция ВЫКЛЮЧЕНА)
+ *
+ * THUMBNAILS_VIDEO_POSTERS=true     включить
+ * THUMBNAILS_VIDEO_MAX_MB=500       лимит размера видео для обработки
+ * THUMBNAILS_VIDEO_TIMEOUT_SEC=60   таймаут одного запуска ffmpeg
+ * THUMBNAILS_FFMPEG_PATH            явный путь к ffmpeg
+ * THUMBNAILS_FFMPEG_DOWNLOAD=true   разрешить скачать статический ffmpeg (с проверкой sha256)
+ * THUMBNAILS_FFMPEG_DIR             куда кэшировать скачанный ffmpeg
+ */
+export interface VideoPosterConfig {
+	enabled: boolean;
+	maxBytes: number;
+	timeoutMs: number;
+	ffmpegPath?: string;
+	allowDownload: boolean;
+	ffmpegDir?: string;
+}
+
+function positiveNumber(value: string | undefined, fallback: number): number {
+	const n = Number(value);
+	return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+export function getVideoConfig(env: Record<string, string | undefined>): VideoPosterConfig {
+	return {
+		enabled: String(env['THUMBNAILS_VIDEO_POSTERS'] ?? '').toLowerCase() === 'true',
+		maxBytes: Math.floor(positiveNumber(env['THUMBNAILS_VIDEO_MAX_MB'], 500) * 1024 * 1024),
+		timeoutMs: Math.floor(positiveNumber(env['THUMBNAILS_VIDEO_TIMEOUT_SEC'], 60) * 1000),
+		ffmpegPath: env['THUMBNAILS_FFMPEG_PATH'] || undefined,
+		allowDownload: String(env['THUMBNAILS_FFMPEG_DOWNLOAD'] ?? 'true').toLowerCase() !== 'false',
+		ffmpegDir: env['THUMBNAILS_FFMPEG_DIR'] || undefined,
+	};
+}

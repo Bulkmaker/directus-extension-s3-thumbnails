@@ -6,6 +6,24 @@ export function isImage(mimeType: string | null | undefined): boolean {
 }
 
 /**
+ * Check if MIME type is a video
+ */
+export function isVideo(mimeType: string | null | undefined): boolean {
+	return !!mimeType && mimeType.toLowerCase().startsWith('video/');
+}
+
+/**
+ * Файл, для которого генерируются миниатюры: картинка всегда,
+ * видео — только если включены видео-постеры (THUMBNAILS_VIDEO_POSTERS=true).
+ */
+export function isThumbnailSource(
+	mimeType: string | null | undefined,
+	videoPostersEnabled: boolean
+): boolean {
+	return isImage(mimeType) || (videoPostersEnabled && isVideo(mimeType));
+}
+
+/**
  * Get MIME type for image format
  */
 export function getMimeType(format: string): string {

@@ -102,7 +102,72 @@ FILES_DOMAIN=files.example.ru
 THUMBNAILS_VERBOSE=true
 ```
 
-### 3. CSP Configuration
+### 3. Видео-постеры (опционально, по умолчанию ВЫКЛЮЧЕНО)
+
+Если редактор загрузил видео (mp4 и др., `video/*`) в Directus, расширение может снять кадр и положить его
+**вариантами тех же пресетов по тому же пути, что миниатюры картинок**:
+
+```
+bucket/
+├── 3f1c2a7e-....mp4                 # оригинал видео
+├── card/3f1c2a7e-....webp           # постер, пресет "card"
+└── hero/3f1c2a7e-....jpg            # постер, пресет "hero" (format: jpeg -> .jpg)
+```
+
+Фронт получает постер тем же `imageUrl(file, preset)`, что и для картинок, без новых полей:
+`<preset.key>/<filename_disk без расширения>.<format>` (см. `buildThumbnailKey`).
+
+**ENV:**
+
+| Переменная | По умолчанию | Назначение |
+|---|---|---|
+| `THUMBNAILS_VIDEO_POSTERS` | не задана (выкл.) | `true` — включить постеры для `video/*` |
+| `THUMBNAILS_VIDEO_MAX_MB` | `500` | видео крупнее не обрабатываются (warn в лог, без ошибки) |
+| `THUMBNAILS_VIDEO_TIMEOUT_SEC` | `60` | таймаут одного запуска ffmpeg (процесс убивается) |
+| `THUMBNAILS_FFMPEG_PATH` | не задана | явный путь к ffmpeg (если есть в образе/смонтирован) |
+| `THUMBNAILS_FFMPEG_DOWNLOAD` | `true` | разрешить скачать статический ffmpeg, если его нигде нет |
+| `THUMBNAILS_FFMPEG_DIR` | `$TMPDIR/directus-s3-thumbnails-ffmpeg` | куда кэшировать скачанный ffmpeg |
+
+**Как выбирается кадр:** ffmpeg берёт кадр на 1-й секунде (`-ss 1`); если кадра там нет (ролик короче секунды) —
+первый кадр (`-ss 0`). Кадр (PNG, ширина ограничена 3840 px, поворот из метаданных учитывается) один раз
+снимается и прогоняется через ту же пресетную схему, что и картинки: `width/height/fit/quality/withoutEnlargement/format`
+(sharp из образа Directus), запись в S3 с `ACL: public-read` (с тем же откатом без ACL, что у картинок),
+`Content-Type` по формату и `Cache-Control: public, max-age=31536000`. Уже существующие варианты пропускаются.
+
+**Чтение видео без полной загрузки:** ffmpeg читает оригинал через локальный HTTP-прокси на `127.0.0.1`,
+который отдаёт куски объекта из S3 по Range (через S3-клиент процесса Directus) — скачиваются только нужные куски
+(moov + начало ролика). Если это не сработало, запасной путь: временный файл в `os.tmpdir()` (лимит
+`THUMBNAILS_VIDEO_MAX_MB`, удаляется всегда). Одновременно работает не более 2 ffmpeg.
+
+**Ошибки не ломают загрузку:** любая ошибка (ffmpeg, битый файл, таймаут, S3) пишется в лог
+(`[thumbnails] Video poster failed ...`), загрузка файла завершается как обычно, постера просто не будет.
+
+**Удаление:** при удалении файла (картинки или видео) удаляются все его варианты `<preset>/<basename>.*`
+(для видео это работает и при выключенной опции — удаляются только реально существующие объекты).
+
+**Регенерация:** «Regenerate» в модуле и `POST /thumbnails/regenerate` при включённой опции обрабатывают и видео
+(в т.ч. уже загруженные ролики; `force`, `preset`, `fileIds` работают как для картинок). `GET /thumbnails/stats`
+добавляет поле `totalVideos`, `totalImages` = картинки + видео при включённой опции.
+
+**ffmpeg и установка (важно для Dokploy):**
+- Образ `directus/directus` — alpine/musl, `USER=node`, ffmpeg в нём нет, `apk add` недоступен.
+- Command-обёртка из `install-extensions.sh` копирует в `/directus/extensions` только `package.json` + `dist` расширения;
+  npm-зависимости (в т.ч. `ffmpeg-static` с его postinstall-загрузкой бинаря) остаются в сборочной папке и **не доезжают**
+  до рантайма. Поэтому `ffmpeg-static` как зависимость здесь не работает, и расширение само скачивает тот же самый
+  бинарь: релиз `eugeneware/ffmpeg-static` `b6.1.1` (GitHub Releases), `linux-x64`/`linux-arm64` (и `darwin-arm64` для
+  локальной разработки), **с проверкой sha256** (хэши зашиты в код), в `THUMBNAILS_FFMPEG_DIR` (по умолчанию `/tmp`, при
+  пересоздании контейнера скачивается заново, ≈25 МБ, ~1-2 с). Бинарь статический и проверен на alpine/musl (arm64 и x64).
+- Нужен исходящий доступ контейнера к `github.com` при первом видео после старта. Чтобы не зависеть от сети: смонтируйте
+  ffmpeg в контейнер и задайте `THUMBNAILS_FFMPEG_PATH`, либо `THUMBNAILS_FFMPEG_DOWNLOAD=false`.
+- Порядок поиска: `THUMBNAILS_FFMPEG_PATH` -> `ffmpeg-static` (если установлен рядом) -> кэш скачивания -> `ffmpeg` из PATH -> скачивание.
+- Лицензия бинаря ffmpeg-static: GPL (отдельный исполняемый файл, расширение запускает его как процесс).
+- sharp для кадра берётся из образа Directus (резолвится через `@directus/api`), в расширение не бандлится.
+
+**Ограничения:** постер = один статичный кадр; формат ролика определяется ffmpeg (mp4/mov/webm/mkv и др.);
+видео с moov-атомом в конце читаются с большим числом Range-запросов (быстрее с `-movflags +faststart`);
+первая обработка после старта контейнера включает скачивание ffmpeg.
+
+### 4. CSP Configuration
 
 Добавьте CDN домен в Content Security Policy (docker-compose.backend.yml):
 
@@ -131,10 +196,11 @@ CONTENT_SECURITY_POLICY_DIRECTIVES__IMG_SRC: "'self' data: blob: https://files.e
 
 | Hook | Событие | Действие |
 |------|---------|----------|
-| `files.upload` | Новый файл | Генерация миниатюр |
+| `files.upload` | Новый файл | Генерация миниатюр (картинки; видео-постеры при `THUMBNAILS_VIDEO_POSTERS=true`) |
+| `filter('files.delete')` + `files.delete` | Удаление файла | Чистка вариантов в S3 (картинки и видео) |
 | `filter('items.update')` | Замена файла | Кэш старого имени |
 | `action('items.update')` | После замены | Удаление старых + генерация новых |
-| `action('items.delete')` | Удаление | Удаление миниатюр из S3 |
+| `action('items.delete')` | (legacy) | Оставлено для совместимости |
 
 ### Endpoints
 
@@ -426,6 +492,10 @@ curl -X POST .../thumbnails/regenerate \
 - [x] Persistent job state — прогресс переживает перезагрузку
 - [x] Orphan folders detection — поиск и удаление сирот
 - [x] Cleanup progress bar — прогресс удаления
+
+### v0.5.0
+- [x] Видео-постеры (ffmpeg, `THUMBNAILS_VIDEO_POSTERS`) — варианты тех же пресетов по тому же пути
+- [x] Удаление вариантов при удалении файла (события `files.delete`)
 
 ### Planned
 - [ ] Watermark

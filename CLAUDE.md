@@ -24,6 +24,10 @@ npm run dev
 
 The `deploy.sh` script builds and copies output to `docker/directus/extensions/directus-extension-thumbnails-generator/`. После этого нужно закоммитить изменения в docker репозиторий и задеплоить на сервер.
 
+## Video posters (v0.5.0, opt-in)
+
+`THUMBNAILS_VIDEO_POSTERS=true` → on `files.upload` of `video/*` ffmpeg grabs a frame (services/ffmpeg.ts, range-proxy.ts, video-poster.ts) and writes variants to the SAME keys as image thumbnails. Details: README "Видео-постеры". Tests: `npm test` (vitest; real-ffmpeg tests need `FFMPEG_TEST_BIN` or ffmpeg in PATH).
+
 ## Architecture
 
 ```
@@ -31,7 +35,7 @@ src/
 ├── hooks/
 │   ├── index.ts        # Hook registration
 │   ├── on-upload.ts    # files.upload + items.update handlers
-│   └── on-delete.ts    # items.delete cleanup
+│   └── on-delete.ts    # files.delete cleanup (filter prefetch + action)
 ├── endpoints/
 │   ├── index.ts        # Endpoint registration + /config
 │   ├── regenerate.ts   # Regenerate with persistent job state
@@ -64,7 +68,7 @@ src/
 | `files.upload` | Generate thumbnails for all presets |
 | `filter('items.update')` | Cache old file metadata |
 | `action('items.update')` | Delete old + generate new thumbnails |
-| `action('items.delete')` | Delete all thumbnails from S3 |
+| `filter('files.delete')` + `action('files.delete')` | Delete all thumbnails (images + video posters) from S3 |
 
 ### Endpoints
 

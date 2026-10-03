@@ -1,19 +1,26 @@
-import { Duplex, Writable, Readable as Readable$1, PassThrough } from 'stream';
-import { Readable } from 'node:stream';
+import { homedir, tmpdir } from 'node:os';
+import 'node:process';
+import { Duplex, Writable as Writable$1, Readable as Readable$1, PassThrough } from 'stream';
+import { Writable, Readable, Transform } from 'node:stream';
 import { Buffer as Buffer$1 } from 'buffer';
 import * as zlib from 'zlib';
+import { readFile as readFile$2, stat, mkdir, chmod, rename, rm, mkdtemp } from 'node:fs/promises';
+import { sep, join, dirname } from 'node:path';
+import { spawn } from 'node:child_process';
+import { getRandomValues, createHash as createHash$1, createPrivateKey, createPublicKey, sign } from 'node:crypto';
+import { createRequire } from 'node:module';
+import * as zlib$1 from 'node:zlib';
+import { createGunzip } from 'node:zlib';
+import { ReadStream, lstatSync, fstatSync, createWriteStream, promises as promises$1 } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
+import { createServer } from 'node:http';
 import crypto$1, { createHash, createHmac, randomUUID as randomUUID$1 } from 'crypto';
 import { parse } from 'url';
 import { Agent, request as request$1 } from 'http';
-import fs, { readFile as readFile$1 } from 'fs/promises';
+import fs, { readFile as readFile$3 } from 'fs/promises';
 import { promises, readFileSync } from 'fs';
-import { sep, join } from 'path';
-import { homedir, platform, release } from 'os';
-import { readFile as readFile$2 } from 'node:fs/promises';
-import { createHash as createHash$1, createPrivateKey, createPublicKey, sign } from 'node:crypto';
-import { ReadStream, lstatSync, fstatSync, promises as promises$1 } from 'node:fs';
-import { homedir as homedir$1 } from 'node:os';
-import { dirname, join as join$1 } from 'node:path';
+import { sep as sep$1, join as join$1 } from 'path';
+import { homedir as homedir$1, platform, release as release$1 } from 'os';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { versions, env } from 'process';
@@ -4363,7 +4370,7 @@ function defineEndpoint(config) {
   return config;
 }
 
-async function loadConfig$1(database, env) {
+async function loadConfig$2(database, env) {
   let presets = [];
   try {
     const settings = await database("directus_settings").select("storage_asset_presets").first();
@@ -4427,9 +4434,29 @@ function computePresetConfigHash(preset) {
 function presetConfigsMatch(a, b) {
   return a.width === b.width && a.height === b.height && a.fit === b.fit && a.quality === b.quality && a.format === b.format;
 }
+function positiveNumber(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+function getVideoConfig(env) {
+  return {
+    enabled: String(env["THUMBNAILS_VIDEO_POSTERS"] ?? "").toLowerCase() === "true",
+    maxBytes: Math.floor(positiveNumber(env["THUMBNAILS_VIDEO_MAX_MB"], 500) * 1024 * 1024),
+    timeoutMs: Math.floor(positiveNumber(env["THUMBNAILS_VIDEO_TIMEOUT_SEC"], 60) * 1e3),
+    ffmpegPath: env["THUMBNAILS_FFMPEG_PATH"] || void 0,
+    allowDownload: String(env["THUMBNAILS_FFMPEG_DOWNLOAD"] ?? "true").toLowerCase() !== "false",
+    ffmpegDir: env["THUMBNAILS_FFMPEG_DIR"] || void 0
+  };
+}
 
 function isImage(mimeType) {
   return !!mimeType && mimeType.startsWith("image/");
+}
+function isVideo(mimeType) {
+  return !!mimeType && mimeType.toLowerCase().startsWith("video/");
+}
+function isThumbnailSource(mimeType, videoPostersEnabled) {
+  return isImage(mimeType) || videoPostersEnabled && isVideo(mimeType);
 }
 function getMimeType(format) {
   const mimeTypes = {
@@ -4449,6 +4476,9 @@ function getBasename(filename) {
 function buildThumbnailKey(root, preset, basename, format) {
   const key = `${preset}/${basename}.${format}`;
   return root ? `${root}/${key}` : key;
+}
+function buildOriginalKey(root, filename) {
+  return root ? `${root}/${filename}` : filename;
 }
 
 const getHttpHandlerExtensionConfiguration = (runtimeConfig) => {
@@ -4496,6 +4526,227 @@ var IniSectionType;
     IniSectionType["SSO_SESSION"] = "sso-session";
     IniSectionType["SERVICES"] = "services";
 })(IniSectionType || (IniSectionType = {}));
+
+let HttpRequest$1 = class HttpRequest {
+    method;
+    protocol;
+    hostname;
+    port;
+    path;
+    query;
+    headers;
+    username;
+    password;
+    fragment;
+    body;
+    constructor(options) {
+        this.method = options.method || "GET";
+        this.hostname = options.hostname || "localhost";
+        this.port = options.port;
+        this.query = options.query || {};
+        this.headers = options.headers || {};
+        this.body = options.body;
+        this.protocol = options.protocol
+            ? options.protocol.slice(-1) !== ":"
+                ? `${options.protocol}:`
+                : options.protocol
+            : "https:";
+        this.path = options.path ? (options.path.charAt(0) !== "/" ? `/${options.path}` : options.path) : "/";
+        this.username = options.username;
+        this.password = options.password;
+        this.fragment = options.fragment;
+    }
+    static clone(request) {
+        const cloned = new HttpRequest({
+            ...request,
+            headers: { ...request.headers },
+        });
+        if (cloned.query) {
+            cloned.query = cloneQuery$1(cloned.query);
+        }
+        return cloned;
+    }
+    static isInstance(request) {
+        if (!request) {
+            return false;
+        }
+        const req = request;
+        return ("method" in req &&
+            "protocol" in req &&
+            "hostname" in req &&
+            "path" in req &&
+            typeof req["query"] === "object" &&
+            typeof req["headers"] === "object");
+    }
+    clone() {
+        return HttpRequest.clone(this);
+    }
+};
+function cloneQuery$1(query) {
+    return Object.keys(query).reduce((carry, paramName) => {
+        const param = query[paramName];
+        return {
+            ...carry,
+            [paramName]: Array.isArray(param) ? [...param] : param,
+        };
+    }, {});
+}
+
+let HttpResponse$1 = class HttpResponse {
+    statusCode;
+    reason;
+    headers;
+    body;
+    constructor(options) {
+        this.statusCode = options.statusCode;
+        this.reason = options.reason;
+        this.headers = options.headers || {};
+        this.body = options.body;
+    }
+    static isInstance(response) {
+        if (!response)
+            return false;
+        const resp = response;
+        return typeof resp.statusCode === "number" && typeof resp.headers === "object";
+    }
+};
+
+function addExpectContinueMiddleware(options) {
+    return (next) => async (args) => {
+        const { request } = args;
+        if (options.expectContinueHeader !== false &&
+            HttpRequest$1.isInstance(request) &&
+            request.body &&
+            options.runtime === "node" &&
+            options.requestHandler?.constructor?.name !== "FetchHttpHandler") {
+            let sendHeader = true;
+            if (typeof options.expectContinueHeader === "number") {
+                try {
+                    const bodyLength = Number(request.headers?.["content-length"]) ?? options.bodyLengthChecker?.(request.body) ?? Infinity;
+                    sendHeader = bodyLength >= options.expectContinueHeader;
+                }
+                catch (e) { }
+            }
+            else {
+                sendHeader = !!options.expectContinueHeader;
+            }
+            if (sendHeader) {
+                request.headers.Expect = "100-continue";
+            }
+        }
+        return next({
+            ...args,
+            request,
+        });
+    };
+}
+const addExpectContinueMiddlewareOptions = {
+    step: "build",
+    tags: ["SET_EXPECT_HEADER", "EXPECT_HEADER"],
+    name: "addExpectContinueMiddleware",
+    override: true,
+};
+const getAddExpectContinuePlugin = (options) => ({
+    applyToStack: (clientStack) => {
+        clientStack.add(addExpectContinueMiddleware(options), addExpectContinueMiddlewareOptions);
+    },
+});
+
+const RequestChecksumCalculation = {
+    WHEN_SUPPORTED: "WHEN_SUPPORTED",
+    WHEN_REQUIRED: "WHEN_REQUIRED",
+};
+const DEFAULT_REQUEST_CHECKSUM_CALCULATION = RequestChecksumCalculation.WHEN_SUPPORTED;
+const ResponseChecksumValidation = {
+    WHEN_SUPPORTED: "WHEN_SUPPORTED",
+    WHEN_REQUIRED: "WHEN_REQUIRED",
+};
+const DEFAULT_RESPONSE_CHECKSUM_VALIDATION = RequestChecksumCalculation.WHEN_SUPPORTED;
+var ChecksumAlgorithm;
+(function (ChecksumAlgorithm) {
+    ChecksumAlgorithm["MD5"] = "MD5";
+    ChecksumAlgorithm["CRC32"] = "CRC32";
+    ChecksumAlgorithm["CRC32C"] = "CRC32C";
+    ChecksumAlgorithm["CRC64NVME"] = "CRC64NVME";
+    ChecksumAlgorithm["SHA1"] = "SHA1";
+    ChecksumAlgorithm["SHA256"] = "SHA256";
+})(ChecksumAlgorithm || (ChecksumAlgorithm = {}));
+var ChecksumLocation;
+(function (ChecksumLocation) {
+    ChecksumLocation["HEADER"] = "header";
+    ChecksumLocation["TRAILER"] = "trailer";
+})(ChecksumLocation || (ChecksumLocation = {}));
+const DEFAULT_CHECKSUM_ALGORITHM = ChecksumAlgorithm.CRC32;
+
+var SelectorType$2;
+(function (SelectorType) {
+    SelectorType["ENV"] = "env";
+    SelectorType["CONFIG"] = "shared config entry";
+})(SelectorType$2 || (SelectorType$2 = {}));
+const stringUnionSelector = (obj, key, union, type) => {
+    if (!(key in obj))
+        return undefined;
+    const value = obj[key].toUpperCase();
+    if (!Object.values(union).includes(value)) {
+        throw new TypeError(`Cannot load ${type} '${key}'. Expected one of ${Object.values(union)}, got '${obj[key]}'.`);
+    }
+    return value;
+};
+
+const ENV_REQUEST_CHECKSUM_CALCULATION = "AWS_REQUEST_CHECKSUM_CALCULATION";
+const CONFIG_REQUEST_CHECKSUM_CALCULATION = "request_checksum_calculation";
+const NODE_REQUEST_CHECKSUM_CALCULATION_CONFIG_OPTIONS = {
+    environmentVariableSelector: (env) => stringUnionSelector(env, ENV_REQUEST_CHECKSUM_CALCULATION, RequestChecksumCalculation, SelectorType$2.ENV),
+    configFileSelector: (profile) => stringUnionSelector(profile, CONFIG_REQUEST_CHECKSUM_CALCULATION, RequestChecksumCalculation, SelectorType$2.CONFIG),
+    default: DEFAULT_REQUEST_CHECKSUM_CALCULATION,
+};
+
+const ENV_RESPONSE_CHECKSUM_VALIDATION = "AWS_RESPONSE_CHECKSUM_VALIDATION";
+const CONFIG_RESPONSE_CHECKSUM_VALIDATION = "response_checksum_validation";
+const NODE_RESPONSE_CHECKSUM_VALIDATION_CONFIG_OPTIONS = {
+    environmentVariableSelector: (env) => stringUnionSelector(env, ENV_RESPONSE_CHECKSUM_VALIDATION, ResponseChecksumValidation, SelectorType$2.ENV),
+    configFileSelector: (profile) => stringUnionSelector(profile, CONFIG_RESPONSE_CHECKSUM_VALIDATION, ResponseChecksumValidation, SelectorType$2.CONFIG),
+    default: DEFAULT_RESPONSE_CHECKSUM_VALIDATION,
+};
+
+const state = {
+    warningEmitted: false,
+};
+const emitWarningIfUnsupportedVersion$1 = (version) => {
+    if (version && !state.warningEmitted) {
+        if (process.env.AWS_SDK_JS_NODE_VERSION_SUPPORT_WARNING_DISABLED === "true") {
+            state.warningEmitted = true;
+            return;
+        }
+        const userMajorVersion = parseInt(version.substring(1, version.indexOf(".")));
+        const vv = 22;
+        if (userMajorVersion < vv) {
+            state.warningEmitted = true;
+            process.emitWarning(`NodeVersionSupportWarning: The AWS SDK for JavaScript (v3)
+versions published after the first week of January 2027
+will require node >=${vv}. You are running node ${version}.
+
+To continue receiving updates to AWS services, bug fixes,
+and security updates please upgrade to node >=${vv}.
+
+More information can be found at: https://a.co/c895JFp`);
+        }
+    }
+};
+
+function setCredentialFeature(credentials, feature, value) {
+    if (!credentials.$source) {
+        credentials.$source = {};
+    }
+    credentials.$source[feature] = value;
+    return credentials;
+}
+
+const getSmithyContext$1 = (context) => context[SMITHY_CONTEXT_KEY] || (context[SMITHY_CONTEXT_KEY] = {});
+
+function hasOwn(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+}
 
 class HttpRequest {
     method;
@@ -4581,128 +4832,2762 @@ class HttpResponse {
     }
 }
 
-function addExpectContinueMiddleware(options) {
-    return (next) => async (args) => {
-        const { request } = args;
-        if (options.expectContinueHeader !== false &&
-            HttpRequest.isInstance(request) &&
-            request.body &&
-            options.runtime === "node" &&
-            options.requestHandler?.constructor?.name !== "FetchHttpHandler") {
-            let sendHeader = true;
-            if (typeof options.expectContinueHeader === "number") {
-                try {
-                    const bodyLength = Number(request.headers?.["content-length"]) ?? options.bodyLengthChecker?.(request.body) ?? Infinity;
-                    sendHeader = bodyLength >= options.expectContinueHeader;
-                }
-                catch (e) { }
+function isValidHostname(hostname) {
+    const hostPattern = /^[a-z0-9][a-z0-9.-]*[a-z0-9]$/;
+    return hostPattern.test(hostname);
+}
+
+const normalizeProvider$2 = (input) => {
+    if (typeof input === "function")
+        return input;
+    const promisified = Promise.resolve(input);
+    return () => promisified;
+};
+
+function parseQueryString$1(querystring) {
+    const query = {};
+    querystring = querystring.replace(/^\?/, "");
+    if (querystring) {
+        for (const pair of querystring.split("&")) {
+            let [key, value = null] = pair.split("=");
+            key = decodeURIComponent(key);
+            if (value) {
+                value = decodeURIComponent(value);
+            }
+            if (!(key in query)) {
+                query[key] = value;
+            }
+            else if (Array.isArray(query[key])) {
+                query[key].push(value);
             }
             else {
-                sendHeader = !!options.expectContinueHeader;
-            }
-            if (sendHeader) {
-                request.headers.Expect = "100-continue";
+                query[key] = [query[key], value];
             }
         }
-        return next({
-            ...args,
-            request,
-        });
-    };
+    }
+    return query;
 }
-const addExpectContinueMiddlewareOptions = {
-    step: "build",
-    tags: ["SET_EXPECT_HEADER", "EXPECT_HEADER"],
-    name: "addExpectContinueMiddleware",
-    override: true,
+
+const parseUrl$1 = (url) => {
+    if (typeof url === "string") {
+        return parseUrl$1(new URL(url));
+    }
+    const { hostname, pathname, port, protocol, search } = url;
+    let query;
+    if (search) {
+        query = parseQueryString$1(search);
+    }
+    return {
+        hostname,
+        port: port ? parseInt(port) : undefined,
+        protocol,
+        path: pathname,
+        query,
+    };
 };
-const getAddExpectContinuePlugin = (options) => ({
-    applyToStack: (clientStack) => {
-        clientStack.add(addExpectContinueMiddleware(options), addExpectContinueMiddlewareOptions);
-    },
+
+const toEndpointV1$1 = (endpoint) => {
+    if (typeof endpoint === "object") {
+        if ("url" in endpoint) {
+            const v1Endpoint = parseUrl$1(endpoint.url);
+            if (endpoint.headers) {
+                v1Endpoint.headers = {};
+                for (const name in endpoint.headers) {
+                    if (!hasOwn(endpoint.headers, name))
+                        continue;
+                    v1Endpoint.headers[name.toLowerCase()] = endpoint.headers[name].join(", ");
+                }
+            }
+            return v1Endpoint;
+        }
+        return endpoint;
+    }
+    return parseUrl$1(endpoint);
+};
+
+const deref = (schemaRef) => {
+    if (typeof schemaRef === "function") {
+        return schemaRef();
+    }
+    return schemaRef;
+};
+
+const operation = (namespace, name, traits, input, output) => ({
+    name,
+    namespace,
+    traits,
+    input,
+    output,
 });
 
-const RequestChecksumCalculation = {
-    WHEN_SUPPORTED: "WHEN_SUPPORTED",
-    WHEN_REQUIRED: "WHEN_REQUIRED",
+const schemaDeserializationMiddleware = (config) => (next, context) => async (args) => {
+    const { response } = await next(args);
+    const { operationSchema } = getSmithyContext$1(context);
+    const [, ns, n, t, i, o] = operationSchema ?? [];
+    try {
+        const parsed = await config.protocol.deserializeResponse(operation(ns, n, t, i, o), {
+            ...config,
+            ...context,
+        }, response);
+        return {
+            response,
+            output: parsed,
+        };
+    }
+    catch (error) {
+        Object.defineProperty(error, "$response", {
+            value: response,
+            enumerable: false,
+            writable: false,
+            configurable: false,
+        });
+        if (!("$metadata" in error)) {
+            const hint = `Deserialization error: to see the raw response, inspect the hidden field {error}.$response on this object.`;
+            try {
+                error.message += "\n  " + hint;
+            }
+            catch (ignored) {
+                if (!context.logger || context.logger?.constructor?.name === "NoOpLogger") {
+                    console.warn(hint);
+                }
+                else {
+                    context.logger?.warn?.(hint);
+                }
+            }
+            if (typeof error.$responseBodyText !== "undefined") {
+                if (error.$response) {
+                    error.$response.body = error.$responseBodyText;
+                }
+            }
+            try {
+                if (HttpResponse.isInstance(response)) {
+                    const { headers = {}, statusCode } = response;
+                    const headerEntries = Object.entries(headers);
+                    error.$metadata = {
+                        httpStatusCode: statusCode,
+                        requestId: findHeader(/^x-[\w-]+-request-?id$/, headerEntries),
+                        extendedRequestId: findHeader(/^x-[\w-]+-id-2$/, headerEntries),
+                        cfId: findHeader(/^x-[\w-]+-cf-id$/, headerEntries),
+                    };
+                }
+            }
+            catch (ignored) {
+            }
+        }
+        throw error;
+    }
 };
-const DEFAULT_REQUEST_CHECKSUM_CALCULATION = RequestChecksumCalculation.WHEN_SUPPORTED;
-const ResponseChecksumValidation = {
-    WHEN_SUPPORTED: "WHEN_SUPPORTED",
-    WHEN_REQUIRED: "WHEN_REQUIRED",
+const findHeader = (pattern, headers) => {
+    return (headers.find(([k]) => {
+        return k.match(pattern);
+    }) || [void 0, void 1])[1];
 };
-const DEFAULT_RESPONSE_CHECKSUM_VALIDATION = RequestChecksumCalculation.WHEN_SUPPORTED;
-var ChecksumAlgorithm;
-(function (ChecksumAlgorithm) {
-    ChecksumAlgorithm["MD5"] = "MD5";
-    ChecksumAlgorithm["CRC32"] = "CRC32";
-    ChecksumAlgorithm["CRC32C"] = "CRC32C";
-    ChecksumAlgorithm["CRC64NVME"] = "CRC64NVME";
-    ChecksumAlgorithm["SHA1"] = "SHA1";
-    ChecksumAlgorithm["SHA256"] = "SHA256";
-})(ChecksumAlgorithm || (ChecksumAlgorithm = {}));
-var ChecksumLocation;
-(function (ChecksumLocation) {
-    ChecksumLocation["HEADER"] = "header";
-    ChecksumLocation["TRAILER"] = "trailer";
-})(ChecksumLocation || (ChecksumLocation = {}));
-const DEFAULT_CHECKSUM_ALGORITHM = ChecksumAlgorithm.CRC32;
+
+const schemaSerializationMiddleware = (config) => (next, context) => async (args) => {
+    const { operationSchema } = getSmithyContext$1(context);
+    const [, ns, n, t, i, o] = operationSchema ?? [];
+    const endpoint = context.endpointV2
+        ? async () => toEndpointV1$1(context.endpointV2)
+        : config.endpoint;
+    const request = await config.protocol.serializeRequest(operation(ns, n, t, i, o), args.input, {
+        ...config,
+        ...context,
+        endpoint,
+    });
+    return next({
+        ...args,
+        request,
+    });
+};
+
+const deserializerMiddlewareOption = {
+    name: "deserializerMiddleware",
+    step: "deserialize",
+    tags: ["DESERIALIZER"],
+    override: true,
+};
+const serializerMiddlewareOption$1 = {
+    name: "serializerMiddleware",
+    step: "serialize",
+    tags: ["SERIALIZER"],
+    override: true,
+};
+function getSchemaSerdePlugin(config) {
+    return {
+        applyToStack: (commandStack) => {
+            commandStack.add(schemaSerializationMiddleware(config), serializerMiddlewareOption$1);
+            commandStack.add(schemaDeserializationMiddleware(config), deserializerMiddlewareOption);
+            config.protocol.setSerdeContext(config);
+        },
+    };
+}
+
+const traitsCache = [];
+function translateTraits(indicator) {
+    if (typeof indicator === "object") {
+        return indicator;
+    }
+    indicator = indicator | 0;
+    if (traitsCache[indicator]) {
+        return traitsCache[indicator];
+    }
+    const traits = {};
+    let i = 0;
+    for (const trait of [
+        "httpLabel",
+        "idempotent",
+        "idempotencyToken",
+        "sensitive",
+        "httpPayload",
+        "httpResponseCode",
+        "httpQueryParams",
+    ]) {
+        if (((indicator >> i++) & 1) === 1) {
+            traits[trait] = 1;
+        }
+    }
+    return (traitsCache[indicator] = traits);
+}
+
+const anno = {
+    it: Symbol.for("@smithy/nor-struct-it"),
+    ns: Symbol.for("@smithy/ns"),
+};
+const simpleSchemaCacheN = [];
+const simpleSchemaCacheS = {};
+class NormalizedSchema {
+    ref;
+    memberName;
+    static symbol = Symbol.for("@smithy/nor");
+    symbol = NormalizedSchema.symbol;
+    name;
+    schema;
+    _isMemberSchema;
+    traits;
+    memberTraits;
+    normalizedTraits;
+    constructor(ref, memberName) {
+        this.ref = ref;
+        this.memberName = memberName;
+        const traitStack = [];
+        let _ref = ref;
+        let schema = ref;
+        this._isMemberSchema = false;
+        while (isMemberSchema(_ref)) {
+            traitStack.push(_ref[1]);
+            _ref = _ref[0];
+            schema = deref(_ref);
+            this._isMemberSchema = true;
+        }
+        if (traitStack.length > 0) {
+            this.memberTraits = {};
+            for (let i = traitStack.length - 1; i >= 0; --i) {
+                const traitSet = traitStack[i];
+                Object.assign(this.memberTraits, translateTraits(traitSet));
+            }
+        }
+        else {
+            this.memberTraits = 0;
+        }
+        if (schema instanceof NormalizedSchema) {
+            const computedMemberTraits = this.memberTraits;
+            Object.assign(this, schema);
+            this.memberTraits = Object.assign({}, computedMemberTraits, schema.getMemberTraits(), this.getMemberTraits());
+            this.normalizedTraits = void 0;
+            this.memberName = memberName ?? schema.memberName;
+            return;
+        }
+        this.schema = deref(schema);
+        if (isStaticSchema(this.schema)) {
+            this.name = `${this.schema[1]}#${this.schema[2]}`;
+            this.traits = this.schema[3];
+        }
+        else {
+            this.name = this.memberName ?? String(schema);
+            this.traits = 0;
+        }
+        if (this._isMemberSchema && !memberName) {
+            throw new Error(`@smithy/core/schema - NormalizedSchema member init ${this.getName(true)} missing member name.`);
+        }
+    }
+    static [Symbol.hasInstance](lhs) {
+        const isPrototype = this.prototype.isPrototypeOf(lhs);
+        if (!isPrototype && typeof lhs === "object" && lhs !== null) {
+            const ns = lhs;
+            return ns.symbol === this.symbol;
+        }
+        return isPrototype;
+    }
+    static of(ref) {
+        const keyAble = typeof ref === "function" || (typeof ref === "object" && ref !== null);
+        if (typeof ref === "number") {
+            if (simpleSchemaCacheN[ref]) {
+                return simpleSchemaCacheN[ref];
+            }
+        }
+        else if (typeof ref === "string") {
+            if (simpleSchemaCacheS[ref]) {
+                return simpleSchemaCacheS[ref];
+            }
+        }
+        else if (keyAble) {
+            if (ref[anno.ns]) {
+                return ref[anno.ns];
+            }
+        }
+        const sc = deref(ref);
+        if (sc instanceof NormalizedSchema) {
+            return sc;
+        }
+        if (isMemberSchema(sc)) {
+            const [ns, traits] = sc;
+            if (ns instanceof NormalizedSchema) {
+                Object.assign(ns.getMergedTraits(), translateTraits(traits));
+                return ns;
+            }
+            throw new Error(`@smithy/core/schema - may not init unwrapped member schema=${JSON.stringify(ref, null, 2)}.`);
+        }
+        const ns = new NormalizedSchema(sc);
+        if (keyAble) {
+            return (ref[anno.ns] = ns);
+        }
+        if (typeof sc === "string") {
+            return (simpleSchemaCacheS[sc] = ns);
+        }
+        if (typeof sc === "number") {
+            return (simpleSchemaCacheN[sc] = ns);
+        }
+        return ns;
+    }
+    getSchema() {
+        const sc = this.schema;
+        if (Array.isArray(sc) && sc[0] === 0) {
+            return sc[4];
+        }
+        return sc;
+    }
+    getName(withNamespace = false) {
+        const { name } = this;
+        const short = !withNamespace && name && name.includes("#");
+        return short ? name.split("#")[1] : name || undefined;
+    }
+    getMemberName() {
+        return this.memberName;
+    }
+    isMemberSchema() {
+        return this._isMemberSchema;
+    }
+    isListSchema() {
+        const sc = this.getSchema();
+        return typeof sc === "number"
+            ? sc >= 64 && sc < 128
+            : sc[0] === 1;
+    }
+    isMapSchema() {
+        const sc = this.getSchema();
+        return typeof sc === "number"
+            ? sc >= 128 && sc <= 0b1111_1111
+            : sc[0] === 2;
+    }
+    isStructSchema() {
+        const sc = this.getSchema();
+        if (typeof sc !== "object") {
+            return false;
+        }
+        const id = sc[0];
+        return (id === 3 ||
+            id === -3 ||
+            id === 4);
+    }
+    isUnionSchema() {
+        const sc = this.getSchema();
+        if (typeof sc !== "object") {
+            return false;
+        }
+        return sc[0] === 4;
+    }
+    isBlobSchema() {
+        const sc = this.getSchema();
+        return sc === 21 || sc === 42;
+    }
+    isTimestampSchema() {
+        const sc = this.getSchema();
+        return (typeof sc === "number" &&
+            sc >= 4 &&
+            sc <= 7);
+    }
+    isUnitSchema() {
+        return this.getSchema() === "unit";
+    }
+    isDocumentSchema() {
+        return this.getSchema() === 15;
+    }
+    isStringSchema() {
+        return this.getSchema() === 0;
+    }
+    isBooleanSchema() {
+        return this.getSchema() === 2;
+    }
+    isNumericSchema() {
+        return this.getSchema() === 1;
+    }
+    isBigIntegerSchema() {
+        return this.getSchema() === 17;
+    }
+    isBigDecimalSchema() {
+        return this.getSchema() === 19;
+    }
+    isStreaming() {
+        const { streaming } = this.getMergedTraits();
+        return !!streaming || this.getSchema() === 42;
+    }
+    isIdempotencyToken() {
+        return !!this.getMergedTraits().idempotencyToken;
+    }
+    getMergedTraits() {
+        return (this.normalizedTraits ??
+            (this.normalizedTraits = {
+                ...this.getOwnTraits(),
+                ...this.getMemberTraits(),
+            }));
+    }
+    getMemberTraits() {
+        return translateTraits(this.memberTraits);
+    }
+    getOwnTraits() {
+        return translateTraits(this.traits);
+    }
+    getKeySchema() {
+        const [isDoc, isMap] = [this.isDocumentSchema(), this.isMapSchema()];
+        if (!isDoc && !isMap) {
+            throw new Error(`@smithy/core/schema - cannot get key for non-map: ${this.getName(true)}`);
+        }
+        const schema = this.getSchema();
+        const memberSchema = isDoc
+            ? 15
+            : (schema[4] ?? 0);
+        return member([memberSchema, 0], "key");
+    }
+    getValueSchema() {
+        const sc = this.getSchema();
+        const [isDoc, isMap, isList] = [this.isDocumentSchema(), this.isMapSchema(), this.isListSchema()];
+        const memberSchema = typeof sc === "number"
+            ? 0b0011_1111 & sc
+            : sc && typeof sc === "object" && (isMap || isList)
+                ? sc[3 + sc[0]]
+                : isDoc
+                    ? 15
+                    : void 0;
+        if (memberSchema != null) {
+            return member([memberSchema, 0], isMap ? "value" : "member");
+        }
+        throw new Error(`@smithy/core/schema - ${this.getName(true)} has no value member.`);
+    }
+    getMemberSchema(memberName) {
+        const struct = this.getSchema();
+        if (this.isStructSchema() && struct[4].includes(memberName)) {
+            const i = struct[4].indexOf(memberName);
+            const memberSchema = struct[5][i];
+            return member(isMemberSchema(memberSchema) ? memberSchema : [memberSchema, 0], memberName);
+        }
+        if (this.isDocumentSchema()) {
+            return member([15, 0], memberName);
+        }
+        throw new Error(`@smithy/core/schema - ${this.getName(true)} has no member=${memberName}.`);
+    }
+    getMemberSchemas() {
+        const buffer = {};
+        try {
+            for (const [k, v] of this.structIterator()) {
+                buffer[k] = v;
+            }
+        }
+        catch (ignored) { }
+        return buffer;
+    }
+    getEventStreamMember() {
+        if (this.isStructSchema()) {
+            for (const [memberName, memberSchema] of this.structIterator()) {
+                if (memberSchema.isStreaming() && memberSchema.isStructSchema()) {
+                    return memberName;
+                }
+            }
+        }
+        return "";
+    }
+    *structIterator() {
+        if (this.isUnitSchema()) {
+            return;
+        }
+        if (!this.isStructSchema()) {
+            throw new Error("@smithy/core/schema - cannot iterate non-struct schema.");
+        }
+        const struct = this.getSchema();
+        const z = struct[4].length;
+        let it = struct[anno.it];
+        if (it && z === it.length) {
+            yield* it;
+            return;
+        }
+        it = Array(z);
+        for (let i = 0; i < z; ++i) {
+            const k = struct[4][i];
+            const v = member([struct[5][i], 0], k);
+            yield (it[i] = [k, v]);
+        }
+        struct[anno.it] = it;
+    }
+}
+function member(memberSchema, memberName) {
+    if (memberSchema instanceof NormalizedSchema) {
+        return Object.assign(memberSchema, {
+            memberName,
+            _isMemberSchema: true,
+        });
+    }
+    const internalCtorAccess = NormalizedSchema;
+    return new internalCtorAccess(memberSchema, memberName);
+}
+const isMemberSchema = (sc) => Array.isArray(sc) && sc.length === 2;
+const isStaticSchema = (sc) => Array.isArray(sc) && sc.length >= 5;
+
+class TypeRegistry {
+    namespace;
+    schemas;
+    exceptions;
+    static registries = new Map();
+    constructor(namespace, schemas = new Map(), exceptions = new Map()) {
+        this.namespace = namespace;
+        this.schemas = schemas;
+        this.exceptions = exceptions;
+        if (!TypeRegistry.registries.has(namespace)) {
+            TypeRegistry.registries.set(namespace, this);
+        }
+    }
+    static for(namespace) {
+        return TypeRegistry.registries.get(namespace) ?? new TypeRegistry(namespace);
+    }
+    copyFrom(other) {
+        const { schemas, exceptions } = this;
+        for (const [k, v] of other.schemas) {
+            if (!schemas.has(k)) {
+                schemas.set(k, v);
+            }
+        }
+        for (const [k, v] of other.exceptions) {
+            if (!exceptions.has(k)) {
+                exceptions.set(k, v);
+            }
+        }
+    }
+    register(shapeId, schema) {
+        const qualifiedName = this.normalizeShapeId(shapeId);
+        for (const r of [this, TypeRegistry.for(qualifiedName.split("#")[0])]) {
+            if (!r.schemas.has(qualifiedName)) {
+                r.schemas.set(qualifiedName, schema);
+            }
+        }
+    }
+    getSchema(shapeId) {
+        const id = this.normalizeShapeId(shapeId);
+        if (!this.schemas.has(id)) {
+            if (!shapeId.includes("#")) {
+                const suffix = "#" + shapeId;
+                const candidates = [];
+                for (const [shapeId, schema] of this.schemas.entries()) {
+                    if (shapeId.endsWith(suffix)) {
+                        candidates.push(schema);
+                    }
+                }
+                if (candidates.length === 1) {
+                    return candidates[0];
+                }
+            }
+            throw new Error(`@smithy/core/schema - schema not found for ${id}`);
+        }
+        return this.schemas.get(id);
+    }
+    registerError(es, ctor) {
+        const $error = es;
+        const ns = $error[1];
+        const qualifiedName = ns + "#" + $error[2];
+        if (!ctor.hasOwnProperty?.("shapeId")) {
+            ctor.shapeId = qualifiedName;
+        }
+        for (const r of [this, TypeRegistry.for(ns)]) {
+            if (!r.schemas.has(qualifiedName) && !r.exceptions.has($error)) {
+                r.schemas.set(qualifiedName, $error);
+                r.exceptions.set($error, ctor);
+            }
+        }
+    }
+    getErrorCtor(es) {
+        const $error = es;
+        if (this.exceptions.has($error)) {
+            return this.exceptions.get($error);
+        }
+        const registry = TypeRegistry.for($error[1]);
+        return registry.exceptions.get($error);
+    }
+    getBaseException() {
+        for (const exceptionKey of this.exceptions.keys()) {
+            if (Array.isArray(exceptionKey)) {
+                const [, ns, name] = exceptionKey;
+                const id = ns + "#" + name;
+                if (id.startsWith("smithy.ts.sdk.synthetic.") && id.endsWith("ServiceException")) {
+                    return exceptionKey;
+                }
+            }
+        }
+        return undefined;
+    }
+    find(predicate) {
+        for (const schema of this.schemas.values()) {
+            if (predicate(schema)) {
+                return schema;
+            }
+        }
+        return undefined;
+    }
+    clear() {
+        this.schemas.clear();
+        this.exceptions.clear();
+    }
+    normalizeShapeId(shapeId) {
+        if (shapeId.includes("#")) {
+            return shapeId;
+        }
+        return this.namespace + "#" + shapeId;
+    }
+}
+
+const decorateServiceException = (exception, additions = {}) => {
+    Object.entries(additions)
+        .filter(([, v]) => v !== undefined)
+        .forEach(([k, v]) => {
+        if (exception[k] == undefined || exception[k] === "") {
+            exception[k] = v;
+        }
+    });
+    const message = exception.message || exception.Message || "UnknownError";
+    exception.message = message;
+    delete exception.Message;
+    return exception;
+};
+
+const getValueFromTextNode = (obj) => {
+    const textNodeName = "#text";
+    for (const key in obj) {
+        if (!hasOwn(obj, key))
+            continue;
+        if (obj[key][textNodeName] !== undefined) {
+            obj[key] = obj[key][textNodeName];
+        }
+        else if (typeof obj[key] === "object" && obj[key] !== null) {
+            obj[key] = getValueFromTextNode(obj[key]);
+        }
+    }
+    return obj;
+};
+
+const isArrayBuffer$1 = (arg) => (typeof ArrayBuffer === "function" && arg instanceof ArrayBuffer) ||
+    Object.prototype.toString.call(arg) === "[object ArrayBuffer]";
+
+const fromArrayBuffer$1 = (input, offset = 0, length = input.byteLength - offset) => {
+    if (!isArrayBuffer$1(input)) {
+        throw new TypeError(`The "input" argument must be ArrayBuffer. Received type ${typeof input} (${input})`);
+    }
+    return Buffer.from(input, offset, length);
+};
+const fromString$2 = (input, encoding) => {
+    if (typeof input !== "string") {
+        throw new TypeError(`The "input" argument must be of type string. Received type ${typeof input} (${input})`);
+    }
+    return encoding ? Buffer.from(input, encoding) : Buffer.from(input);
+};
+
+const BASE64_REGEX$1 = /^[A-Za-z0-9+/]*={0,2}$/;
+const fromBase64$1 = (input) => {
+    if ((input.length * 3) % 4 !== 0) {
+        throw new TypeError(`Incorrect padding on base64 string.`);
+    }
+    if (!BASE64_REGEX$1.exec(input)) {
+        throw new TypeError(`Invalid base64 string.`);
+    }
+    const buffer = fromString$2(input, "base64");
+    return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+};
+
+const fromUtf8$4 = (input) => {
+    const buf = fromString$2(input, "utf8");
+    return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength / Uint8Array.BYTES_PER_ELEMENT);
+};
+
+const toBase64$2 = (_input) => {
+    let input;
+    if (typeof _input === "string") {
+        input = fromUtf8$4(_input);
+    }
+    else {
+        input = _input;
+    }
+    if (typeof input !== "object" || typeof input.byteOffset !== "number" || typeof input.byteLength !== "number") {
+        throw new Error("@smithy/util-base64: toBase64 encoder function only accepts string | Uint8Array.");
+    }
+    return fromArrayBuffer$1(input.buffer, input.byteOffset, input.byteLength).toString("base64");
+};
+
+function bindUint8ArrayBlobAdapter(toUtf8, fromUtf8, toBase64, fromBase64) {
+    return class Uint8ArrayBlobAdapter extends Uint8Array {
+        static fromString(source, encoding = "utf-8") {
+            if (typeof source === "string") {
+                if (encoding === "base64") {
+                    return Uint8ArrayBlobAdapter.mutate(fromBase64(source));
+                }
+                return Uint8ArrayBlobAdapter.mutate(fromUtf8(source));
+            }
+            throw new Error(`Unsupported conversion from ${typeof source} to Uint8ArrayBlobAdapter.`);
+        }
+        static mutate(source) {
+            Object.setPrototypeOf(source, Uint8ArrayBlobAdapter.prototype);
+            return source;
+        }
+        transformToString(encoding = "utf-8") {
+            if (encoding === "base64") {
+                return toBase64(this);
+            }
+            return toUtf8(this);
+        }
+    };
+}
+
+const toUtf8$2 = (input) => {
+    if (typeof input === "string") {
+        return input;
+    }
+    if (typeof input !== "object" || typeof input.byteOffset !== "number" || typeof input.byteLength !== "number") {
+        throw new Error("@smithy/util-utf8: toUtf8 encoder function only accepts string | Uint8Array.");
+    }
+    return fromArrayBuffer$1(input.buffer, input.byteOffset, input.byteLength).toString("utf8");
+};
+
+const decimalToHex$1 = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, "0"));
+function bindV4(getRandomValues) {
+    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+        return () => crypto.randomUUID();
+    }
+    return () => {
+        const rnds = new Uint8Array(16);
+        getRandomValues(rnds);
+        rnds[6] = (rnds[6] & 0x0f) | 0x40;
+        rnds[8] = (rnds[8] & 0x3f) | 0x80;
+        return (decimalToHex$1[rnds[0]] +
+            decimalToHex$1[rnds[1]] +
+            decimalToHex$1[rnds[2]] +
+            decimalToHex$1[rnds[3]] +
+            "-" +
+            decimalToHex$1[rnds[4]] +
+            decimalToHex$1[rnds[5]] +
+            "-" +
+            decimalToHex$1[rnds[6]] +
+            decimalToHex$1[rnds[7]] +
+            "-" +
+            decimalToHex$1[rnds[8]] +
+            decimalToHex$1[rnds[9]] +
+            "-" +
+            decimalToHex$1[rnds[10]] +
+            decimalToHex$1[rnds[11]] +
+            decimalToHex$1[rnds[12]] +
+            decimalToHex$1[rnds[13]] +
+            decimalToHex$1[rnds[14]] +
+            decimalToHex$1[rnds[15]]);
+    };
+}
+
+const expectNumber = (value) => {
+    if (value === null || value === undefined) {
+        return undefined;
+    }
+    if (typeof value === "string") {
+        const parsed = parseFloat(value);
+        if (!Number.isNaN(parsed)) {
+            if (String(parsed) !== String(value)) {
+                logger.warn(stackTraceWarning(`Expected number but observed string: ${value}`));
+            }
+            return parsed;
+        }
+    }
+    if (typeof value === "number") {
+        return value;
+    }
+    throw new TypeError(`Expected number, got ${typeof value}: ${value}`);
+};
+const MAX_FLOAT = Math.ceil(2 ** 127 * (2 - 2 ** -23));
+const expectFloat32 = (value) => {
+    const expected = expectNumber(value);
+    if (expected !== undefined && !Number.isNaN(expected) && expected !== Infinity && expected !== -Infinity) {
+        if (Math.abs(expected) > MAX_FLOAT) {
+            throw new TypeError(`Expected 32-bit float, got ${value}`);
+        }
+    }
+    return expected;
+};
+const expectLong = (value) => {
+    if (value === null || value === undefined) {
+        return undefined;
+    }
+    if (Number.isInteger(value) && !Number.isNaN(value)) {
+        return value;
+    }
+    throw new TypeError(`Expected integer, got ${typeof value}: ${value}`);
+};
+const expectShort = (value) => expectSizedInt(value, 16);
+const expectByte = (value) => expectSizedInt(value, 8);
+const expectSizedInt = (value, size) => {
+    const expected = expectLong(value);
+    if (expected !== undefined && castInt(expected, size) !== expected) {
+        throw new TypeError(`Expected ${size}-bit integer, got ${value}`);
+    }
+    return expected;
+};
+const castInt = (value, size) => {
+    switch (size) {
+        case 32:
+            return Int32Array.of(value)[0];
+        case 16:
+            return Int16Array.of(value)[0];
+        case 8:
+            return Int8Array.of(value)[0];
+    }
+};
+const strictParseDouble = (value) => {
+    if (typeof value == "string") {
+        return expectNumber(parseNumber(value));
+    }
+    return expectNumber(value);
+};
+const strictParseFloat32 = (value) => {
+    if (typeof value == "string") {
+        return expectFloat32(parseNumber(value));
+    }
+    return expectFloat32(value);
+};
+const NUMBER_REGEX = /(-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)|(-?Infinity)|(NaN)/g;
+const parseNumber = (value) => {
+    const matches = value.match(NUMBER_REGEX);
+    if (matches === null || matches[0].length !== value.length) {
+        throw new TypeError(`Expected real number, got implicit NaN`);
+    }
+    return parseFloat(value);
+};
+const strictParseShort = (value) => {
+    if (typeof value === "string") {
+        return expectShort(parseNumber(value));
+    }
+    return expectShort(value);
+};
+const strictParseByte = (value) => {
+    if (typeof value === "string") {
+        return expectByte(parseNumber(value));
+    }
+    return expectByte(value);
+};
+const stackTraceWarning = (message) => {
+    return String(new TypeError(message).stack || message)
+        .split("\n")
+        .slice(0, 5)
+        .filter((s) => !s.includes("stackTraceWarning"))
+        .join("\n");
+};
+const logger = {
+    warn: console.warn,
+};
+
+const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+function dateToUtcString(date) {
+    const year = date.getUTCFullYear();
+    const month = date.getUTCMonth();
+    const dayOfWeek = date.getUTCDay();
+    const dayOfMonthInt = date.getUTCDate();
+    const hoursInt = date.getUTCHours();
+    const minutesInt = date.getUTCMinutes();
+    const secondsInt = date.getUTCSeconds();
+    const dayOfMonthString = dayOfMonthInt < 10 ? `0${dayOfMonthInt}` : `${dayOfMonthInt}`;
+    const hoursString = hoursInt < 10 ? `0${hoursInt}` : `${hoursInt}`;
+    const minutesString = minutesInt < 10 ? `0${minutesInt}` : `${minutesInt}`;
+    const secondsString = secondsInt < 10 ? `0${secondsInt}` : `${secondsInt}`;
+    return `${DAYS[dayOfWeek]}, ${dayOfMonthString} ${MONTHS[month]} ${year} ${hoursString}:${minutesString}:${secondsString} GMT`;
+}
+const RFC3339 = new RegExp(/^(\d{4})-(\d{2})-(\d{2})[tT](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?[zZ]$/);
+const parseRfc3339DateTime = (value) => {
+    if (value === null || value === undefined) {
+        return undefined;
+    }
+    if (typeof value !== "string") {
+        throw new TypeError("RFC-3339 date-times must be expressed as strings");
+    }
+    const match = RFC3339.exec(value);
+    if (!match) {
+        throw new TypeError("Invalid RFC-3339 date-time value");
+    }
+    const [_, yearStr, monthStr, dayStr, hours, minutes, seconds, fractionalMilliseconds] = match;
+    const year = strictParseShort(stripLeadingZeroes(yearStr));
+    const month = parseDateValue(monthStr, "month", 1, 12);
+    const day = parseDateValue(dayStr, "day", 1, 31);
+    return buildDate(year, month, day, { hours, minutes, seconds, fractionalMilliseconds });
+};
+const RFC3339_WITH_OFFSET$1 = new RegExp(/^(\d{4})-(\d{2})-(\d{2})[tT](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(([-+]\d{2}:\d{2})|[zZ])$/);
+const parseRfc3339DateTimeWithOffset = (value) => {
+    if (value === null || value === undefined) {
+        return undefined;
+    }
+    if (typeof value !== "string") {
+        throw new TypeError("RFC-3339 date-times must be expressed as strings");
+    }
+    const match = RFC3339_WITH_OFFSET$1.exec(value);
+    if (!match) {
+        throw new TypeError("Invalid RFC-3339 date-time value");
+    }
+    const [_, yearStr, monthStr, dayStr, hours, minutes, seconds, fractionalMilliseconds, offsetStr] = match;
+    const year = strictParseShort(stripLeadingZeroes(yearStr));
+    const month = parseDateValue(monthStr, "month", 1, 12);
+    const day = parseDateValue(dayStr, "day", 1, 31);
+    const date = buildDate(year, month, day, { hours, minutes, seconds, fractionalMilliseconds });
+    if (offsetStr.toUpperCase() != "Z") {
+        date.setTime(date.getTime() - parseOffsetToMilliseconds(offsetStr));
+    }
+    return date;
+};
+const IMF_FIXDATE$1 = new RegExp(/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), (\d{2}) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (\d{4}) (\d{1,2}):(\d{2}):(\d{2})(?:\.(\d+))? GMT$/);
+const RFC_850_DATE$1 = new RegExp(/^(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), (\d{2})-(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-(\d{2}) (\d{1,2}):(\d{2}):(\d{2})(?:\.(\d+))? GMT$/);
+const ASC_TIME$1 = new RegExp(/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) ( [1-9]|\d{2}) (\d{1,2}):(\d{2}):(\d{2})(?:\.(\d+))? (\d{4})$/);
+const parseRfc7231DateTime = (value) => {
+    if (value === null || value === undefined) {
+        return undefined;
+    }
+    if (typeof value !== "string") {
+        throw new TypeError("RFC-7231 date-times must be expressed as strings");
+    }
+    let match = IMF_FIXDATE$1.exec(value);
+    if (match) {
+        const [_, dayStr, monthStr, yearStr, hours, minutes, seconds, fractionalMilliseconds] = match;
+        return buildDate(strictParseShort(stripLeadingZeroes(yearStr)), parseMonthByShortName(monthStr), parseDateValue(dayStr, "day", 1, 31), { hours, minutes, seconds, fractionalMilliseconds });
+    }
+    match = RFC_850_DATE$1.exec(value);
+    if (match) {
+        const [_, dayStr, monthStr, yearStr, hours, minutes, seconds, fractionalMilliseconds] = match;
+        return adjustRfc850Year(buildDate(parseTwoDigitYear(yearStr), parseMonthByShortName(monthStr), parseDateValue(dayStr, "day", 1, 31), {
+            hours,
+            minutes,
+            seconds,
+            fractionalMilliseconds,
+        }));
+    }
+    match = ASC_TIME$1.exec(value);
+    if (match) {
+        const [_, monthStr, dayStr, hours, minutes, seconds, fractionalMilliseconds, yearStr] = match;
+        return buildDate(strictParseShort(stripLeadingZeroes(yearStr)), parseMonthByShortName(monthStr), parseDateValue(dayStr.trimLeft(), "day", 1, 31), { hours, minutes, seconds, fractionalMilliseconds });
+    }
+    throw new TypeError("Invalid RFC-7231 date-time value");
+};
+const parseEpochTimestamp = (value) => {
+    if (value === null || value === undefined) {
+        return undefined;
+    }
+    let valueAsDouble;
+    if (typeof value === "number") {
+        valueAsDouble = value;
+    }
+    else if (typeof value === "string") {
+        valueAsDouble = strictParseDouble(value);
+    }
+    else if (typeof value === "object" && value.tag === 1) {
+        valueAsDouble = value.value;
+    }
+    else {
+        throw new TypeError("Epoch timestamps must be expressed as floating point numbers or their string representation");
+    }
+    if (Number.isNaN(valueAsDouble) || valueAsDouble === Infinity || valueAsDouble === -Infinity) {
+        throw new TypeError("Epoch timestamps must be valid, non-Infinite, non-NaN numerics");
+    }
+    return new Date(Math.round(valueAsDouble * 1000));
+};
+const buildDate = (year, month, day, time) => {
+    const adjustedMonth = month - 1;
+    validateDayOfMonth(year, adjustedMonth, day);
+    return new Date(Date.UTC(year, adjustedMonth, day, parseDateValue(time.hours, "hour", 0, 23), parseDateValue(time.minutes, "minute", 0, 59), parseDateValue(time.seconds, "seconds", 0, 60), parseMilliseconds(time.fractionalMilliseconds)));
+};
+const parseTwoDigitYear = (value) => {
+    const thisYear = new Date().getUTCFullYear();
+    const valueInThisCentury = Math.floor(thisYear / 100) * 100 + strictParseShort(stripLeadingZeroes(value));
+    if (valueInThisCentury < thisYear) {
+        return valueInThisCentury + 100;
+    }
+    return valueInThisCentury;
+};
+const FIFTY_YEARS_IN_MILLIS = 50 * 365 * 24 * 60 * 60 * 1000;
+const adjustRfc850Year = (input) => {
+    if (input.getTime() - new Date().getTime() > FIFTY_YEARS_IN_MILLIS) {
+        return new Date(Date.UTC(input.getUTCFullYear() - 100, input.getUTCMonth(), input.getUTCDate(), input.getUTCHours(), input.getUTCMinutes(), input.getUTCSeconds(), input.getUTCMilliseconds()));
+    }
+    return input;
+};
+const parseMonthByShortName = (value) => {
+    const monthIdx = MONTHS.indexOf(value);
+    if (monthIdx < 0) {
+        throw new TypeError(`Invalid month: ${value}`);
+    }
+    return monthIdx + 1;
+};
+const DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+const validateDayOfMonth = (year, month, day) => {
+    let maxDays = DAYS_IN_MONTH[month];
+    if (month === 1 && isLeapYear(year)) {
+        maxDays = 29;
+    }
+    if (day > maxDays) {
+        throw new TypeError(`Invalid day for ${MONTHS[month]} in ${year}: ${day}`);
+    }
+};
+const isLeapYear = (year) => {
+    return year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+};
+const parseDateValue = (value, type, lower, upper) => {
+    const dateVal = strictParseByte(stripLeadingZeroes(value));
+    if (dateVal < lower || dateVal > upper) {
+        throw new TypeError(`${type} must be between ${lower} and ${upper}, inclusive`);
+    }
+    return dateVal;
+};
+const parseMilliseconds = (value) => {
+    if (value === null || value === undefined) {
+        return 0;
+    }
+    return strictParseFloat32("0." + value) * 1000;
+};
+const parseOffsetToMilliseconds = (value) => {
+    const directionStr = value[0];
+    let direction = 1;
+    if (directionStr == "+") {
+        direction = 1;
+    }
+    else if (directionStr == "-") {
+        direction = -1;
+    }
+    else {
+        throw new TypeError(`Offset direction, ${directionStr}, must be "+" or "-"`);
+    }
+    const hour = Number(value.substring(1, 3));
+    const minute = Number(value.substring(4, 6));
+    return direction * (hour * 60 + minute) * 60 * 1000;
+};
+const stripLeadingZeroes = (value) => {
+    let idx = 0;
+    while (idx < value.length - 1 && value.charAt(idx) === "0") {
+        idx++;
+    }
+    if (idx === 0) {
+        return value;
+    }
+    return value.slice(idx);
+};
+
+const LazyJsonString = function LazyJsonString(val) {
+    const str = Object.assign(new String(val), {
+        deserializeJSON() {
+            return JSON.parse(String(val));
+        },
+        toString() {
+            return String(val);
+        },
+        toJSON() {
+            return String(val);
+        },
+    });
+    return str;
+};
+LazyJsonString.from = (object) => {
+    if (object && typeof object === "object" && (object instanceof LazyJsonString || "deserializeJSON" in object)) {
+        return object;
+    }
+    else if (typeof object === "string" || Object.getPrototypeOf(object) === String.prototype) {
+        return LazyJsonString(String(object));
+    }
+    return LazyJsonString(JSON.stringify(object));
+};
+LazyJsonString.fromObject = LazyJsonString.from;
+
+function quoteHeader(part) {
+    if (part.includes(",") || part.includes('"')) {
+        part = `"${part.replace(/"/g, '\\"')}"`;
+    }
+    return part;
+}
+
+const ddd = `(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)(?:[ne|u?r]?s?day)?`;
+const mmm = `(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)`;
+const time = `(\\d?\\d):(\\d{2}):(\\d{2})(?:\\.(\\d+))?`;
+const date = `(\\d?\\d)`;
+const year = `(\\d{4})`;
+const RFC3339_WITH_OFFSET = new RegExp(/^(\d{4})-(\d\d)-(\d\d)[tT](\d\d):(\d\d):(\d\d)(\.(\d+))?(([-+]\d\d:\d\d)|[zZ])$/);
+const IMF_FIXDATE = new RegExp(`^${ddd}, ${date} ${mmm} ${year} ${time} GMT$`);
+const RFC_850_DATE = new RegExp(`^${ddd}, ${date}-${mmm}-(\\d\\d) ${time} GMT$`);
+const ASC_TIME = new RegExp(`^${ddd} ${mmm} ( [1-9]|\\d\\d) ${time} ${year}$`);
+const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const _parseEpochTimestamp = (value) => {
+    if (value == null) {
+        return void 0;
+    }
+    let num = NaN;
+    if (typeof value === "number") {
+        num = value;
+    }
+    else if (typeof value === "string") {
+        if (!/^-?\d*\.?\d+$/.test(value)) {
+            throw new TypeError(`parseEpochTimestamp - numeric string invalid.`);
+        }
+        num = Number.parseFloat(value);
+    }
+    else if (typeof value === "object" && value.tag === 1) {
+        num = value.value;
+    }
+    if (isNaN(num) || Math.abs(num) === Infinity) {
+        throw new TypeError("Epoch timestamps must be valid finite numbers.");
+    }
+    return new Date(Math.round(num * 1000));
+};
+const _parseRfc3339DateTimeWithOffset = (value) => {
+    if (value == null) {
+        return void 0;
+    }
+    if (typeof value !== "string") {
+        throw new TypeError("RFC3339 timestamps must be strings");
+    }
+    const matches = RFC3339_WITH_OFFSET.exec(value);
+    if (!matches) {
+        throw new TypeError(`Invalid RFC3339 timestamp format ${value}`);
+    }
+    const [, yearStr, monthStr, dayStr, hours, minutes, seconds, , ms, offsetStr] = matches;
+    range(monthStr, 1, 12);
+    range(dayStr, 1, 31);
+    range(hours, 0, 23);
+    range(minutes, 0, 59);
+    range(seconds, 0, 60);
+    const date = new Date(Date.UTC(Number(yearStr), Number(monthStr) - 1, Number(dayStr), Number(hours), Number(minutes), Number(seconds), Number(ms) ? Math.round(parseFloat(`0.${ms}`) * 1000) : 0));
+    date.setUTCFullYear(Number(yearStr));
+    if (offsetStr.toUpperCase() != "Z") {
+        const [, sign, offsetH, offsetM] = /([+-])(\d\d):(\d\d)/.exec(offsetStr) || [void 0, "+", 0, 0];
+        const scalar = sign === "-" ? 1 : -1;
+        date.setTime(date.getTime() + scalar * (Number(offsetH) * 60 * 60 * 1000 + Number(offsetM) * 60 * 1000));
+    }
+    return date;
+};
+const _parseRfc7231DateTime = (value) => {
+    if (value == null) {
+        return void 0;
+    }
+    if (typeof value !== "string") {
+        throw new TypeError("RFC7231 timestamps must be strings.");
+    }
+    let day;
+    let month;
+    let year;
+    let hour;
+    let minute;
+    let second;
+    let fraction;
+    let matches;
+    if ((matches = IMF_FIXDATE.exec(value))) {
+        [, day, month, year, hour, minute, second, fraction] = matches;
+    }
+    else if ((matches = RFC_850_DATE.exec(value))) {
+        [, day, month, year, hour, minute, second, fraction] = matches;
+        year = (Number(year) + 1900).toString();
+    }
+    else if ((matches = ASC_TIME.exec(value))) {
+        [, month, day, hour, minute, second, fraction, year] = matches;
+    }
+    if (year && second) {
+        const timestamp = Date.UTC(Number(year), months.indexOf(month), Number(day), Number(hour), Number(minute), Number(second), fraction ? Math.round(parseFloat(`0.${fraction}`) * 1000) : 0);
+        range(day, 1, 31);
+        range(hour, 0, 23);
+        range(minute, 0, 59);
+        range(second, 0, 60);
+        const date = new Date(timestamp);
+        date.setUTCFullYear(Number(year));
+        return date;
+    }
+    throw new TypeError(`Invalid RFC7231 date-time value ${value}.`);
+};
+function range(v, min, max) {
+    const _v = Number(v);
+    if (_v < min || _v > max) {
+        throw new Error(`Value ${_v} out of range [${min}, ${max}]`);
+    }
+}
+
+function splitEvery(value, delimiter, numDelimiters) {
+    if (numDelimiters <= 0 || !Number.isInteger(numDelimiters)) {
+        throw new Error("Invalid number of delimiters (" + numDelimiters + ") for splitEvery.");
+    }
+    const segments = value.split(delimiter);
+    if (numDelimiters === 1) {
+        return segments;
+    }
+    const compoundSegments = [];
+    let currentSegment = "";
+    for (let i = 0; i < segments.length; i++) {
+        if (currentSegment === "") {
+            currentSegment = segments[i];
+        }
+        else {
+            currentSegment += delimiter + segments[i];
+        }
+        if ((i + 1) % numDelimiters === 0) {
+            compoundSegments.push(currentSegment);
+            currentSegment = "";
+        }
+    }
+    if (currentSegment !== "") {
+        compoundSegments.push(currentSegment);
+    }
+    return compoundSegments;
+}
+
+const splitHeader = (value) => {
+    const z = value.length;
+    const values = [];
+    let withinQuotes = false;
+    let prevChar = undefined;
+    let anchor = 0;
+    for (let i = 0; i < z; ++i) {
+        const char = value[i];
+        switch (char) {
+            case `"`:
+                if (prevChar !== "\\") {
+                    withinQuotes = !withinQuotes;
+                }
+                break;
+            case ",":
+                if (!withinQuotes) {
+                    values.push(value.slice(anchor, i));
+                    anchor = i + 1;
+                }
+                break;
+        }
+        prevChar = char;
+    }
+    values.push(value.slice(anchor));
+    return values.map((v) => {
+        v = v.trim();
+        const z = v.length;
+        if (z < 2) {
+            return v;
+        }
+        if (v[0] === `"` && v[z - 1] === `"`) {
+            v = v.slice(1, z - 1);
+        }
+        return v.replace(/\\"/g, '"');
+    });
+};
+
+const format = /^-?((0|[1-9]\d*)(\.\d+)?|\.\d+)([eE][+-]?\d+)?$/;
+class NumericValue {
+    string;
+    type;
+    constructor(string, type) {
+        this.string = string;
+        this.type = type;
+        if (!format.test(string)) {
+            throw new Error(`@smithy/core/serde - NumericValue string must conform to the Smithy bigDecimal format. Received: "${string}"`);
+        }
+    }
+    toString() {
+        return this.string;
+    }
+    static [Symbol.hasInstance](object) {
+        if (!object || typeof object !== "object") {
+            return false;
+        }
+        const _nv = object;
+        return NumericValue.prototype.isPrototypeOf(object) || (_nv.type === "bigDecimal" && format.test(_nv.string));
+    }
+}
+
+const SHORT_TO_HEX$1 = {};
+const HEX_TO_SHORT$1 = {};
+for (let i = 0; i < 256; i++) {
+    let encodedByte = i.toString(16).toLowerCase();
+    if (encodedByte.length === 1) {
+        encodedByte = `0${encodedByte}`;
+    }
+    SHORT_TO_HEX$1[i] = encodedByte;
+    HEX_TO_SHORT$1[encodedByte] = i;
+}
+function fromHex$1(encoded) {
+    if (encoded.length % 2 !== 0) {
+        throw new Error("Hex encoded strings must have an even number length");
+    }
+    const out = new Uint8Array(encoded.length / 2);
+    for (let i = 0; i < encoded.length; i += 2) {
+        const encodedByte = encoded.slice(i, i + 2).toLowerCase();
+        if (encodedByte in HEX_TO_SHORT$1) {
+            out[i / 2] = HEX_TO_SHORT$1[encodedByte];
+        }
+        else {
+            throw new Error(`Cannot decode unrecognized sequence ${encodedByte} as hexadecimal`);
+        }
+    }
+    return out;
+}
+function toHex$1(bytes) {
+    let out = "";
+    for (let i = 0; i < bytes.byteLength; i++) {
+        out += SHORT_TO_HEX$1[bytes[i]];
+    }
+    return out;
+}
+
+const toUint8Array$1 = (data) => {
+    if (data instanceof Uint8Array) {
+        return data;
+    }
+    if (typeof data === "string") {
+        return fromUtf8$4(data);
+    }
+    if (ArrayBuffer.isView(data)) {
+        return new Uint8Array(data.buffer, data.byteOffset, data.byteLength / Uint8Array.BYTES_PER_ELEMENT);
+    }
+    return new Uint8Array(data);
+};
+
+function concatBytes(arrays, length) {
+    if (length === undefined) {
+        length = 0;
+        for (const bytes of arrays) {
+            length += bytes.byteLength;
+        }
+    }
+    const result = new Uint8Array(length);
+    let offset = 0;
+    for (const buf of arrays) {
+        result.set(buf, offset);
+        offset += buf.byteLength;
+    }
+    return result;
+}
+
+let ProviderError$1 = class ProviderError extends Error {
+    name = "ProviderError";
+    tryNextLink;
+    constructor(message, options = true) {
+        let logger;
+        let tryNextLink = true;
+        if (typeof options === "boolean") {
+            logger = undefined;
+            tryNextLink = options;
+        }
+        else if (options != null && typeof options === "object") {
+            logger = options.logger;
+            tryNextLink = options.tryNextLink ?? true;
+        }
+        super(message);
+        this.tryNextLink = tryNextLink;
+        Object.setPrototypeOf(this, ProviderError.prototype);
+        logger?.debug?.(`@smithy/property-provider ${tryNextLink ? "->" : "(!)"} ${message}`);
+    }
+    static from(error, options = true) {
+        return Object.assign(new this(error.message, options), error);
+    }
+};
+
+let CredentialsProviderError$1 = class CredentialsProviderError extends ProviderError$1 {
+    name = "CredentialsProviderError";
+    constructor(message, options = true) {
+        super(message, options);
+        Object.setPrototypeOf(this, CredentialsProviderError.prototype);
+    }
+};
+
+const chain$1 = (...providers) => async () => {
+    if (providers.length === 0) {
+        throw new ProviderError$1("No providers in chain");
+    }
+    let lastProviderError;
+    for (const provider of providers) {
+        try {
+            const credentials = await provider();
+            return credentials;
+        }
+        catch (err) {
+            lastProviderError = err;
+            if (err?.tryNextLink) {
+                continue;
+            }
+            throw err;
+        }
+    }
+    throw lastProviderError;
+};
+
+const fromValue = (staticValue) => () => Promise.resolve(staticValue);
+
+const memoize$1 = (provider, isExpired, requiresRefresh) => {
+    let resolved;
+    let pending;
+    let hasResult;
+    let isConstant = false;
+    const coalesceProvider = async () => {
+        if (!pending) {
+            pending = provider();
+        }
+        try {
+            resolved = await pending;
+            hasResult = true;
+            isConstant = false;
+        }
+        finally {
+            pending = undefined;
+        }
+        return resolved;
+    };
+    if (isExpired === undefined) {
+        return async (options) => {
+            if (!hasResult || options?.forceRefresh) {
+                resolved = await coalesceProvider();
+            }
+            return resolved;
+        };
+    }
+    return async (options) => {
+        if (!hasResult || options?.forceRefresh) {
+            resolved = await coalesceProvider();
+        }
+        if (isConstant) {
+            return resolved;
+        }
+        if (requiresRefresh && !requiresRefresh(resolved)) {
+            isConstant = true;
+            return resolved;
+        }
+        if (isExpired(resolved)) {
+            await coalesceProvider();
+            return resolved;
+        }
+        return resolved;
+    };
+};
+
+const booleanSelector$1 = (obj, key, type) => {
+    if (!(key in obj))
+        return undefined;
+    if (obj[key] === "true")
+        return true;
+    if (obj[key] === "false")
+        return false;
+    throw new Error(`Cannot load ${type} "${key}". Expected "true" or "false", got ${obj[key]}.`);
+};
 
 var SelectorType$1;
 (function (SelectorType) {
     SelectorType["ENV"] = "env";
     SelectorType["CONFIG"] = "shared config entry";
 })(SelectorType$1 || (SelectorType$1 = {}));
-const stringUnionSelector = (obj, key, union, type) => {
-    if (!(key in obj))
-        return undefined;
-    const value = obj[key].toUpperCase();
-    if (!Object.values(union).includes(value)) {
-        throw new TypeError(`Cannot load ${type} '${key}'. Expected one of ${Object.values(union)}, got '${obj[key]}'.`);
+
+const homeDirCache$1 = {};
+const getHomeDirCacheKey$1 = () => {
+    if (process && process.geteuid) {
+        return `${process.geteuid()}`;
     }
-    return value;
+    return "DEFAULT";
+};
+const getHomeDir$1 = () => {
+    const { HOME, USERPROFILE, HOMEPATH, HOMEDRIVE = `C:${sep}` } = process.env;
+    if (HOME)
+        return HOME;
+    if (USERPROFILE)
+        return USERPROFILE;
+    if (HOMEPATH)
+        return `${HOMEDRIVE}${HOMEPATH}`;
+    const homeDirCacheKey = getHomeDirCacheKey$1();
+    if (!homeDirCache$1[homeDirCacheKey])
+        homeDirCache$1[homeDirCacheKey] = homedir();
+    return homeDirCache$1[homeDirCacheKey];
 };
 
-const ENV_REQUEST_CHECKSUM_CALCULATION = "AWS_REQUEST_CHECKSUM_CALCULATION";
-const CONFIG_REQUEST_CHECKSUM_CALCULATION = "request_checksum_calculation";
-const NODE_REQUEST_CHECKSUM_CALCULATION_CONFIG_OPTIONS = {
-    environmentVariableSelector: (env) => stringUnionSelector(env, ENV_REQUEST_CHECKSUM_CALCULATION, RequestChecksumCalculation, SelectorType$1.ENV),
-    configFileSelector: (profile) => stringUnionSelector(profile, CONFIG_REQUEST_CHECKSUM_CALCULATION, RequestChecksumCalculation, SelectorType$1.CONFIG),
-    default: DEFAULT_REQUEST_CHECKSUM_CALCULATION,
-};
+const ENV_PROFILE$1 = "AWS_PROFILE";
+const DEFAULT_PROFILE$1 = "default";
+const getProfileName$1 = (init) => init.profile || process.env[ENV_PROFILE$1] || DEFAULT_PROFILE$1;
 
-const ENV_RESPONSE_CHECKSUM_VALIDATION = "AWS_RESPONSE_CHECKSUM_VALIDATION";
-const CONFIG_RESPONSE_CHECKSUM_VALIDATION = "response_checksum_validation";
-const NODE_RESPONSE_CHECKSUM_VALIDATION_CONFIG_OPTIONS = {
-    environmentVariableSelector: (env) => stringUnionSelector(env, ENV_RESPONSE_CHECKSUM_VALIDATION, ResponseChecksumValidation, SelectorType$1.ENV),
-    configFileSelector: (profile) => stringUnionSelector(profile, CONFIG_RESPONSE_CHECKSUM_VALIDATION, ResponseChecksumValidation, SelectorType$1.CONFIG),
-    default: DEFAULT_RESPONSE_CHECKSUM_VALIDATION,
-};
+const CONFIG_PREFIX_SEPARATOR$1 = ".";
 
-const state = {
-    warningEmitted: false,
-};
-const emitWarningIfUnsupportedVersion$1 = (version) => {
-    if (version && !state.warningEmitted && parseInt(version.substring(1, version.indexOf("."))) < 20) {
-        state.warningEmitted = true;
-        process.emitWarning(`NodeDeprecationWarning: The AWS SDK for JavaScript (v3) will
-no longer support Node.js ${version} in January 2026.
-
-To continue receiving updates to AWS services, bug fixes, and security
-updates please upgrade to a supported Node.js LTS version.
-
-More information can be found at: https://a.co/c895JFp`);
+const getConfigData$1 = (data) => Object.entries(data)
+    .filter(([key]) => {
+    const indexOfSeparator = key.indexOf(CONFIG_PREFIX_SEPARATOR$1);
+    if (indexOfSeparator === -1) {
+        return false;
     }
+    return Object.values(IniSectionType).includes(key.substring(0, indexOfSeparator));
+})
+    .reduce((acc, [key, value]) => {
+    const indexOfSeparator = key.indexOf(CONFIG_PREFIX_SEPARATOR$1);
+    const updatedKey = key.substring(0, indexOfSeparator) === IniSectionType.PROFILE ? key.substring(indexOfSeparator + 1) : key;
+    acc[updatedKey] = value;
+    return acc;
+}, {
+    ...(data.default && { default: data.default }),
+});
+
+const ENV_CONFIG_PATH$1 = "AWS_CONFIG_FILE";
+const getConfigFilepath$1 = () => process.env[ENV_CONFIG_PATH$1] || join(getHomeDir$1(), ".aws", "config");
+
+const ENV_CREDENTIALS_PATH$1 = "AWS_SHARED_CREDENTIALS_FILE";
+const getCredentialsFilepath$1 = () => process.env[ENV_CREDENTIALS_PATH$1] || join(getHomeDir$1(), ".aws", "credentials");
+
+const prefixKeyRegex$1 = /^([\w-]+)\s(["'])?([\w-@+.%:/]+)\2$/;
+const profileNameBlockList$1 = ["__proto__", "profile __proto__"];
+const parseIni$1 = (iniData) => {
+    const map = {};
+    let currentSection;
+    let currentSubSection;
+    for (const iniLine of iniData.split(/\r?\n/)) {
+        const trimmedLine = iniLine.split(/(^|\s)[;#]/)[0].trim();
+        const isSection = trimmedLine[0] === "[" && trimmedLine[trimmedLine.length - 1] === "]";
+        if (isSection) {
+            currentSection = undefined;
+            currentSubSection = undefined;
+            const sectionName = trimmedLine.substring(1, trimmedLine.length - 1);
+            const matches = prefixKeyRegex$1.exec(sectionName);
+            if (matches) {
+                const [, prefix, , name] = matches;
+                if (Object.values(IniSectionType).includes(prefix)) {
+                    currentSection = [prefix, name].join(CONFIG_PREFIX_SEPARATOR$1);
+                }
+            }
+            else {
+                currentSection = sectionName;
+            }
+            if (profileNameBlockList$1.includes(sectionName)) {
+                throw new Error(`Found invalid profile name "${sectionName}"`);
+            }
+        }
+        else if (currentSection) {
+            const indexOfEqualsSign = trimmedLine.indexOf("=");
+            if (![0, -1].includes(indexOfEqualsSign)) {
+                const [name, value] = [
+                    trimmedLine.substring(0, indexOfEqualsSign).trim(),
+                    trimmedLine.substring(indexOfEqualsSign + 1).trim(),
+                ];
+                if (value === "") {
+                    currentSubSection = name;
+                }
+                else {
+                    if (currentSubSection && iniLine.trimStart() === iniLine) {
+                        currentSubSection = undefined;
+                    }
+                    map[currentSection] = map[currentSection] || {};
+                    const key = currentSubSection ? [currentSubSection, name].join(CONFIG_PREFIX_SEPARATOR$1) : name;
+                    map[currentSection][key] = value;
+                }
+            }
+        }
+    }
+    return map;
 };
 
-function setCredentialFeature(credentials, feature, value) {
-    if (!credentials.$source) {
-        credentials.$source = {};
+const filePromises$1 = {};
+const fileIntercept$1 = {};
+const readFile$1 = (path, options) => {
+    if (fileIntercept$1[path] !== undefined) {
+        return fileIntercept$1[path];
     }
-    credentials.$source[feature] = value;
-    return credentials;
+    if (!filePromises$1[path] || options?.ignoreCache) {
+        filePromises$1[path] = readFile$2(path, "utf8");
+    }
+    return filePromises$1[path];
+};
+
+const swallowError$2 = () => ({});
+const loadSharedConfigFiles$1 = async (init = {}) => {
+    const { filepath = getCredentialsFilepath$1(), configFilepath = getConfigFilepath$1() } = init;
+    const homeDir = getHomeDir$1();
+    const relativeHomeDirPrefix = "~/";
+    let resolvedFilepath = filepath;
+    if (filepath.startsWith(relativeHomeDirPrefix)) {
+        resolvedFilepath = join(homeDir, filepath.slice(2));
+    }
+    let resolvedConfigFilepath = configFilepath;
+    if (configFilepath.startsWith(relativeHomeDirPrefix)) {
+        resolvedConfigFilepath = join(homeDir, configFilepath.slice(2));
+    }
+    const parsedFiles = await Promise.all([
+        readFile$1(resolvedConfigFilepath, {
+            ignoreCache: init.ignoreCache,
+        })
+            .then(parseIni$1)
+            .then(getConfigData$1)
+            .catch(swallowError$2),
+        readFile$1(resolvedFilepath, {
+            ignoreCache: init.ignoreCache,
+        })
+            .then(parseIni$1)
+            .catch(swallowError$2),
+    ]);
+    return {
+        configFile: parsedFiles[0],
+        credentialsFile: parsedFiles[1],
+    };
+};
+
+function getSelectorName$1(functionString) {
+    try {
+        const constants = new Set(Array.from(functionString.match(/([A-Z_]){3,}/g) ?? []));
+        constants.delete("CONFIG");
+        constants.delete("CONFIG_PREFIX_SEPARATOR");
+        constants.delete("ENV");
+        return [...constants].join(", ");
+    }
+    catch (ignored) {
+        return functionString;
+    }
 }
 
+const fromEnv$2 = (envVarSelector, options) => async () => {
+    try {
+        const config = envVarSelector(process.env, options);
+        if (config === undefined) {
+            throw new Error();
+        }
+        return config;
+    }
+    catch (e) {
+        throw new CredentialsProviderError$1(e.message || `Not found in ENV: ${getSelectorName$1(envVarSelector.toString())}`, { logger: options?.logger });
+    }
+};
+
+const fromSharedConfigFiles$1 = (configSelector, { preferredFile = "config", ...init } = {}) => async () => {
+    const profile = getProfileName$1(init);
+    const { configFile, credentialsFile } = await loadSharedConfigFiles$1(init);
+    const profileFromCredentials = credentialsFile[profile] || {};
+    const profileFromConfig = configFile[profile] || {};
+    const mergedProfile = preferredFile === "config"
+        ? { ...profileFromCredentials, ...profileFromConfig }
+        : { ...profileFromConfig, ...profileFromCredentials };
+    try {
+        const cfgFile = preferredFile === "config" ? configFile : credentialsFile;
+        const configValue = configSelector(mergedProfile, cfgFile);
+        if (configValue === undefined) {
+            throw new Error();
+        }
+        return configValue;
+    }
+    catch (e) {
+        throw new CredentialsProviderError$1(e.message || `Not found in config files w/ profile [${profile}]: ${getSelectorName$1(configSelector.toString())}`, { logger: init.logger });
+    }
+};
+
+const isFunction$1 = (func) => typeof func === "function";
+const fromStatic$2 = (defaultValue) => isFunction$1(defaultValue) ? async () => await defaultValue() : fromValue(defaultValue);
+
+const loadConfig$1 = ({ environmentVariableSelector, configFileSelector, default: defaultValue }, configuration = {}) => {
+    const { signingName, logger } = configuration;
+    const envOptions = { signingName, logger };
+    return memoize$1(chain$1(fromEnv$2(environmentVariableSelector, envOptions), fromSharedConfigFiles$1(configFileSelector, configuration), fromStatic$2(defaultValue)));
+};
+
+const isReadableStream$1 = (stream) => typeof ReadableStream === "function" &&
+    (stream?.constructor?.name === ReadableStream.name || stream instanceof ReadableStream);
+const isBlob$1 = (blob) => {
+    return typeof Blob === "function" && (blob?.constructor?.name === Blob.name || blob instanceof Blob);
+};
+
+const fromUtf8$3 = (input) => new TextEncoder().encode(input);
+
+const chars = `ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/`;
+Object.entries(chars).reduce((acc, [i, c]) => {
+    acc[c] = Number(i);
+    return acc;
+}, {});
+const alphabetByValue = chars.split("");
+const bitsPerLetter = 6;
+const bitsPerByte = 8;
+const maxLetterValue = 0b111111;
+
+function toBase64$1(_input) {
+    let input;
+    if (typeof _input === "string") {
+        input = fromUtf8$3(_input);
+    }
+    else {
+        input = _input;
+    }
+    const isArrayLike = typeof input === "object" && typeof input.length === "number";
+    const isUint8Array = typeof input === "object" &&
+        typeof input.byteOffset === "number" &&
+        typeof input.byteLength === "number";
+    if (!isArrayLike && !isUint8Array) {
+        throw new Error("@smithy/util-base64: toBase64 encoder function only accepts string | Uint8Array.");
+    }
+    let str = "";
+    for (let i = 0; i < input.length; i += 3) {
+        let bits = 0;
+        let bitLength = 0;
+        for (let j = i, limit = Math.min(i + 3, input.length); j < limit; j++) {
+            bits |= input[j] << ((limit - j - 1) * bitsPerByte);
+            bitLength += bitsPerByte;
+        }
+        const bitClusterCount = Math.ceil(bitLength / bitsPerLetter);
+        bits <<= bitClusterCount * bitsPerLetter - bitLength;
+        for (let k = 1; k <= bitClusterCount; k++) {
+            const offset = (bitClusterCount - k) * bitsPerLetter;
+            str += alphabetByValue[(bits & (maxLetterValue << offset)) >> offset];
+        }
+        str += "==".slice(0, 4 - bitClusterCount);
+    }
+    return str;
+}
+
+const toUtf8$1 = (input) => {
+    if (typeof input === "string") {
+        return input;
+    }
+    if (typeof input !== "object" || typeof input.byteOffset !== "number" || typeof input.byteLength !== "number") {
+        throw new Error("@smithy/util-utf8: toUtf8 encoder function only accepts string | Uint8Array.");
+    }
+    return new TextDecoder("utf-8").decode(input);
+};
+
+const streamCollector$3 = async (stream) => {
+    if (isBlob$1(stream)) {
+        return collectBlob$1(stream);
+    }
+    return collectReadableStream$1(stream);
+};
+async function collectBlob$1(blob) {
+    return blob.arrayBuffer().then((ab) => new Uint8Array(ab));
+}
+async function collectReadableStream$1(stream) {
+    const chunks = [];
+    const reader = stream.getReader();
+    let length = 0;
+    while (true) {
+        const { done, value } = await reader.read();
+        if (value) {
+            chunks.push(value);
+            length += value.length;
+        }
+        if (done) {
+            break;
+        }
+    }
+    return concatBytes(chunks, length);
+}
+
+const ERR_MSG_STREAM_HAS_BEEN_TRANSFORMED$3 = "The stream has already been transformed.";
+const sdkStreamMixin$3 = (stream) => {
+    if (!isBlobInstance$1(stream) && !isReadableStream$1(stream)) {
+        const name = stream?.__proto__?.constructor?.name || stream;
+        throw new Error(`Unexpected stream implementation, expect Blob or ReadableStream, got ${name}`);
+    }
+    let transformed = false;
+    const transformToByteArray = async () => {
+        if (transformed) {
+            throw new Error(ERR_MSG_STREAM_HAS_BEEN_TRANSFORMED$3);
+        }
+        transformed = true;
+        return await streamCollector$3(stream);
+    };
+    const blobToWebStream = (blob) => {
+        if (typeof blob.stream !== "function") {
+            throw new Error("Cannot transform payload Blob to web stream. Please make sure the Blob.stream() is polyfilled.\n" +
+                "If you are using React Native, this API is not yet supported, see: https://react-native.canny.io/feature-requests/p/fetch-streaming-body");
+        }
+        return blob.stream();
+    };
+    return Object.assign(stream, {
+        transformToByteArray: transformToByteArray,
+        transformToString: async (encoding) => {
+            const buf = await transformToByteArray();
+            if (encoding === "base64") {
+                return toBase64$1(buf);
+            }
+            else if (encoding === "hex") {
+                return toHex$1(buf);
+            }
+            else if (encoding === undefined || encoding === "utf8" || encoding === "utf-8") {
+                return toUtf8$1(buf);
+            }
+            else if (typeof TextDecoder === "function") {
+                return new TextDecoder(encoding).decode(buf);
+            }
+            else {
+                throw new Error("TextDecoder is not available, please make sure polyfill is provided.");
+            }
+        },
+        transformToWebStream: () => {
+            if (transformed) {
+                throw new Error(ERR_MSG_STREAM_HAS_BEEN_TRANSFORMED$3);
+            }
+            transformed = true;
+            if (isBlobInstance$1(stream)) {
+                return blobToWebStream(stream);
+            }
+            else if (isReadableStream$1(stream)) {
+                return stream;
+            }
+            else {
+                throw new Error(`Cannot transform payload to web stream, got ${stream}`);
+            }
+        },
+    });
+};
+const isBlobInstance$1 = (stream) => typeof Blob === "function" && stream instanceof Blob;
+
+const streamCollector$2 = (stream) => {
+    if (isBlob$1(stream)) {
+        return collectBlob$1(stream);
+    }
+    if (isReadableStream$1(stream)) {
+        return collectReadableStream$1(stream);
+    }
+    return new Promise((resolve, reject) => {
+        const collector = new Collector$2();
+        const nodeStream = stream;
+        nodeStream.pipe(collector);
+        nodeStream.on("error", (err) => {
+            collector.end();
+            reject(err);
+        });
+        collector.on("error", reject);
+        collector.on("finish", function () {
+            const bytes = concatBytes(this.bufferedBytes);
+            resolve(bytes);
+        });
+    });
+};
+let Collector$2 = class Collector extends Writable {
+    bufferedBytes = [];
+    _write(chunk, encoding, callback) {
+        this.bufferedBytes.push(chunk);
+        callback();
+    }
+};
+
+const ERR_MSG_STREAM_HAS_BEEN_TRANSFORMED$2 = "The stream has already been transformed.";
+const sdkStreamMixin$2 = (stream) => {
+    if (!(stream instanceof Readable)) {
+        try {
+            return sdkStreamMixin$3(stream);
+        }
+        catch (ignored) {
+            const name = stream?.__proto__?.constructor?.name || stream;
+            throw new Error(`Unexpected stream implementation, expect Stream.Readable instance, got ${name}`);
+        }
+    }
+    let transformed = false;
+    const transformToByteArray = async () => {
+        if (transformed) {
+            throw new Error(ERR_MSG_STREAM_HAS_BEEN_TRANSFORMED$2);
+        }
+        transformed = true;
+        return await streamCollector$2(stream);
+    };
+    return Object.assign(stream, {
+        transformToByteArray,
+        transformToString: async (encoding) => {
+            const buf = await transformToByteArray();
+            if (encoding === undefined || Buffer.isEncoding(encoding)) {
+                return fromArrayBuffer$1(buf.buffer, buf.byteOffset, buf.byteLength).toString(encoding);
+            }
+            else {
+                const decoder = new TextDecoder(encoding);
+                return decoder.decode(buf);
+            }
+        },
+        transformToWebStream: () => {
+            if (transformed) {
+                throw new Error(ERR_MSG_STREAM_HAS_BEEN_TRANSFORMED$2);
+            }
+            if (stream.readableFlowing !== null) {
+                throw new Error("The stream has been consumed by other callbacks.");
+            }
+            if (typeof Readable.toWeb !== "function") {
+                throw new Error("Readable.toWeb() is not supported. Please ensure a polyfill is available.");
+            }
+            transformed = true;
+            return Readable.toWeb(stream);
+        },
+    });
+};
+
+class Uint8ArrayBlobAdapter extends bindUint8ArrayBlobAdapter(toUtf8$2, fromUtf8$4, toBase64$2, fromBase64$1) {
+}
+const _getRandomValues = getRandomValues;
+const v4$1 = bindV4(_getRandomValues);
+const generateIdempotencyToken = v4$1;
+
+const collectBody$1 = async (streamBody = new Uint8Array(), context) => {
+    if (streamBody instanceof Uint8Array) {
+        return Uint8ArrayBlobAdapter.mutate(streamBody);
+    }
+    if (!streamBody) {
+        return Uint8ArrayBlobAdapter.mutate(new Uint8Array());
+    }
+    const fromContext = context.streamCollector(streamBody);
+    return Uint8ArrayBlobAdapter.mutate(await fromContext);
+};
+
+function extendedEncodeURIComponent(str) {
+    return encodeURIComponent(str).replace(/[!'()*]/g, function (c) {
+        return "%" + c.charCodeAt(0).toString(16).toUpperCase();
+    });
+}
+
+class SerdeContext {
+    serdeContext;
+    setSerdeContext(serdeContext) {
+        this.serdeContext = serdeContext;
+    }
+}
+
+class HttpProtocol extends SerdeContext {
+    options;
+    compositeErrorRegistry;
+    constructor(options) {
+        super();
+        this.options = options;
+        this.compositeErrorRegistry = new TypeRegistry(options.defaultNamespace);
+        for (const etr of options.errorTypeRegistries ?? []) {
+            this.compositeErrorRegistry.copyFrom(etr);
+        }
+    }
+    getRequestType() {
+        return HttpRequest;
+    }
+    getResponseType() {
+        return HttpResponse;
+    }
+    setSerdeContext(serdeContext) {
+        this.serdeContext = serdeContext;
+        this.serializer.setSerdeContext(serdeContext);
+        this.deserializer.setSerdeContext(serdeContext);
+        if (this.getPayloadCodec()) {
+            this.getPayloadCodec().setSerdeContext(serdeContext);
+        }
+    }
+    updateServiceEndpoint(request, endpoint) {
+        if ("url" in endpoint) {
+            request.protocol = endpoint.url.protocol;
+            request.hostname = endpoint.url.hostname;
+            request.port = endpoint.url.port ? Number(endpoint.url.port) : undefined;
+            request.path = endpoint.url.pathname;
+            request.fragment = endpoint.url.hash || void 0;
+            request.username = endpoint.url.username || void 0;
+            request.password = endpoint.url.password || void 0;
+            if (!request.query) {
+                request.query = {};
+            }
+            for (const [k, v] of endpoint.url.searchParams.entries()) {
+                request.query[k] = v;
+            }
+            if (endpoint.headers) {
+                for (const name in endpoint.headers) {
+                    if (!hasOwn(endpoint.headers, name))
+                        continue;
+                    request.headers[name] = endpoint.headers[name].join(", ");
+                }
+            }
+            return request;
+        }
+        else {
+            request.protocol = endpoint.protocol;
+            request.hostname = endpoint.hostname;
+            request.port = endpoint.port ? Number(endpoint.port) : undefined;
+            request.path = endpoint.path;
+            request.query = {
+                ...endpoint.query,
+            };
+            if (endpoint.headers) {
+                for (const name in endpoint.headers) {
+                    if (!hasOwn(endpoint.headers, name))
+                        continue;
+                    request.headers[name] = endpoint.headers[name];
+                }
+            }
+            return request;
+        }
+    }
+    setHostPrefix(request, operationSchema, input) {
+        if (this.serdeContext?.disableHostPrefix) {
+            return;
+        }
+        const inputNs = NormalizedSchema.of(operationSchema.input);
+        const opTraits = translateTraits(operationSchema.traits ?? {});
+        if (opTraits.endpoint) {
+            let hostPrefix = opTraits.endpoint?.[0];
+            if (typeof hostPrefix === "string") {
+                for (const [name, member] of inputNs.structIterator()) {
+                    if (!member.getMergedTraits().hostLabel) {
+                        continue;
+                    }
+                    const replacement = input[name];
+                    if (typeof replacement !== "string") {
+                        throw new Error(`@smithy/core/schema - ${name} in input must be a string as hostLabel.`);
+                    }
+                    hostPrefix = hostPrefix.replace(`{${name}}`, replacement);
+                }
+                request.hostname = hostPrefix + request.hostname;
+                if (!isValidHostname(request.hostname)) {
+                    throw new Error(`[${request.hostname}] is not a valid hostname.`);
+                }
+            }
+        }
+    }
+    deserializeMetadata(output) {
+        return {
+            httpStatusCode: output.statusCode,
+            requestId: output.headers["x-amzn-requestid"] ?? output.headers["x-amzn-request-id"] ?? output.headers["x-amz-request-id"],
+            extendedRequestId: output.headers["x-amz-id-2"],
+            cfId: output.headers["x-amz-cf-id"],
+        };
+    }
+    resolveError(name, namespaces, registries) {
+        const defaultErrorSchema = [-3, "", "Error", 0, [], [], 0];
+        let schema;
+        for (const registry of registries) {
+            for (const ns of namespaces) {
+                try {
+                    if (ns === "*") {
+                        schema = registry.getSchema(name);
+                    }
+                    else {
+                        schema = registry.getSchema(ns + "#" + name);
+                    }
+                    const errorCtor = registry.getErrorCtor(schema);
+                    if (errorCtor) {
+                        return [schema, errorCtor, "modeled"];
+                    }
+                    else {
+                        const syntheticErrorSchema = registry.getBaseException();
+                        if (syntheticErrorSchema) {
+                            const syntheticErrorCtor = registry.getErrorCtor(syntheticErrorSchema);
+                            if (syntheticErrorCtor) {
+                                return [schema, syntheticErrorCtor, "synthetic"];
+                            }
+                        }
+                    }
+                }
+                catch (ignored) {
+                }
+            }
+        }
+        for (const registry of registries) {
+            const syntheticErrorSchema = registry.getBaseException();
+            if (syntheticErrorSchema) {
+                const syntheticErrorCtor = registry.getErrorCtor(syntheticErrorSchema);
+                if (syntheticErrorCtor) {
+                    return [syntheticErrorSchema, syntheticErrorCtor, "synthetic"];
+                }
+            }
+        }
+        return [defaultErrorSchema, Error, "native"];
+    }
+    async serializeEventStream({ eventStream, requestSchema, initialRequest, }) {
+        const eventStreamSerde = await this.loadEventStreamCapability();
+        return eventStreamSerde.serializeEventStream({
+            eventStream,
+            requestSchema,
+            initialRequest,
+        });
+    }
+    async deserializeEventStream({ response, responseSchema, initialResponseContainer, }) {
+        const eventStreamSerde = await this.loadEventStreamCapability();
+        return eventStreamSerde.deserializeEventStream({
+            response,
+            responseSchema,
+            initialResponseContainer,
+        });
+    }
+    async loadEventStreamCapability() {
+        const { EventStreamSerde, eventStreamSerdeProvider } = await Promise.resolve().then(function () { return index$9; });
+        const marshaller = this.resolveEventStreamMarshaller(eventStreamSerdeProvider);
+        return new EventStreamSerde({
+            marshaller,
+            serializer: this.serializer,
+            deserializer: this.deserializer,
+            serdeContext: this.serdeContext,
+            defaultContentType: this.getDefaultContentType(),
+            compositeErrorRegistry: this.compositeErrorRegistry,
+        });
+    }
+    getDefaultContentType() {
+        throw new Error(`@smithy/core/protocols - ${this.constructor.name} getDefaultContentType() implementation missing.`);
+    }
+    async deserializeHttpMessage(schema, context, response, arg4, arg5) {
+        return [];
+    }
+    getEventStreamMarshaller() {
+        const context = this.serdeContext;
+        if (!context.eventStreamMarshaller) {
+            throw new Error("@smithy/core - HttpProtocol: eventStreamMarshaller missing in serdeContext.");
+        }
+        return context.eventStreamMarshaller;
+    }
+    resolveEventStreamMarshaller(importedProvider) {
+        const context = this.serdeContext;
+        if (context.eventStreamMarshaller) {
+            return context.eventStreamMarshaller;
+        }
+        return importedProvider(this.serdeContext);
+    }
+}
+
+class HttpBindingProtocol extends HttpProtocol {
+    async serializeRequest(operationSchema, _input, context) {
+        const input = _input && typeof _input === "object" ? _input : {};
+        const serializer = this.serializer;
+        const query = {};
+        const headers = {};
+        const endpoint = await context.endpoint();
+        const ns = NormalizedSchema.of(operationSchema?.input);
+        const payloadMemberNames = [];
+        const payloadMemberSchemas = [];
+        let hasNonHttpBindingMember = false;
+        let payload;
+        const request = new HttpRequest({
+            protocol: "",
+            hostname: "",
+            port: undefined,
+            path: "",
+            fragment: undefined,
+            query: query,
+            headers: headers,
+            body: undefined,
+        });
+        if (endpoint) {
+            this.updateServiceEndpoint(request, endpoint);
+            this.setHostPrefix(request, operationSchema, input);
+            const opTraits = translateTraits(operationSchema.traits);
+            if (opTraits.http) {
+                request.method = opTraits.http[0];
+                const [path, search] = opTraits.http[1].split("?");
+                if (request.path == "/") {
+                    request.path = path;
+                }
+                else {
+                    request.path += path;
+                }
+                const traitSearchParams = new URLSearchParams(search ?? "");
+                for (const [key, value] of traitSearchParams) {
+                    query[key] = value;
+                }
+            }
+        }
+        for (const [memberName, memberNs] of ns.structIterator()) {
+            const memberTraits = memberNs.getMergedTraits() ?? {};
+            const inputMemberValue = input[memberName];
+            if (inputMemberValue == null && !memberNs.isIdempotencyToken()) {
+                if (memberTraits.httpLabel) {
+                    if (request.path.includes(`{${memberName}+}`) || request.path.includes(`{${memberName}}`)) {
+                        throw new Error(`No value provided for input HTTP label: ${memberName}.`);
+                    }
+                }
+                continue;
+            }
+            if (memberTraits.httpPayload) {
+                const isStreaming = memberNs.isStreaming();
+                if (isStreaming) {
+                    const isEventStream = memberNs.isStructSchema();
+                    if (isEventStream) {
+                        if (input[memberName]) {
+                            payload = await this.serializeEventStream({
+                                eventStream: input[memberName],
+                                requestSchema: ns,
+                            });
+                        }
+                    }
+                    else {
+                        payload = inputMemberValue;
+                    }
+                }
+                else {
+                    serializer.write(memberNs, inputMemberValue);
+                    payload = serializer.flush();
+                }
+            }
+            else if (memberTraits.httpLabel) {
+                serializer.write(memberNs, inputMemberValue);
+                const replacement = serializer.flush();
+                if (request.path.includes(`{${memberName}+}`)) {
+                    request.path = request.path.replace(`{${memberName}+}`, replacement.split("/").map(extendedEncodeURIComponent).join("/"));
+                }
+                else if (request.path.includes(`{${memberName}}`)) {
+                    request.path = request.path.replace(`{${memberName}}`, extendedEncodeURIComponent(replacement));
+                }
+            }
+            else if (memberTraits.httpHeader) {
+                serializer.write(memberNs, inputMemberValue);
+                headers[memberTraits.httpHeader.toLowerCase()] = String(serializer.flush());
+            }
+            else if (typeof memberTraits.httpPrefixHeaders === "string") {
+                for (const key in inputMemberValue) {
+                    if (!hasOwn(inputMemberValue, key))
+                        continue;
+                    const val = inputMemberValue[key];
+                    const amalgam = memberTraits.httpPrefixHeaders + key;
+                    serializer.write([memberNs.getValueSchema(), { httpHeader: amalgam }], val);
+                    headers[amalgam.toLowerCase()] = serializer.flush();
+                }
+            }
+            else if (memberTraits.httpQuery || memberTraits.httpQueryParams) {
+                this.serializeQuery(memberNs, inputMemberValue, query);
+            }
+            else {
+                hasNonHttpBindingMember = true;
+                payloadMemberNames.push(memberName);
+                payloadMemberSchemas.push(memberNs);
+            }
+        }
+        if (hasNonHttpBindingMember && input) {
+            const [namespace, name] = (ns.getName(true) ?? "#Unknown").split("#");
+            const requiredMembers = ns.getSchema()[6];
+            const payloadSchema = [
+                3,
+                namespace,
+                name,
+                ns.getMergedTraits(),
+                payloadMemberNames,
+                payloadMemberSchemas,
+                undefined,
+            ];
+            if (requiredMembers) {
+                payloadSchema[6] = requiredMembers;
+            }
+            else {
+                payloadSchema.pop();
+            }
+            serializer.write(payloadSchema, input);
+            payload = serializer.flush();
+        }
+        request.headers = headers;
+        request.query = query;
+        request.body = payload;
+        return request;
+    }
+    serializeQuery(ns, data, query) {
+        const serializer = this.serializer;
+        const traits = ns.getMergedTraits();
+        if (traits.httpQueryParams) {
+            for (const key in data) {
+                if (!hasOwn(data, key))
+                    continue;
+                if (!(key in query)) {
+                    const val = data[key];
+                    const valueSchema = ns.getValueSchema();
+                    Object.assign(valueSchema.getMergedTraits(), {
+                        ...traits,
+                        httpQuery: key,
+                        httpQueryParams: undefined,
+                    });
+                    this.serializeQuery(valueSchema, val, query);
+                }
+            }
+            return;
+        }
+        if (ns.isListSchema()) {
+            const sparse = !!ns.getMergedTraits().sparse;
+            const buffer = [];
+            for (const item of data) {
+                serializer.write([ns.getValueSchema(), traits], item);
+                const serializable = serializer.flush();
+                if (sparse || serializable !== undefined) {
+                    buffer.push(serializable);
+                }
+            }
+            query[traits.httpQuery] = buffer;
+        }
+        else {
+            serializer.write([ns, traits], data);
+            query[traits.httpQuery] = serializer.flush();
+        }
+    }
+    async deserializeResponse(operationSchema, context, response) {
+        const deserializer = this.deserializer;
+        const ns = NormalizedSchema.of(operationSchema.output);
+        const dataObject = {};
+        if (response.statusCode >= 300) {
+            const bytes = await collectBody$1(response.body, context);
+            if (bytes.byteLength > 0) {
+                Object.assign(dataObject, await deserializer.read(15, bytes));
+            }
+            await this.handleError(operationSchema, context, response, dataObject, this.deserializeMetadata(response));
+            throw new Error("@smithy/core/protocols - HTTP Protocol error handler failed to throw.");
+        }
+        for (const header in response.headers) {
+            if (!hasOwn(response.headers, header))
+                continue;
+            const value = response.headers[header];
+            delete response.headers[header];
+            response.headers[header.toLowerCase()] = value;
+        }
+        const nonHttpBindingMembers = await this.deserializeHttpMessage(ns, context, response, dataObject);
+        if (nonHttpBindingMembers.length) {
+            const bytes = await collectBody$1(response.body, context);
+            if (bytes.byteLength > 0) {
+                const dataFromBody = await deserializer.read(ns, bytes);
+                for (const member of nonHttpBindingMembers) {
+                    if (dataFromBody[member] != null) {
+                        dataObject[member] = dataFromBody[member];
+                    }
+                }
+            }
+        }
+        else if (nonHttpBindingMembers.discardResponseBody) {
+            await collectBody$1(response.body, context);
+        }
+        dataObject.$metadata = this.deserializeMetadata(response);
+        return dataObject;
+    }
+    async deserializeHttpMessage(schema, context, response, arg4, arg5) {
+        let dataObject;
+        if (arg4 instanceof Set) {
+            dataObject = arg5;
+        }
+        else {
+            dataObject = arg4;
+        }
+        let discardResponseBody = true;
+        const deserializer = this.deserializer;
+        const ns = NormalizedSchema.of(schema);
+        const nonHttpBindingMembers = [];
+        for (const [memberName, memberSchema] of ns.structIterator()) {
+            const memberTraits = memberSchema.getMemberTraits();
+            if (memberTraits.httpPayload) {
+                discardResponseBody = false;
+                const isStreaming = memberSchema.isStreaming();
+                if (isStreaming) {
+                    const isEventStream = memberSchema.isStructSchema();
+                    if (isEventStream) {
+                        dataObject[memberName] = await this.deserializeEventStream({
+                            response,
+                            responseSchema: ns,
+                        });
+                    }
+                    else {
+                        dataObject[memberName] = sdkStreamMixin$2(response.body);
+                    }
+                }
+                else if (response.body) {
+                    const bytes = await collectBody$1(response.body, context);
+                    if (bytes.byteLength > 0) {
+                        dataObject[memberName] = await deserializer.read(memberSchema, bytes);
+                    }
+                }
+            }
+            else if (memberTraits.httpHeader) {
+                const key = String(memberTraits.httpHeader).toLowerCase();
+                const value = response.headers[key];
+                if (null != value) {
+                    if (memberSchema.isListSchema()) {
+                        const headerListValueSchema = memberSchema.getValueSchema();
+                        headerListValueSchema.getMergedTraits().httpHeader = key;
+                        let sections;
+                        if (headerListValueSchema.isTimestampSchema() &&
+                            headerListValueSchema.getSchema() === 4) {
+                            sections = splitEvery(value, ",", 2);
+                        }
+                        else {
+                            sections = splitHeader(value);
+                        }
+                        const list = [];
+                        for (const section of sections) {
+                            list.push(await deserializer.read(headerListValueSchema, section.trim()));
+                        }
+                        dataObject[memberName] = list;
+                    }
+                    else {
+                        dataObject[memberName] = await deserializer.read(memberSchema, value);
+                    }
+                }
+            }
+            else if (memberTraits.httpPrefixHeaders !== undefined) {
+                dataObject[memberName] = {};
+                for (const header in response.headers) {
+                    if (!hasOwn(response.headers, header))
+                        continue;
+                    if (header.startsWith(memberTraits.httpPrefixHeaders)) {
+                        const value = response.headers[header];
+                        const valueSchema = memberSchema.getValueSchema();
+                        valueSchema.getMergedTraits().httpHeader = header;
+                        dataObject[memberName][header.slice(memberTraits.httpPrefixHeaders.length)] = await deserializer.read(valueSchema, value);
+                    }
+                }
+            }
+            else if (memberTraits.httpResponseCode) {
+                dataObject[memberName] = response.statusCode;
+            }
+            else {
+                nonHttpBindingMembers.push(memberName);
+            }
+        }
+        nonHttpBindingMembers.discardResponseBody = discardResponseBody;
+        return nonHttpBindingMembers;
+    }
+}
+
+class RpcProtocol extends HttpProtocol {
+    async serializeRequest(operationSchema, _input, context) {
+        const serializer = this.serializer;
+        const query = {};
+        const headers = {};
+        const endpoint = await context.endpoint();
+        const ns = NormalizedSchema.of(operationSchema?.input);
+        const schema = ns.getSchema();
+        let payload;
+        const input = _input && typeof _input === "object" ? _input : {};
+        const request = new HttpRequest({
+            protocol: "",
+            hostname: "",
+            port: undefined,
+            path: "/",
+            fragment: undefined,
+            query: query,
+            headers: headers,
+            body: undefined,
+        });
+        if (endpoint) {
+            this.updateServiceEndpoint(request, endpoint);
+            this.setHostPrefix(request, operationSchema, input);
+        }
+        if (input) {
+            const eventStreamMember = ns.getEventStreamMember();
+            if (eventStreamMember) {
+                if (input[eventStreamMember]) {
+                    const initialRequest = {};
+                    for (const [memberName] of ns.structIterator()) {
+                        if (memberName !== eventStreamMember && input[memberName] != null) {
+                            initialRequest[memberName] = input[memberName];
+                        }
+                    }
+                    payload = await this.serializeEventStream({
+                        eventStream: input[eventStreamMember],
+                        requestSchema: ns,
+                        initialRequest,
+                    });
+                }
+            }
+            else {
+                serializer.write(schema, input);
+                payload = serializer.flush();
+            }
+        }
+        request.headers = Object.assign(request.headers, headers);
+        request.query = query;
+        request.body = payload;
+        request.method = "POST";
+        return request;
+    }
+    async deserializeResponse(operationSchema, context, response) {
+        const deserializer = this.deserializer;
+        const ns = NormalizedSchema.of(operationSchema.output);
+        const dataObject = {};
+        if (response.statusCode >= 300) {
+            const bytes = await collectBody$1(response.body, context);
+            if (bytes.byteLength > 0) {
+                Object.assign(dataObject, await deserializer.read(15, bytes));
+            }
+            await this.handleError(operationSchema, context, response, dataObject, this.deserializeMetadata(response));
+            throw new Error("@smithy/core/protocols - RPC Protocol error handler failed to throw.");
+        }
+        for (const header in response.headers) {
+            if (!hasOwn(response.headers, header))
+                continue;
+            const value = response.headers[header];
+            delete response.headers[header];
+            response.headers[header.toLowerCase()] = value;
+        }
+        const eventStreamMember = ns.getEventStreamMember();
+        if (eventStreamMember) {
+            dataObject[eventStreamMember] = await this.deserializeEventStream({
+                response,
+                responseSchema: ns,
+                initialResponseContainer: dataObject,
+            });
+        }
+        else {
+            const bytes = await collectBody$1(response.body, context);
+            if (bytes.byteLength > 0) {
+                Object.assign(dataObject, await deserializer.read(ns, bytes));
+            }
+        }
+        dataObject.$metadata = this.deserializeMetadata(response);
+        return dataObject;
+    }
+}
+
+function determineTimestampFormat(ns, settings) {
+    if (settings.timestampFormat.useTrait) {
+        if (ns.isTimestampSchema() &&
+            (ns.getSchema() === 5 ||
+                ns.getSchema() === 6 ||
+                ns.getSchema() === 7)) {
+            return ns.getSchema();
+        }
+    }
+    const { httpLabel, httpPrefixHeaders, httpHeader, httpQuery } = ns.getMergedTraits();
+    const bindingFormat = settings.httpBindings
+        ? typeof httpPrefixHeaders === "string" || Boolean(httpHeader)
+            ? 6
+            : Boolean(httpQuery) || Boolean(httpLabel)
+                ? 5
+                : undefined
+        : undefined;
+    return bindingFormat ?? settings.timestampFormat.default;
+}
+
+class FromStringShapeDeserializer extends SerdeContext {
+    settings;
+    constructor(settings) {
+        super();
+        this.settings = settings;
+    }
+    read(_schema, data) {
+        const ns = NormalizedSchema.of(_schema);
+        if (ns.isListSchema()) {
+            return splitHeader(data).map((item) => this.read(ns.getValueSchema(), item));
+        }
+        if (ns.isBlobSchema()) {
+            return (this.serdeContext?.base64Decoder ?? fromBase64$1)(data);
+        }
+        if (ns.isTimestampSchema()) {
+            const format = determineTimestampFormat(ns, this.settings);
+            switch (format) {
+                case 5:
+                    return _parseRfc3339DateTimeWithOffset(data);
+                case 6:
+                    return _parseRfc7231DateTime(data);
+                case 7:
+                    return _parseEpochTimestamp(data);
+                default:
+                    console.warn("Missing timestamp format, parsing value with Date constructor:", data);
+                    return new Date(data);
+            }
+        }
+        if (ns.isStringSchema()) {
+            const mediaType = ns.getMergedTraits().mediaType;
+            let intermediateValue = data;
+            if (mediaType) {
+                if (ns.getMergedTraits().httpHeader) {
+                    intermediateValue = this.base64ToUtf8(intermediateValue);
+                }
+                const isJson = mediaType === "application/json" || mediaType.endsWith("+json");
+                if (isJson) {
+                    intermediateValue = LazyJsonString.from(intermediateValue);
+                }
+                return intermediateValue;
+            }
+        }
+        if (ns.isNumericSchema()) {
+            return Number(data);
+        }
+        if (ns.isBigIntegerSchema()) {
+            return BigInt(data);
+        }
+        if (ns.isBigDecimalSchema()) {
+            return new NumericValue(data, "bigDecimal");
+        }
+        if (ns.isBooleanSchema()) {
+            return String(data).toLowerCase() === "true";
+        }
+        return data;
+    }
+    base64ToUtf8(base64String) {
+        return (this.serdeContext?.utf8Encoder ?? toUtf8$2)((this.serdeContext?.base64Decoder ?? fromBase64$1)(base64String));
+    }
+}
+
+class HttpInterceptingShapeDeserializer extends SerdeContext {
+    codecDeserializer;
+    stringDeserializer;
+    constructor(codecDeserializer, codecSettings) {
+        super();
+        this.codecDeserializer = codecDeserializer;
+        this.stringDeserializer = new FromStringShapeDeserializer(codecSettings);
+    }
+    setSerdeContext(serdeContext) {
+        this.stringDeserializer.setSerdeContext(serdeContext);
+        this.codecDeserializer.setSerdeContext(serdeContext);
+        this.serdeContext = serdeContext;
+    }
+    read(schema, data) {
+        const ns = NormalizedSchema.of(schema);
+        const traits = ns.getMergedTraits();
+        const toString = this.serdeContext?.utf8Encoder ?? toUtf8$2;
+        if (traits.httpHeader || traits.httpResponseCode) {
+            return this.stringDeserializer.read(ns, toString(data));
+        }
+        if (traits.httpPayload) {
+            if (ns.isBlobSchema()) {
+                const toBytes = this.serdeContext?.utf8Decoder ?? fromUtf8$4;
+                if (typeof data === "string") {
+                    return toBytes(data);
+                }
+                return data;
+            }
+            else if (ns.isStringSchema()) {
+                if ("byteLength" in data) {
+                    return toString(data);
+                }
+                return data;
+            }
+        }
+        return this.codecDeserializer.read(ns, data);
+    }
+}
+
+class ToStringShapeSerializer extends SerdeContext {
+    settings;
+    stringBuffer = "";
+    constructor(settings) {
+        super();
+        this.settings = settings;
+    }
+    write(schema, value) {
+        const ns = NormalizedSchema.of(schema);
+        switch (typeof value) {
+            case "object":
+                if (value === null) {
+                    this.stringBuffer = "null";
+                    return;
+                }
+                if (ns.isTimestampSchema()) {
+                    if (!(value instanceof Date)) {
+                        throw new Error(`@smithy/core/protocols - received non-Date value ${value} when schema expected Date in ${ns.getName(true)}`);
+                    }
+                    const format = determineTimestampFormat(ns, this.settings);
+                    switch (format) {
+                        case 5:
+                            this.stringBuffer = value.toISOString().replace(".000Z", "Z");
+                            break;
+                        case 6:
+                            this.stringBuffer = dateToUtcString(value);
+                            break;
+                        case 7:
+                            this.stringBuffer = String(value.getTime() / 1000);
+                            break;
+                        default:
+                            console.warn("Missing timestamp format, using epoch seconds", value);
+                            this.stringBuffer = String(value.getTime() / 1000);
+                    }
+                    return;
+                }
+                if (ns.isBlobSchema() && "byteLength" in value) {
+                    this.stringBuffer = (this.serdeContext?.base64Encoder ?? toBase64$2)(value);
+                    return;
+                }
+                if (ns.isListSchema() && Array.isArray(value)) {
+                    let buffer = "";
+                    for (const item of value) {
+                        this.write([ns.getValueSchema(), ns.getMergedTraits()], item);
+                        const headerItem = this.flush();
+                        const serialized = ns.getValueSchema().isTimestampSchema() ? headerItem : quoteHeader(headerItem);
+                        if (buffer !== "") {
+                            buffer += ", ";
+                        }
+                        buffer += serialized;
+                    }
+                    this.stringBuffer = buffer;
+                    return;
+                }
+                this.stringBuffer = JSON.stringify(value, null, 2);
+                break;
+            case "string":
+                const mediaType = ns.getMergedTraits().mediaType;
+                let intermediateValue = value;
+                if (mediaType) {
+                    const isJson = mediaType === "application/json" || mediaType.endsWith("+json");
+                    if (isJson) {
+                        intermediateValue = LazyJsonString.from(intermediateValue);
+                    }
+                    if (ns.getMergedTraits().httpHeader) {
+                        this.stringBuffer = (this.serdeContext?.base64Encoder ?? toBase64$2)(intermediateValue.toString());
+                        return;
+                    }
+                }
+                this.stringBuffer = value;
+                break;
+            default:
+                if (ns.isIdempotencyToken()) {
+                    this.stringBuffer = generateIdempotencyToken();
+                }
+                else {
+                    this.stringBuffer = String(value);
+                }
+        }
+    }
+    flush() {
+        const buffer = this.stringBuffer;
+        this.stringBuffer = "";
+        return buffer;
+    }
+}
+
+class HttpInterceptingShapeSerializer {
+    codecSerializer;
+    stringSerializer;
+    buffer;
+    constructor(codecSerializer, codecSettings, stringSerializer = new ToStringShapeSerializer(codecSettings)) {
+        this.codecSerializer = codecSerializer;
+        this.stringSerializer = stringSerializer;
+    }
+    setSerdeContext(serdeContext) {
+        this.codecSerializer.setSerdeContext(serdeContext);
+        this.stringSerializer.setSerdeContext(serdeContext);
+    }
+    write(schema, value) {
+        const ns = NormalizedSchema.of(schema);
+        const traits = ns.getMergedTraits();
+        if (traits.httpHeader || traits.httpLabel || traits.httpQuery) {
+            this.stringSerializer.write(ns, value);
+            this.buffer = this.stringSerializer.flush();
+            return;
+        }
+        return this.codecSerializer.write(ns, value);
+    }
+    flush() {
+        if (this.buffer !== undefined) {
+            const buffer = this.buffer;
+            this.buffer = undefined;
+            return buffer;
+        }
+        return this.codecSerializer.flush();
+    }
+}
+
+const escapeUri$1 = (uri) => encodeURIComponent(uri).replace(/[!'()*]/g, hexEncode$1);
+const hexEncode$1 = (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`;
+
+class Retry {
+    static v2026 = typeof process !== "undefined" && process.env?.SMITHY_NEW_RETRIES_2026 === "true";
+    static delay() {
+        return Retry.v2026 ? 50 : 100;
+    }
+    static throttlingDelay() {
+        return Retry.v2026 ? 1_000 : 500;
+    }
+    static cost() {
+        return Retry.v2026 ? 14 : 5;
+    }
+    static throttlingCost() {
+        return Retry.v2026 ? 5 : 10;
+    }
+    static modifiedCostType() {
+        return Retry.v2026 ? "THROTTLING" : "TRANSIENT";
+    }
+}
+
+Retry.v2026 ||= typeof process === "object" && process.env?.AWS_NEW_RETRIES_2026 === "true";
 function setFeature$1(context, feature, value) {
     if (!context.__aws_sdk_context) {
         context.__aws_sdk_context = {
@@ -4715,141 +7600,133 @@ function setFeature$1(context, feature, value) {
     context.__aws_sdk_context.features[feature] = value;
 }
 
-const getDateHeader = (response) => HttpResponse.isInstance(response) ? response.headers?.date ?? response.headers?.Date : undefined;
-
-const getSkewCorrectedDate = (systemClockOffset) => new Date(Date.now() + systemClockOffset);
-
-const isClockSkewed = (clockTime, systemClockOffset) => Math.abs(getSkewCorrectedDate(systemClockOffset).getTime() - clockTime) >= 300000;
-
-const getUpdatedSystemClockOffset = (clockTime, currentSystemClockOffset) => {
-    const clockTimeInMs = Date.parse(clockTime);
-    if (isClockSkewed(clockTimeInMs, currentSystemClockOffset)) {
-        return clockTimeInMs - Date.now();
+const PROTECTED_KEYS$1 = {
+    REQUEST_ID: Symbol.for("_AWS_LAMBDA_REQUEST_ID"),
+    X_RAY_TRACE_ID: Symbol.for("_AWS_LAMBDA_X_RAY_TRACE_ID"),
+    TENANT_ID: Symbol.for("_AWS_LAMBDA_TENANT_ID"),
+    TRACEPARENT: Symbol.for("_AWS_LAMBDA_TRACEPARENT"),
+    TRACESTATE: Symbol.for("_AWS_LAMBDA_TRACESTATE"),
+    BAGGAGE: Symbol.for("_AWS_LAMBDA_BAGGAGE"),
+};
+const NO_GLOBAL_AWS_LAMBDA$1 = ["true", "1"].includes(process.env?.AWS_LAMBDA_NODEJS_NO_GLOBAL_AWSLAMBDA ?? "");
+if (!NO_GLOBAL_AWS_LAMBDA$1) {
+    globalThis.awslambda = globalThis.awslambda || {};
+}
+let InvokeStoreBase$1 = class InvokeStoreBase {
+    static PROTECTED_KEYS = PROTECTED_KEYS$1;
+    isProtectedKey(key) {
+        return Object.values(PROTECTED_KEYS$1).includes(key);
     }
-    return currentSystemClockOffset;
-};
-
-const throwSigningPropertyError = (name, property) => {
-    if (!property) {
-        throw new Error(`Property \`${name}\` is not resolved for AWS SDK SigV4Auth`);
+    getRequestId() {
+        return this.get(PROTECTED_KEYS$1.REQUEST_ID) ?? "-";
     }
-    return property;
+    getXRayTraceId() {
+        return this.get(PROTECTED_KEYS$1.X_RAY_TRACE_ID);
+    }
+    getTenantId() {
+        return this.get(PROTECTED_KEYS$1.TENANT_ID);
+    }
+    getTraceparent() {
+        return this.get(PROTECTED_KEYS$1.TRACEPARENT);
+    }
+    getTracestate() {
+        return this.get(PROTECTED_KEYS$1.TRACESTATE);
+    }
+    getBaggage() {
+        return this.get(PROTECTED_KEYS$1.BAGGAGE);
+    }
 };
-const validateSigningProperties = async (signingProperties) => {
-    const context = throwSigningPropertyError("context", signingProperties.context);
-    const config = throwSigningPropertyError("config", signingProperties.config);
-    const authScheme = context.endpointV2?.properties?.authSchemes?.[0];
-    const signerFunction = throwSigningPropertyError("signer", config.signer);
-    const signer = await signerFunction(authScheme);
-    const signingRegion = signingProperties?.signingRegion;
-    const signingRegionSet = signingProperties?.signingRegionSet;
-    const signingName = signingProperties?.signingName;
-    return {
-        config,
-        signer,
-        signingRegion,
-        signingRegionSet,
-        signingName,
-    };
-};
-class AwsSdkSigV4Signer {
-    async sign(httpRequest, identity, signingProperties) {
-        if (!HttpRequest.isInstance(httpRequest)) {
-            throw new Error("The request is not an instance of `HttpRequest` and cannot be signed");
+let InvokeStoreSingle$1 = class InvokeStoreSingle extends InvokeStoreBase$1 {
+    currentContext;
+    getContext() {
+        return this.currentContext;
+    }
+    hasContext() {
+        return this.currentContext !== undefined;
+    }
+    get(key) {
+        return this.currentContext?.[key];
+    }
+    set(key, value) {
+        if (this.isProtectedKey(key)) {
+            throw new Error(`Cannot modify protected Lambda context field: ${String(key)}`);
         }
-        const validatedProps = await validateSigningProperties(signingProperties);
-        const { config, signer } = validatedProps;
-        let { signingRegion, signingName } = validatedProps;
-        const handlerExecutionContext = signingProperties.context;
-        if (handlerExecutionContext?.authSchemes?.length ?? 0 > 1) {
-            const [first, second] = handlerExecutionContext.authSchemes;
-            if (first?.name === "sigv4a" && second?.name === "sigv4") {
-                signingRegion = second?.signingRegion ?? signingRegion;
-                signingName = second?.signingName ?? signingName;
-            }
-        }
-        const signedRequest = await signer.sign(httpRequest, {
-            signingDate: getSkewCorrectedDate(config.systemClockOffset),
-            signingRegion: signingRegion,
-            signingService: signingName,
-        });
-        return signedRequest;
+        this.currentContext = this.currentContext || {};
+        this.currentContext[key] = value;
     }
-    errorHandler(signingProperties) {
-        return (error) => {
-            const serverTime = error.ServerTime ?? getDateHeader(error.$response);
-            if (serverTime) {
-                const config = throwSigningPropertyError("config", signingProperties.config);
-                const initialSystemClockOffset = config.systemClockOffset;
-                config.systemClockOffset = getUpdatedSystemClockOffset(serverTime, config.systemClockOffset);
-                const clockSkewCorrected = config.systemClockOffset !== initialSystemClockOffset;
-                if (clockSkewCorrected && error.$metadata) {
-                    error.$metadata.clockSkewCorrected = true;
+    run(context, fn) {
+        this.currentContext = context;
+        return fn();
+    }
+};
+let InvokeStoreMulti$1 = class InvokeStoreMulti extends InvokeStoreBase$1 {
+    als;
+    static async create() {
+        const instance = new InvokeStoreMulti();
+        const asyncHooks = await import('node:async_hooks');
+        instance.als = new asyncHooks.AsyncLocalStorage();
+        return instance;
+    }
+    getContext() {
+        return this.als.getStore();
+    }
+    hasContext() {
+        return this.als.getStore() !== undefined;
+    }
+    get(key) {
+        return this.als.getStore()?.[key];
+    }
+    set(key, value) {
+        if (this.isProtectedKey(key)) {
+            throw new Error(`Cannot modify protected Lambda context field: ${String(key)}`);
+        }
+        const store = this.als.getStore();
+        if (!store) {
+            throw new Error("No context available");
+        }
+        store[key] = value;
+    }
+    run(context, fn) {
+        return this.als.run(context, fn);
+    }
+};
+var InvokeStore$1;
+(function (InvokeStore) {
+    let instance = null;
+    async function getInstanceAsync(forceInvokeStoreMulti) {
+        if (!instance) {
+            instance = (async () => {
+                const isMulti = forceInvokeStoreMulti === true || "AWS_LAMBDA_MAX_CONCURRENCY" in process.env;
+                const newInstance = isMulti
+                    ? await InvokeStoreMulti$1.create()
+                    : new InvokeStoreSingle$1();
+                if (!NO_GLOBAL_AWS_LAMBDA$1 && globalThis.awslambda?.InvokeStore) {
+                    return globalThis.awslambda.InvokeStore;
                 }
-            }
-            throw error;
-        };
-    }
-    successHandler(httpResponse, signingProperties) {
-        const dateHeader = getDateHeader(httpResponse);
-        if (dateHeader) {
-            const config = throwSigningPropertyError("config", signingProperties.config);
-            config.systemClockOffset = getUpdatedSystemClockOffset(dateHeader, config.systemClockOffset);
+                else if (!NO_GLOBAL_AWS_LAMBDA$1 && globalThis.awslambda) {
+                    globalThis.awslambda.InvokeStore = newInstance;
+                    return newInstance;
+                }
+                else {
+                    return newInstance;
+                }
+            })();
         }
+        return instance;
     }
-}
-
-class AwsSdkSigV4ASigner extends AwsSdkSigV4Signer {
-    async sign(httpRequest, identity, signingProperties) {
-        if (!HttpRequest.isInstance(httpRequest)) {
-            throw new Error("The request is not an instance of `HttpRequest` and cannot be signed");
+    InvokeStore.getInstanceAsync = getInstanceAsync;
+    InvokeStore._testing = process.env.AWS_LAMBDA_BENCHMARK_MODE === "1"
+        ? {
+            reset: () => {
+                instance = null;
+                if (globalThis.awslambda?.InvokeStore) {
+                    delete globalThis.awslambda.InvokeStore;
+                }
+                globalThis.awslambda = { InvokeStore: undefined };
+            },
         }
-        const { config, signer, signingRegion, signingRegionSet, signingName } = await validateSigningProperties(signingProperties);
-        const configResolvedSigningRegionSet = await config.sigv4aSigningRegionSet?.();
-        const multiRegionOverride = (configResolvedSigningRegionSet ??
-            signingRegionSet ?? [signingRegion]).join(",");
-        const signedRequest = await signer.sign(httpRequest, {
-            signingDate: getSkewCorrectedDate(config.systemClockOffset),
-            signingRegion: multiRegionOverride,
-            signingService: signingName,
-        });
-        return signedRequest;
-    }
-}
-
-const getArrayForCommaSeparatedString = (str) => typeof str === "string" && str.length > 0 ? str.split(",").map((item) => item.trim()) : [];
-
-const getBearerTokenEnvKey = (signingName) => `AWS_BEARER_TOKEN_${signingName.replace(/[\s-]/g, "_").toUpperCase()}`;
-
-const NODE_AUTH_SCHEME_PREFERENCE_ENV_KEY = "AWS_AUTH_SCHEME_PREFERENCE";
-const NODE_AUTH_SCHEME_PREFERENCE_CONFIG_KEY = "auth_scheme_preference";
-const NODE_AUTH_SCHEME_PREFERENCE_OPTIONS = {
-    environmentVariableSelector: (env, options) => {
-        if (options?.signingName) {
-            const bearerTokenKey = getBearerTokenEnvKey(options.signingName);
-            if (bearerTokenKey in env)
-                return ["httpBearerAuth"];
-        }
-        if (!(NODE_AUTH_SCHEME_PREFERENCE_ENV_KEY in env))
-            return undefined;
-        return getArrayForCommaSeparatedString(env[NODE_AUTH_SCHEME_PREFERENCE_ENV_KEY]);
-    },
-    configFileSelector: (profile) => {
-        if (!(NODE_AUTH_SCHEME_PREFERENCE_CONFIG_KEY in profile))
-            return undefined;
-        return getArrayForCommaSeparatedString(profile[NODE_AUTH_SCHEME_PREFERENCE_CONFIG_KEY]);
-    },
-    default: [],
-};
-
-const getSmithyContext = (context) => context[SMITHY_CONTEXT_KEY] || (context[SMITHY_CONTEXT_KEY] = {});
-
-const normalizeProvider$1 = (input) => {
-    if (typeof input === "function")
-        return input;
-    const promisified = Promise.resolve(input);
-    return () => promisified;
-};
+        : undefined;
+})(InvokeStore$1 || (InvokeStore$1 = {}));
 
 const resolveAuthOptions = (candidateAuthOptions, authSchemePreference) => {
     if (!authSchemePreference || authSchemePreference.length === 0) {
@@ -4884,7 +7761,7 @@ const httpAuthSchemeMiddleware = (config, mwOptions) => (next, context) => async
     const authSchemePreference = config.authSchemePreference ? await config.authSchemePreference() : [];
     const resolvedOptions = resolveAuthOptions(options, authSchemePreference);
     const authSchemes = convertHttpAuthSchemesToMap(config.httpAuthSchemes);
-    const smithyContext = getSmithyContext(context);
+    const smithyContext = getSmithyContext$1(context);
     const failureReasons = [];
     for (const option of resolvedOptions) {
         const scheme = authSchemes.get(option.schemeId);
@@ -4930,13 +7807,6 @@ const getHttpAuthSchemeEndpointRuleSetPlugin = (config, { httpAuthSchemeParamete
     },
 });
 
-const serializerMiddlewareOption$1 = {
-    name: "serializerMiddleware",
-    step: "serialize",
-    tags: ["SERIALIZER"],
-    override: true,
-};
-
 const defaultErrorHandler$1 = (signingProperties) => (error) => {
     throw error;
 };
@@ -4945,7 +7815,7 @@ const httpSigningMiddleware = (config) => (next, context) => async (args) => {
     if (!HttpRequest.isInstance(args.request)) {
         return next(args);
     }
-    const smithyContext = getSmithyContext(context);
+    const smithyContext = getSmithyContext$1(context);
     const scheme = smithyContext.selectedHttpAuthScheme;
     if (!scheme) {
         throw new Error(`No HttpAuthScheme was selected: unable to sign request`);
@@ -4974,12 +7844,3556 @@ const getHttpSigningPlugin = (config) => ({
     },
 });
 
-const normalizeProvider = (input) => {
+const normalizeProvider$1 = (input) => {
     if (typeof input === "function")
         return input;
     const promisified = Promise.resolve(input);
     return () => promisified;
 };
+
+function setFeature(context, feature, value) {
+    if (!context.__smithy_context) {
+        context.__smithy_context = {
+            features: {},
+        };
+    }
+    else if (!context.__smithy_context.features) {
+        context.__smithy_context.features = {};
+    }
+    context.__smithy_context.features[feature] = value;
+}
+
+class DefaultIdentityProviderConfig {
+    authSchemes = new Map();
+    constructor(config) {
+        for (const key in config) {
+            if (!hasOwn(config, key))
+                continue;
+            const value = config[key];
+            if (value !== undefined) {
+                this.authSchemes.set(key, value);
+            }
+        }
+    }
+    getIdentityProvider(schemeId) {
+        return this.authSchemes.get(schemeId);
+    }
+}
+
+class NoAuthSigner {
+    async sign(httpRequest, identity, signingProperties) {
+        return httpRequest;
+    }
+}
+
+const createIsIdentityExpiredFunction = (expirationMs) => function isIdentityExpired(identity) {
+    return doesIdentityRequireRefresh(identity) && identity.expiration.getTime() - Date.now() < expirationMs;
+};
+const EXPIRATION_MS = 300_000;
+const isIdentityExpired = createIsIdentityExpiredFunction(EXPIRATION_MS);
+const doesIdentityRequireRefresh = (identity) => identity.expiration !== undefined;
+const memoizeIdentityProvider = (provider, isExpired, requiresRefresh) => {
+    if (provider === undefined) {
+        return undefined;
+    }
+    const normalizedProvider = typeof provider !== "function" ? async () => Promise.resolve(provider) : provider;
+    let resolved;
+    let pending;
+    let hasResult;
+    let isConstant = false;
+    const coalesceProvider = async (options) => {
+        if (!pending) {
+            pending = normalizedProvider(options);
+        }
+        try {
+            resolved = await pending;
+            hasResult = true;
+            isConstant = false;
+        }
+        finally {
+            pending = undefined;
+        }
+        return resolved;
+    };
+    if (isExpired === undefined) {
+        return async (options) => {
+            if (!hasResult || options?.forceRefresh) {
+                resolved = await coalesceProvider(options);
+            }
+            return resolved;
+        };
+    }
+    return async (options) => {
+        if (!hasResult || options?.forceRefresh) {
+            resolved = await coalesceProvider(options);
+        }
+        if (isConstant) {
+            return resolved;
+        }
+        if (!requiresRefresh(resolved)) {
+            isConstant = true;
+            return resolved;
+        }
+        if (isExpired(resolved)) {
+            await coalesceProvider(options);
+            return resolved;
+        }
+        return resolved;
+    };
+};
+
+const getDateHeader = (response) => HttpResponse.isInstance(response) ? (response.headers?.date ?? response.headers?.Date) : undefined;
+const getAgeHeader = (response) => HttpResponse.isInstance(response) ? (response.headers?.age ?? response.headers?.Age) : undefined;
+
+const getSkewCorrectedDate = (systemClockOffset) => new Date(Date.now() + systemClockOffset);
+
+const getUpdatedSystemClockOffset = (clockTime, currentSystemClockOffset, timeRequestSent, ageHeader) => {
+    if (ageHeader !== undefined) {
+        return currentSystemClockOffset;
+    }
+    const serverTime = Date.parse(clockTime);
+    const timeResponseReceived = Date.now();
+    if (timeRequestSent !== undefined && timeResponseReceived - timeRequestSent > 900_000) {
+        return currentSystemClockOffset;
+    }
+    const candidateSkew = timeRequestSent !== undefined
+        ? serverTime - (timeRequestSent + timeResponseReceived) / 2
+        : serverTime - timeResponseReceived;
+    return candidateSkew;
+};
+
+const throwSigningPropertyError = (name, property) => {
+    if (!property) {
+        throw new Error(`Property \`${name}\` is not resolved for AWS SDK SigV4Auth`);
+    }
+    return property;
+};
+const validateSigningProperties = async (signingProperties) => {
+    const context = throwSigningPropertyError("context", signingProperties.context);
+    const config = throwSigningPropertyError("config", signingProperties.config);
+    const authScheme = context.endpointV2?.properties?.authSchemes?.[0];
+    const signerFunction = throwSigningPropertyError("signer", config.signer);
+    const signer = await signerFunction(authScheme);
+    const signingRegion = signingProperties?.signingRegion;
+    const signingRegionSet = signingProperties?.signingRegionSet;
+    const signingName = signingProperties?.signingName;
+    return {
+        config,
+        signer,
+        signingRegion,
+        signingRegionSet,
+        signingName,
+    };
+};
+class AwsSdkSigV4Signer {
+    async sign(httpRequest, identity, signingProperties) {
+        if (!HttpRequest.isInstance(httpRequest)) {
+            throw new Error("The request is not an instance of `HttpRequest` and cannot be signed");
+        }
+        const validatedProps = await validateSigningProperties(signingProperties);
+        const { config, signer } = validatedProps;
+        let { signingRegion, signingName } = validatedProps;
+        const handlerExecutionContext = signingProperties.context;
+        if (handlerExecutionContext?.authSchemes?.length ?? 0 > 1) {
+            const [first, second] = handlerExecutionContext.authSchemes;
+            if (first?.name === "sigv4a" && second?.name === "sigv4") {
+                signingRegion = second?.signingRegion ?? signingRegion;
+                signingName = second?.signingName ?? signingName;
+            }
+        }
+        const noSkewCorrection = (await config.disableClockSkewCorrection?.()) === true;
+        signingProperties._disableClockSkewCorrection = noSkewCorrection;
+        if (!noSkewCorrection) {
+            signingProperties._preRequestSystemClockOffset = config.systemClockOffset;
+            signingProperties._requestSentAt = Date.now();
+        }
+        const signedRequest = await signer.sign(httpRequest, {
+            signingDate: noSkewCorrection ? new Date() : getSkewCorrectedDate(config.systemClockOffset),
+            signingRegion: signingRegion,
+            signingService: signingName,
+        });
+        return signedRequest;
+    }
+    errorHandler(signingProperties) {
+        return (error) => {
+            const errorException = error;
+            if (!signingProperties._disableClockSkewCorrection) {
+                const serverTime = errorException.ServerTime ?? getDateHeader(errorException.$response);
+                if (serverTime) {
+                    const config = throwSigningPropertyError("config", signingProperties.config);
+                    const preRequestOffset = signingProperties._preRequestSystemClockOffset;
+                    const timeRequestSent = signingProperties._requestSentAt;
+                    const ageHeader = getAgeHeader(errorException.$response);
+                    const newOffset = getUpdatedSystemClockOffset(serverTime, config.systemClockOffset, timeRequestSent, ageHeader);
+                    config.systemClockOffset = newOffset;
+                    const skewExceedsThreshold = Math.abs(newOffset) >= 240_000;
+                    const isLocalCorrection = newOffset !== preRequestOffset;
+                    const isConcurrentCorrection = preRequestOffset !== undefined && preRequestOffset !== newOffset;
+                    if (skewExceedsThreshold && (isLocalCorrection || isConcurrentCorrection) && errorException.$metadata) {
+                        errorException.$metadata.clockSkewCorrected = true;
+                    }
+                }
+            }
+            throw error;
+        };
+    }
+    successHandler(httpResponse, signingProperties) {
+        if (signingProperties._disableClockSkewCorrection) {
+            return;
+        }
+        const dateHeader = getDateHeader(httpResponse);
+        if (dateHeader) {
+            const config = throwSigningPropertyError("config", signingProperties.config);
+            const timeRequestSent = signingProperties._requestSentAt;
+            const ageHeader = getAgeHeader(httpResponse);
+            config.systemClockOffset = getUpdatedSystemClockOffset(dateHeader, config.systemClockOffset, timeRequestSent, ageHeader);
+        }
+    }
+}
+
+class AwsSdkSigV4ASigner extends AwsSdkSigV4Signer {
+    async sign(httpRequest, identity, signingProperties) {
+        if (!HttpRequest.isInstance(httpRequest)) {
+            throw new Error("The request is not an instance of `HttpRequest` and cannot be signed");
+        }
+        const { config, signer, signingRegion, signingRegionSet, signingName } = await validateSigningProperties(signingProperties);
+        const configResolvedSigningRegionSet = await config.sigv4aSigningRegionSet?.();
+        const multiRegionOverride = (configResolvedSigningRegionSet ??
+            signingRegionSet ?? [signingRegion]).join(",");
+        const noSkewCorrection = (await config.disableClockSkewCorrection?.()) === true;
+        signingProperties._disableClockSkewCorrection = noSkewCorrection;
+        if (!noSkewCorrection) {
+            signingProperties._preRequestSystemClockOffset = config.systemClockOffset;
+            signingProperties._requestSentAt = Date.now();
+        }
+        const signedRequest = await signer.sign(httpRequest, {
+            signingDate: noSkewCorrection ? new Date() : getSkewCorrectedDate(config.systemClockOffset),
+            signingRegion: multiRegionOverride,
+            signingService: signingName,
+        });
+        return signedRequest;
+    }
+}
+
+const getArrayForCommaSeparatedString = (str) => typeof str === "string" && str.length > 0 ? str.split(",").map((item) => item.trim()) : [];
+
+const getBearerTokenEnvKey = (signingName) => `AWS_BEARER_TOKEN_${signingName.replace(/[\s-]/g, "_").toUpperCase()}`;
+
+const NODE_AUTH_SCHEME_PREFERENCE_ENV_KEY = "AWS_AUTH_SCHEME_PREFERENCE";
+const NODE_AUTH_SCHEME_PREFERENCE_CONFIG_KEY = "auth_scheme_preference";
+const NODE_AUTH_SCHEME_PREFERENCE_OPTIONS = {
+    environmentVariableSelector: (env, options) => {
+        if (options?.signingName) {
+            const bearerTokenKey = getBearerTokenEnvKey(options.signingName);
+            if (bearerTokenKey in env)
+                return ["httpBearerAuth"];
+        }
+        if (!(NODE_AUTH_SCHEME_PREFERENCE_ENV_KEY in env))
+            return undefined;
+        return getArrayForCommaSeparatedString(env[NODE_AUTH_SCHEME_PREFERENCE_ENV_KEY]);
+    },
+    configFileSelector: (profile) => {
+        if (!(NODE_AUTH_SCHEME_PREFERENCE_CONFIG_KEY in profile))
+            return undefined;
+        return getArrayForCommaSeparatedString(profile[NODE_AUTH_SCHEME_PREFERENCE_CONFIG_KEY]);
+    },
+    default: [],
+};
+
+const resolveAwsSdkSigV4AConfig = (config) => {
+    config.sigv4aSigningRegionSet = normalizeProvider$1(config.sigv4aSigningRegionSet);
+    return config;
+};
+const NODE_SIGV4A_CONFIG_OPTIONS = {
+    environmentVariableSelector(env) {
+        if (env.AWS_SIGV4A_SIGNING_REGION_SET) {
+            return env.AWS_SIGV4A_SIGNING_REGION_SET.split(",").map((_) => _.trim());
+        }
+        throw new ProviderError$1("AWS_SIGV4A_SIGNING_REGION_SET not set in env.", {
+            tryNextLink: true,
+        });
+    },
+    configFileSelector(profile) {
+        if (profile.sigv4a_signing_region_set) {
+            return (profile.sigv4a_signing_region_set ?? "").split(",").map((_) => _.trim());
+        }
+        throw new ProviderError$1("sigv4a_signing_region_set not set in profile.", {
+            tryNextLink: true,
+        });
+    },
+    default: undefined,
+};
+
+class HeaderFormatter {
+    format(headers) {
+        const chunks = [];
+        for (const headerName in headers) {
+            if (!hasOwn(headers, headerName))
+                continue;
+            const bytes = fromUtf8$4(headerName);
+            chunks.push(Uint8Array.from([bytes.byteLength]), bytes, this.formatHeaderValue(headers[headerName]));
+        }
+        const out = new Uint8Array(chunks.reduce((carry, bytes) => carry + bytes.byteLength, 0));
+        let position = 0;
+        for (const chunk of chunks) {
+            out.set(chunk, position);
+            position += chunk.byteLength;
+        }
+        return out;
+    }
+    formatHeaderValue(header) {
+        switch (header.type) {
+            case "boolean":
+                return Uint8Array.from([header.value ? 0 : 1]);
+            case "byte":
+                return Uint8Array.from([2, header.value]);
+            case "short":
+                const shortView = new DataView(new ArrayBuffer(3));
+                shortView.setUint8(0, 3);
+                shortView.setInt16(1, header.value, false);
+                return new Uint8Array(shortView.buffer);
+            case "integer":
+                const intView = new DataView(new ArrayBuffer(5));
+                intView.setUint8(0, 4);
+                intView.setInt32(1, header.value, false);
+                return new Uint8Array(intView.buffer);
+            case "long":
+                const longBytes = new Uint8Array(9);
+                longBytes[0] = 5;
+                longBytes.set(header.value.bytes, 1);
+                return longBytes;
+            case "binary":
+                const binView = new DataView(new ArrayBuffer(3 + header.value.byteLength));
+                binView.setUint8(0, 6);
+                binView.setUint16(1, header.value.byteLength, false);
+                const binBytes = new Uint8Array(binView.buffer);
+                binBytes.set(header.value, 3);
+                return binBytes;
+            case "string":
+                const utf8Bytes = fromUtf8$4(header.value);
+                const strView = new DataView(new ArrayBuffer(3 + utf8Bytes.byteLength));
+                strView.setUint8(0, 7);
+                strView.setUint16(1, utf8Bytes.byteLength, false);
+                const strBytes = new Uint8Array(strView.buffer);
+                strBytes.set(utf8Bytes, 3);
+                return strBytes;
+            case "timestamp":
+                const tsBytes = new Uint8Array(9);
+                tsBytes[0] = 8;
+                tsBytes.set(Int64$2.fromNumber(header.value.valueOf()).bytes, 1);
+                return tsBytes;
+            case "uuid":
+                if (!UUID_PATTERN$2.test(header.value)) {
+                    throw new Error(`Invalid UUID received: ${header.value}`);
+                }
+                const uuidBytes = new Uint8Array(17);
+                uuidBytes[0] = 9;
+                uuidBytes.set(fromHex$1(header.value.replace(/-/g, "")), 1);
+                return uuidBytes;
+        }
+    }
+}
+var HEADER_VALUE_TYPE$2;
+(function (HEADER_VALUE_TYPE) {
+    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["boolTrue"] = 0] = "boolTrue";
+    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["boolFalse"] = 1] = "boolFalse";
+    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["byte"] = 2] = "byte";
+    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["short"] = 3] = "short";
+    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["integer"] = 4] = "integer";
+    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["long"] = 5] = "long";
+    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["byteArray"] = 6] = "byteArray";
+    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["string"] = 7] = "string";
+    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["timestamp"] = 8] = "timestamp";
+    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["uuid"] = 9] = "uuid";
+})(HEADER_VALUE_TYPE$2 || (HEADER_VALUE_TYPE$2 = {}));
+const UUID_PATTERN$2 = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+let Int64$2 = class Int64 {
+    bytes;
+    constructor(bytes) {
+        this.bytes = bytes;
+        if (bytes.byteLength !== 8) {
+            throw new Error("Int64 buffers must be exactly 8 bytes");
+        }
+    }
+    static fromNumber(number) {
+        if (number > 9_223_372_036_854_775_807 || number < -9_223_372_036_854_775_808) {
+            throw new Error(`${number} is too large (or, if negative, too small) to represent as an Int64`);
+        }
+        const bytes = new Uint8Array(8);
+        for (let i = 7, remaining = Math.abs(Math.round(number)); i > -1 && remaining > 0; i--, remaining /= 256) {
+            bytes[i] = remaining;
+        }
+        if (number < 0) {
+            negate$2(bytes);
+        }
+        return new Int64(bytes);
+    }
+    valueOf() {
+        const bytes = this.bytes.slice(0);
+        const negative = bytes[0] & 0b10000000;
+        if (negative) {
+            negate$2(bytes);
+        }
+        return parseInt(toHex$1(bytes), 16) * (negative ? -1 : 1);
+    }
+    toString() {
+        return String(this.valueOf());
+    }
+};
+function negate$2(bytes) {
+    for (let i = 0; i < 8; i++) {
+        bytes[i] ^= 0xff;
+    }
+    for (let i = 7; i > -1; i--) {
+        bytes[i]++;
+        if (bytes[i] !== 0)
+            break;
+    }
+}
+
+const ALGORITHM_QUERY_PARAM = "X-Amz-Algorithm";
+const CREDENTIAL_QUERY_PARAM = "X-Amz-Credential";
+const AMZ_DATE_QUERY_PARAM = "X-Amz-Date";
+const SIGNED_HEADERS_QUERY_PARAM = "X-Amz-SignedHeaders";
+const EXPIRES_QUERY_PARAM = "X-Amz-Expires";
+const SIGNATURE_QUERY_PARAM = "X-Amz-Signature";
+const TOKEN_QUERY_PARAM = "X-Amz-Security-Token";
+const AUTH_HEADER = "authorization";
+const AMZ_DATE_HEADER = AMZ_DATE_QUERY_PARAM.toLowerCase();
+const DATE_HEADER = "date";
+const GENERATED_HEADERS = [AUTH_HEADER, AMZ_DATE_HEADER, DATE_HEADER];
+const SIGNATURE_HEADER = SIGNATURE_QUERY_PARAM.toLowerCase();
+const SHA256_HEADER = "x-amz-content-sha256";
+const TOKEN_HEADER = TOKEN_QUERY_PARAM.toLowerCase();
+const ALWAYS_UNSIGNABLE_HEADERS = {
+    authorization: true,
+    "cache-control": true,
+    connection: true,
+    expect: true,
+    from: true,
+    "keep-alive": true,
+    "max-forwards": true,
+    pragma: true,
+    referer: true,
+    te: true,
+    trailer: true,
+    "transfer-encoding": true,
+    upgrade: true,
+    "user-agent": true,
+    "x-amzn-trace-id": true,
+};
+const PROXY_HEADER_PATTERN = /^proxy-/;
+const SEC_HEADER_PATTERN = /^sec-/;
+const ALGORITHM_IDENTIFIER = "AWS4-HMAC-SHA256";
+const EVENT_ALGORITHM_IDENTIFIER = "AWS4-HMAC-SHA256-PAYLOAD";
+const UNSIGNED_PAYLOAD = "UNSIGNED-PAYLOAD";
+const MAX_CACHE_SIZE = 50;
+const KEY_TYPE_IDENTIFIER = "aws4_request";
+const MAX_PRESIGNED_TTL = 60 * 60 * 24 * 7;
+
+const getCanonicalQuery = ({ query = {} }) => {
+    const keys = [];
+    const serialized = {};
+    for (const key in query) {
+        if (!hasOwn(query, key))
+            continue;
+        if (key.toLowerCase() === SIGNATURE_HEADER) {
+            continue;
+        }
+        const encodedKey = escapeUri$1(key);
+        keys.push(encodedKey);
+        const value = query[key];
+        if (typeof value === "string") {
+            serialized[encodedKey] = `${encodedKey}=${escapeUri$1(value)}`;
+        }
+        else if (Array.isArray(value)) {
+            serialized[encodedKey] = value
+                .slice(0)
+                .reduce((encoded, value) => encoded.concat([`${encodedKey}=${escapeUri$1(value)}`]), [])
+                .sort()
+                .join("&");
+        }
+    }
+    return keys
+        .sort()
+        .map((key) => serialized[key])
+        .filter((serialized) => serialized)
+        .join("&");
+};
+
+const iso8601 = (time) => toDate(time)
+    .toISOString()
+    .replace(/\.\d{3}Z$/, "Z");
+const toDate = (time) => {
+    if (typeof time === "number") {
+        return new Date(time * 1000);
+    }
+    if (typeof time === "string") {
+        if (Number(time)) {
+            return new Date(Number(time) * 1000);
+        }
+        return new Date(time);
+    }
+    return time;
+};
+
+class SignatureV4Base {
+    service;
+    regionProvider;
+    credentialProvider;
+    sha256;
+    uriEscapePath;
+    applyChecksum;
+    constructor({ applyChecksum, credentials, region, service, sha256, uriEscapePath = true, }) {
+        this.service = service;
+        this.sha256 = sha256;
+        this.uriEscapePath = uriEscapePath;
+        this.applyChecksum = typeof applyChecksum === "boolean" ? applyChecksum : true;
+        this.regionProvider = normalizeProvider$2(region);
+        this.credentialProvider = normalizeProvider$2(credentials);
+    }
+    createCanonicalRequest(request, canonicalHeaders, payloadHash) {
+        const sortedHeaders = Object.keys(canonicalHeaders).sort();
+        return `${request.method}
+${this.getCanonicalPath(request)}
+${getCanonicalQuery(request)}
+${sortedHeaders.map((name) => `${name}:${canonicalHeaders[name]}`).join("\n")}
+
+${sortedHeaders.join(";")}
+${payloadHash}`;
+    }
+    async createStringToSign(longDate, credentialScope, canonicalRequest, algorithmIdentifier) {
+        const hash = new this.sha256();
+        hash.update(toUint8Array$1(canonicalRequest));
+        const hashedRequest = await hash.digest();
+        return `${algorithmIdentifier}
+${longDate}
+${credentialScope}
+${toHex$1(hashedRequest)}`;
+    }
+    getCanonicalPath({ path }) {
+        if (this.uriEscapePath) {
+            const normalizedPathSegments = [];
+            for (const pathSegment of path.split("/")) {
+                if (pathSegment?.length === 0)
+                    continue;
+                if (pathSegment === ".")
+                    continue;
+                if (pathSegment === "..") {
+                    normalizedPathSegments.pop();
+                }
+                else {
+                    normalizedPathSegments.push(pathSegment);
+                }
+            }
+            const normalizedPath = `${path?.startsWith("/") ? "/" : ""}${normalizedPathSegments.join("/")}${normalizedPathSegments.length > 0 && path?.endsWith("/") ? "/" : ""}`;
+            const doubleEncoded = escapeUri$1(normalizedPath);
+            return doubleEncoded.replace(/%2F/g, "/");
+        }
+        return path;
+    }
+    validateResolvedCredentials(credentials) {
+        if (typeof credentials !== "object" ||
+            typeof credentials.accessKeyId !== "string" ||
+            typeof credentials.secretAccessKey !== "string") {
+            throw new Error("Resolved credential object is not valid");
+        }
+    }
+    formatDate(now) {
+        const longDate = iso8601(now).replace(/[-:]/g, "");
+        return {
+            longDate,
+            shortDate: longDate.slice(0, 8),
+        };
+    }
+    getCanonicalHeaderList(headers) {
+        return Object.keys(headers).sort().join(";");
+    }
+}
+
+const signingKeyCache = {};
+const cacheQueue = [];
+const createScope = (shortDate, region, service) => `${shortDate}/${region}/${service}/${KEY_TYPE_IDENTIFIER}`;
+const getSigningKey = async (sha256Constructor, credentials, shortDate, region, service) => {
+    const credsHash = await hmac(sha256Constructor, credentials.secretAccessKey, credentials.accessKeyId);
+    const cacheKey = `${shortDate}:${region}:${service}:${toHex$1(credsHash)}:${credentials.sessionToken}`;
+    if (cacheKey in signingKeyCache) {
+        return signingKeyCache[cacheKey];
+    }
+    cacheQueue.push(cacheKey);
+    while (cacheQueue.length > MAX_CACHE_SIZE) {
+        delete signingKeyCache[cacheQueue.shift()];
+    }
+    let key = `AWS4${credentials.secretAccessKey}`;
+    for (const signable of [shortDate, region, service, KEY_TYPE_IDENTIFIER]) {
+        key = await hmac(sha256Constructor, key, signable);
+    }
+    return (signingKeyCache[cacheKey] = key);
+};
+const hmac = (ctor, secret, data) => {
+    const hash = new ctor(secret);
+    hash.update(toUint8Array$1(data));
+    return hash.digest();
+};
+
+const getCanonicalHeaders = ({ headers }, unsignableHeaders, signableHeaders) => {
+    const canonical = {};
+    for (const headerName of Object.keys(headers).sort()) {
+        if (headers[headerName] == undefined) {
+            continue;
+        }
+        const canonicalHeaderName = headerName.toLowerCase();
+        if (canonicalHeaderName in ALWAYS_UNSIGNABLE_HEADERS ||
+            unsignableHeaders?.has(canonicalHeaderName) ||
+            PROXY_HEADER_PATTERN.test(canonicalHeaderName) ||
+            SEC_HEADER_PATTERN.test(canonicalHeaderName)) {
+            if (!signableHeaders || (signableHeaders && !signableHeaders.has(canonicalHeaderName))) {
+                continue;
+            }
+        }
+        canonical[canonicalHeaderName] = headers[headerName]
+            .replace(/[\r\n]/g, " ")
+            .replace(/[ \t]+/g, " ")
+            .replace(/^ | $/g, "");
+    }
+    return canonical;
+};
+
+const getPayloadHash = async ({ headers, body }, hashConstructor) => {
+    for (const headerName in headers) {
+        if (!hasOwn(headers, headerName))
+            continue;
+        if (headerName.toLowerCase() === SHA256_HEADER) {
+            return headers[headerName];
+        }
+    }
+    if (body == undefined) {
+        return "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    }
+    else if (typeof body === "string" || ArrayBuffer.isView(body) || isArrayBuffer$1(body)) {
+        const hashCtor = new hashConstructor();
+        hashCtor.update(toUint8Array$1(body));
+        return toHex$1(await hashCtor.digest());
+    }
+    return UNSIGNED_PAYLOAD;
+};
+
+const hasHeader$1 = (soughtHeader, headers) => {
+    soughtHeader = soughtHeader.toLowerCase();
+    for (const headerName in headers) {
+        if (!hasOwn(headers, headerName))
+            continue;
+        if (soughtHeader === headerName.toLowerCase()) {
+            return true;
+        }
+    }
+    return false;
+};
+
+const moveHeadersToQuery = (request, options = {}) => {
+    const { headers, query = {} } = HttpRequest.clone(request);
+    for (const name in headers) {
+        if (!hasOwn(headers, name))
+            continue;
+        const lname = name.toLowerCase();
+        if ((lname.slice(0, 6) === "x-amz-" && !options.unhoistableHeaders?.has(lname)) ||
+            options.hoistableHeaders?.has(lname)) {
+            query[name] = headers[name];
+            delete headers[name];
+        }
+    }
+    return {
+        ...request,
+        headers,
+        query,
+    };
+};
+
+const prepareRequest = (request) => {
+    request = HttpRequest.clone(request);
+    for (const headerName in request.headers) {
+        if (!hasOwn(request.headers, headerName))
+            continue;
+        if (GENERATED_HEADERS.indexOf(headerName.toLowerCase()) > -1) {
+            delete request.headers[headerName];
+        }
+    }
+    return request;
+};
+
+class SignatureV4 extends SignatureV4Base {
+    headerFormatter = new HeaderFormatter();
+    constructor({ applyChecksum, credentials, region, service, sha256, uriEscapePath = true, }) {
+        super({
+            applyChecksum,
+            credentials,
+            region,
+            service,
+            sha256,
+            uriEscapePath,
+        });
+    }
+    async presign(originalRequest, options = {}) {
+        const { signingDate = new Date(), expiresIn = 3600, unsignableHeaders, unhoistableHeaders, signableHeaders, hoistableHeaders, signingRegion, signingService, } = options;
+        const credentials = await this.credentialProvider();
+        this.validateResolvedCredentials(credentials);
+        const region = signingRegion ?? (await this.regionProvider());
+        const { longDate, shortDate } = this.formatDate(signingDate);
+        if (expiresIn > MAX_PRESIGNED_TTL) {
+            return Promise.reject("Signature version 4 presigned URLs" + " must have an expiration date less than one week in" + " the future");
+        }
+        const scope = createScope(shortDate, region, signingService ?? this.service);
+        const request = moveHeadersToQuery(prepareRequest(originalRequest), { unhoistableHeaders, hoistableHeaders });
+        if (credentials.sessionToken) {
+            request.query[TOKEN_QUERY_PARAM] = credentials.sessionToken;
+        }
+        request.query[ALGORITHM_QUERY_PARAM] = ALGORITHM_IDENTIFIER;
+        request.query[CREDENTIAL_QUERY_PARAM] = `${credentials.accessKeyId}/${scope}`;
+        request.query[AMZ_DATE_QUERY_PARAM] = longDate;
+        request.query[EXPIRES_QUERY_PARAM] = expiresIn.toString(10);
+        const canonicalHeaders = getCanonicalHeaders(request, unsignableHeaders, signableHeaders);
+        request.query[SIGNED_HEADERS_QUERY_PARAM] = this.getCanonicalHeaderList(canonicalHeaders);
+        request.query[SIGNATURE_QUERY_PARAM] = await this.getSignature(longDate, scope, this.getSigningKey(credentials, region, shortDate, signingService), this.createCanonicalRequest(request, canonicalHeaders, await getPayloadHash(originalRequest, this.sha256)));
+        return request;
+    }
+    async sign(toSign, options) {
+        if (typeof toSign === "string") {
+            return this.signString(toSign, options);
+        }
+        else if (toSign.headers && toSign.payload) {
+            return this.signEvent(toSign, options);
+        }
+        else if (toSign.message) {
+            return this.signMessage(toSign, options);
+        }
+        else {
+            return this.signRequest(toSign, options);
+        }
+    }
+    async signEvent({ headers, payload }, { signingDate = new Date(), priorSignature, signingRegion, signingService, eventStreamCredentials, }) {
+        const region = signingRegion ?? (await this.regionProvider());
+        const { shortDate, longDate } = this.formatDate(signingDate);
+        const scope = createScope(shortDate, region, signingService ?? this.service);
+        const hashedPayload = await getPayloadHash({ headers: {}, body: payload }, this.sha256);
+        const hash = new this.sha256();
+        hash.update(headers);
+        const hashedHeaders = toHex$1(await hash.digest());
+        const stringToSign = [
+            EVENT_ALGORITHM_IDENTIFIER,
+            longDate,
+            scope,
+            priorSignature,
+            hashedHeaders,
+            hashedPayload,
+        ].join("\n");
+        return this.signString(stringToSign, {
+            signingDate,
+            signingRegion: region,
+            signingService,
+            eventStreamCredentials,
+        });
+    }
+    async signMessage(signableMessage, { signingDate = new Date(), signingRegion, signingService, eventStreamCredentials }) {
+        const promise = this.signEvent({
+            headers: this.headerFormatter.format(signableMessage.message.headers),
+            payload: signableMessage.message.body,
+        }, {
+            signingDate,
+            signingRegion,
+            signingService,
+            priorSignature: signableMessage.priorSignature,
+            eventStreamCredentials,
+        });
+        return promise.then((signature) => {
+            return { message: signableMessage.message, signature };
+        });
+    }
+    async signString(stringToSign, { signingDate = new Date(), signingRegion, signingService, eventStreamCredentials, } = {}) {
+        const credentials = eventStreamCredentials ?? (await this.credentialProvider());
+        this.validateResolvedCredentials(credentials);
+        const region = signingRegion ?? (await this.regionProvider());
+        const { shortDate } = this.formatDate(signingDate);
+        const hash = new this.sha256(await this.getSigningKey(credentials, region, shortDate, signingService));
+        hash.update(toUint8Array$1(stringToSign));
+        return toHex$1(await hash.digest());
+    }
+    async signRequest(requestToSign, { signingDate = new Date(), signableHeaders, unsignableHeaders, signingRegion, signingService, } = {}) {
+        const credentials = await this.credentialProvider();
+        this.validateResolvedCredentials(credentials);
+        const region = signingRegion ?? (await this.regionProvider());
+        const request = prepareRequest(requestToSign);
+        const { longDate, shortDate } = this.formatDate(signingDate);
+        const scope = createScope(shortDate, region, signingService ?? this.service);
+        request.headers[AMZ_DATE_HEADER] = longDate;
+        if (credentials.sessionToken) {
+            request.headers[TOKEN_HEADER] = credentials.sessionToken;
+        }
+        const payloadHash = await getPayloadHash(request, this.sha256);
+        if (!hasHeader$1(SHA256_HEADER, request.headers) && this.applyChecksum) {
+            request.headers[SHA256_HEADER] = payloadHash;
+        }
+        const canonicalHeaders = getCanonicalHeaders(request, unsignableHeaders, signableHeaders);
+        const signature = await this.getSignature(longDate, scope, this.getSigningKey(credentials, region, shortDate, signingService), this.createCanonicalRequest(request, canonicalHeaders, payloadHash));
+        request.headers[AUTH_HEADER] =
+            `${ALGORITHM_IDENTIFIER} ` +
+                `Credential=${credentials.accessKeyId}/${scope}, ` +
+                `SignedHeaders=${this.getCanonicalHeaderList(canonicalHeaders)}, ` +
+                `Signature=${signature}`;
+        return request;
+    }
+    async getSignature(longDate, credentialScope, keyPromise, canonicalRequest) {
+        const stringToSign = await this.createStringToSign(longDate, credentialScope, canonicalRequest, ALGORITHM_IDENTIFIER);
+        const hash = new this.sha256(await keyPromise);
+        hash.update(toUint8Array$1(stringToSign));
+        return toHex$1(await hash.digest());
+    }
+    getSigningKey(credentials, region, shortDate, service) {
+        return getSigningKey(this.sha256, credentials, shortDate, region, service || this.service);
+    }
+}
+
+const bindResolveAwsSdkSigV4Config = (defaultDisableClockSkewCorrection) => (config) => {
+    let inputCredentials = config.credentials;
+    let isUserSupplied = !!config.credentials;
+    let resolvedCredentials = undefined;
+    Object.defineProperty(config, "credentials", {
+        set(credentials) {
+            if (credentials && credentials !== inputCredentials && credentials !== resolvedCredentials) {
+                isUserSupplied = true;
+            }
+            inputCredentials = credentials;
+            const memoizedProvider = normalizeCredentialProvider(config, {
+                credentials: inputCredentials,
+                credentialDefaultProvider: config.credentialDefaultProvider,
+            });
+            const boundProvider = bindCallerConfig(config, memoizedProvider);
+            if (isUserSupplied && !boundProvider.attributed) {
+                const isCredentialObject = typeof inputCredentials === "object" && inputCredentials !== null;
+                resolvedCredentials = async (options) => {
+                    const creds = await boundProvider(options);
+                    const attributedCreds = creds;
+                    if (isCredentialObject && (!attributedCreds.$source || Object.keys(attributedCreds.$source).length === 0)) {
+                        return setCredentialFeature(attributedCreds, "CREDENTIALS_CODE", "e");
+                    }
+                    return attributedCreds;
+                };
+                resolvedCredentials.memoized = boundProvider.memoized;
+                resolvedCredentials.configBound = boundProvider.configBound;
+                resolvedCredentials.attributed = true;
+            }
+            else {
+                resolvedCredentials = boundProvider;
+            }
+        },
+        get() {
+            return resolvedCredentials;
+        },
+        enumerable: true,
+        configurable: true,
+    });
+    config.credentials = inputCredentials;
+    const { signingEscapePath = true, systemClockOffset = config.systemClockOffset || 0, sha256, } = config;
+    let signer;
+    if (config.signer) {
+        signer = normalizeProvider$1(config.signer);
+    }
+    else if (config.regionInfoProvider) {
+        signer = () => normalizeProvider$1(config.region)()
+            .then(async (region) => [
+            (await config.regionInfoProvider(region, {
+                useFipsEndpoint: await config.useFipsEndpoint(),
+                useDualstackEndpoint: await config.useDualstackEndpoint(),
+            })) || {},
+            region,
+        ])
+            .then(([regionInfo, region]) => {
+            const { signingRegion, signingService } = regionInfo;
+            config.signingRegion = config.signingRegion || signingRegion || region;
+            config.signingName = config.signingName || signingService || config.serviceId;
+            const params = {
+                ...config,
+                credentials: config.credentials,
+                region: config.signingRegion,
+                service: config.signingName,
+                sha256,
+                uriEscapePath: signingEscapePath,
+            };
+            const SignerCtor = config.signerConstructor || SignatureV4;
+            return new SignerCtor(params);
+        });
+    }
+    else {
+        signer = async (authScheme) => {
+            authScheme = Object.assign({}, {
+                name: "sigv4",
+                signingName: config.signingName || config.defaultSigningName,
+                signingRegion: await normalizeProvider$1(config.region)(),
+                properties: {},
+            }, authScheme);
+            const signingRegion = authScheme.signingRegion;
+            const signingService = authScheme.signingName;
+            config.signingRegion = config.signingRegion || signingRegion;
+            config.signingName = config.signingName || signingService || config.serviceId;
+            const params = {
+                ...config,
+                credentials: config.credentials,
+                region: config.signingRegion,
+                service: config.signingName,
+                sha256,
+                uriEscapePath: signingEscapePath,
+            };
+            const SignerCtor = config.signerConstructor || SignatureV4;
+            return new SignerCtor(params);
+        };
+    }
+    const resolvedConfig = Object.assign(config, {
+        systemClockOffset,
+        signingEscapePath,
+        signer,
+        disableClockSkewCorrection: normalizeProvider$1(config.disableClockSkewCorrection ?? defaultDisableClockSkewCorrection),
+    });
+    return resolvedConfig;
+};
+function normalizeCredentialProvider(config, { credentials, credentialDefaultProvider }) {
+    let credentialsProvider;
+    if (credentials) {
+        if (!credentials?.memoized) {
+            credentialsProvider = memoizeIdentityProvider(credentials, isIdentityExpired, doesIdentityRequireRefresh);
+        }
+        else {
+            credentialsProvider = credentials;
+        }
+    }
+    else {
+        if (credentialDefaultProvider) {
+            credentialsProvider = normalizeProvider$1(credentialDefaultProvider(Object.assign({}, config, {
+                parentClientConfig: config,
+            })));
+        }
+        else {
+            credentialsProvider = async () => {
+                throw new Error("@aws-sdk/core::resolveAwsSdkSigV4Config - `credentials` not provided and no credentialDefaultProvider was configured.");
+            };
+        }
+    }
+    credentialsProvider.memoized = true;
+    return credentialsProvider;
+}
+function bindCallerConfig(config, credentialsProvider) {
+    if (credentialsProvider.configBound) {
+        return credentialsProvider;
+    }
+    const fn = async (options) => credentialsProvider({ ...options, callerClientConfig: config });
+    fn.memoized = credentialsProvider.memoized;
+    fn.configBound = true;
+    return fn;
+}
+
+const ENV_DISABLE_CLOCK_SKEW_CORRECTION = "AWS_DISABLE_CLOCK_SKEW_CORRECTION";
+const CONFIG_DISABLE_CLOCK_SKEW_CORRECTION = "disable_clock_skew_correction";
+const NODE_DISABLE_CLOCK_SKEW_CORRECTION_CONFIG_OPTIONS = {
+    environmentVariableSelector: (env) => booleanSelector$1(env, ENV_DISABLE_CLOCK_SKEW_CORRECTION, SelectorType$1.ENV),
+    configFileSelector: (profile) => booleanSelector$1(profile, CONFIG_DISABLE_CLOCK_SKEW_CORRECTION, SelectorType$1.CONFIG),
+    default: false,
+};
+
+const DEFAULT_DISABLE_CLOCK_SKEW_CORRECTION = loadConfig$1(NODE_DISABLE_CLOCK_SKEW_CORRECTION_CONFIG_OPTIONS);
+
+const resolveAwsSdkSigV4Config = bindResolveAwsSdkSigV4Config(DEFAULT_DISABLE_CLOCK_SKEW_CORRECTION);
+
+class ProtocolLib {
+    queryCompat;
+    errorRegistry;
+    constructor(queryCompat = false) {
+        this.queryCompat = queryCompat;
+    }
+    resolveRestContentType(defaultContentType, inputSchema) {
+        const members = inputSchema.getMemberSchemas();
+        const httpPayloadMember = Object.values(members).find((m) => {
+            return !!m.getMergedTraits().httpPayload;
+        });
+        if (httpPayloadMember) {
+            const mediaType = httpPayloadMember.getMergedTraits().mediaType;
+            if (mediaType) {
+                return mediaType;
+            }
+            else if (httpPayloadMember.isStringSchema()) {
+                return "text/plain";
+            }
+            else if (httpPayloadMember.isBlobSchema()) {
+                return "application/octet-stream";
+            }
+            else {
+                return defaultContentType;
+            }
+        }
+        else if (!inputSchema.isUnitSchema()) {
+            const hasBody = Object.values(members).find((m) => {
+                const { httpQuery, httpQueryParams, httpHeader, httpLabel, httpPrefixHeaders } = m.getMergedTraits();
+                const noPrefixHeaders = httpPrefixHeaders === void 0;
+                return !httpQuery && !httpQueryParams && !httpHeader && !httpLabel && noPrefixHeaders;
+            });
+            if (hasBody) {
+                return defaultContentType;
+            }
+        }
+    }
+    async getErrorSchemaOrThrowBaseException(errorIdentifier, defaultNamespace, response, dataObject, metadata, getErrorSchema) {
+        let errorName = errorIdentifier;
+        if (errorIdentifier.includes("#")) {
+            [, errorName] = errorIdentifier.split("#");
+        }
+        const errorMetadata = {
+            $metadata: metadata,
+            $fault: response.statusCode < 500 ? "client" : "server",
+        };
+        if (!this.errorRegistry) {
+            throw new Error("@aws-sdk/core/protocols - error handler not initialized.");
+        }
+        try {
+            const errorSchema = getErrorSchema?.(this.errorRegistry, errorName) ??
+                this.errorRegistry.getSchema(errorIdentifier);
+            return { errorSchema, errorMetadata };
+        }
+        catch (e) {
+            dataObject.message = dataObject.message ?? dataObject.Message ?? "UnknownError";
+            const synthetic = this.errorRegistry;
+            const baseExceptionSchema = synthetic.getBaseException();
+            if (baseExceptionSchema) {
+                const ErrorCtor = synthetic.getErrorCtor(baseExceptionSchema) ?? Error;
+                throw this.decorateServiceException(Object.assign(new ErrorCtor({ name: errorName }), errorMetadata), dataObject);
+            }
+            const d = dataObject;
+            const message = d?.message ?? d?.Message ?? d?.Error?.Message ?? d?.Error?.message;
+            throw this.decorateServiceException(Object.assign(new Error(message), {
+                name: errorName,
+            }, errorMetadata), dataObject);
+        }
+    }
+    compose(composite, errorIdentifier, defaultNamespace) {
+        let namespace = defaultNamespace;
+        if (errorIdentifier.includes("#")) {
+            [namespace] = errorIdentifier.split("#");
+        }
+        const staticRegistry = TypeRegistry.for(namespace);
+        const defaultSyntheticRegistry = TypeRegistry.for("smithy.ts.sdk.synthetic." + defaultNamespace);
+        composite.copyFrom(staticRegistry);
+        composite.copyFrom(defaultSyntheticRegistry);
+        this.errorRegistry = composite;
+    }
+    decorateServiceException(exception, additions = {}) {
+        if (this.queryCompat) {
+            const msg = exception.Message ?? additions.Message;
+            const error = decorateServiceException(exception, additions);
+            if (msg) {
+                error.message = msg;
+            }
+            const errorObj = error.Error ?? {};
+            errorObj.Type = error.Error?.Type;
+            errorObj.Code = error.Error?.Code;
+            errorObj.Message = error.Error?.message ?? error.Error?.Message ?? msg;
+            error.Error = errorObj;
+            const reqId = error.$metadata.requestId;
+            if (reqId) {
+                error.RequestId = reqId;
+            }
+            return error;
+        }
+        return decorateServiceException(exception, additions);
+    }
+    setQueryCompatError(output, response) {
+        const queryErrorHeader = response.headers?.["x-amzn-query-error"];
+        if (output !== undefined && queryErrorHeader != null) {
+            const [Code, Type] = queryErrorHeader.split(";");
+            const keys = Object.keys(output);
+            const Error = {
+                Code,
+                Type,
+            };
+            output.Code = Code;
+            output.Type = Type;
+            for (let i = 0; i < keys.length; i++) {
+                const k = keys[i];
+                Error[k === "message" ? "Message" : k] = output[k];
+            }
+            delete Error.__type;
+            output.Error = Error;
+        }
+    }
+    queryCompatOutput(queryCompatErrorData, errorData) {
+        if (queryCompatErrorData.Error) {
+            errorData.Error = queryCompatErrorData.Error;
+        }
+        if (queryCompatErrorData.Type) {
+            errorData.Type = queryCompatErrorData.Type;
+        }
+        if (queryCompatErrorData.Code) {
+            errorData.Code = queryCompatErrorData.Code;
+        }
+    }
+    findQueryCompatibleError(registry, errorName) {
+        try {
+            return registry.getSchema(errorName);
+        }
+        catch (e) {
+            return registry.find((schema) => NormalizedSchema.of(schema).getMergedTraits().awsQueryError?.[0] === errorName);
+        }
+    }
+}
+
+class SerdeContextConfig {
+    serdeContext;
+    setSerdeContext(serdeContext) {
+        this.serdeContext = serdeContext;
+    }
+}
+
+class UnionSerde {
+    from;
+    to;
+    keys;
+    constructor(from, to) {
+        this.from = from;
+        this.to = to;
+        const keys = Object.keys(this.from);
+        const set = new Set(keys);
+        set.delete("__type");
+        this.keys = set;
+    }
+    mark(key) {
+        this.keys.delete(key);
+    }
+    hasUnknown() {
+        return this.keys.size === 1 && Object.keys(this.to).length === 0;
+    }
+    writeUnknown() {
+        if (this.hasUnknown()) {
+            const k = this.keys.values().next().value;
+            const v = this.from[k];
+            this.to.$unknown = [k, v];
+        }
+    }
+}
+
+let canParseBuffer;
+function detectBufferParsing() {
+    if (canParseBuffer === undefined) {
+        try {
+            if (typeof Buffer !== "function") {
+                canParseBuffer = false;
+            }
+            else {
+                const result = JSON.parse(Buffer.from([0x7b, 0x7d]));
+                canParseBuffer = result !== null && typeof result === "object";
+            }
+        }
+        catch {
+            canParseBuffer = false;
+        }
+    }
+    return canParseBuffer;
+}
+
+function jsonReviver(key, value, context) {
+    if (context?.source) {
+        const numericString = context.source;
+        if (typeof value === "number") {
+            const inSafeRange = value <= Number.MAX_SAFE_INTEGER && value >= Number.MIN_SAFE_INTEGER;
+            if (inSafeRange) {
+                if (isRepresentable(numericString, value)) {
+                    return value;
+                }
+                return new NumericValue(numericString, "bigDecimal");
+            }
+            else {
+                if (isFractionalBigNumeric(numericString)) {
+                    return new NumericValue(numericString, "bigDecimal");
+                }
+                if (/[eE]/.test(numericString)) {
+                    return expandExponentToBigInt(numericString);
+                }
+                return BigInt(numericString);
+            }
+        }
+    }
+    return value;
+}
+function isFractionalBigNumeric(s) {
+    const dotIndex = s.indexOf(".");
+    if (dotIndex === -1) {
+        return false;
+    }
+    const eIndex = s.search(/[eE]/);
+    if (eIndex === -1) {
+        return true;
+    }
+    const fracDigits = eIndex - dotIndex - 1;
+    const exp = parseInt(s.slice(eIndex + 1), 10);
+    return exp < fracDigits;
+}
+function isRepresentable(numericString, value) {
+    if (numericString === String(value)) {
+        return true;
+    }
+    if (Object.is(value, -0)) {
+        return true;
+    }
+    if (/[eE]/.test(numericString)) {
+        return expandToDecimal(numericString) === expandToDecimal(String(value));
+    }
+    const normalized = numericString.replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "");
+    const canonical = String(value);
+    if (normalized === canonical) {
+        return true;
+    }
+    if (/[eE]/.test(canonical)) {
+        return normalized === expandToDecimal(canonical);
+    }
+    return false;
+}
+function expandToDecimal(s) {
+    const negative = s.startsWith("-");
+    const abs = negative ? s.slice(1) : s;
+    const eIndex = abs.search(/[eE]/);
+    let result;
+    if (eIndex === -1) {
+        result = abs;
+    }
+    else {
+        const exp = parseInt(abs.slice(eIndex + 1), 10);
+        const mantissa = abs.slice(0, eIndex);
+        const dotIndex = mantissa.indexOf(".");
+        let digits;
+        let intLen;
+        if (dotIndex === -1) {
+            digits = mantissa;
+            intLen = mantissa.length;
+        }
+        else {
+            digits = mantissa.slice(0, dotIndex) + mantissa.slice(dotIndex + 1);
+            intLen = dotIndex;
+        }
+        digits = digits.replace(/0+$/, "") || "0";
+        const newDotPos = intLen + exp;
+        if (digits === "0") {
+            result = "0";
+        }
+        else if (newDotPos <= 0) {
+            result = "0." + "0".repeat(-newDotPos) + digits;
+        }
+        else if (newDotPos >= digits.length) {
+            result = digits + "0".repeat(newDotPos - digits.length);
+        }
+        else {
+            result = digits.slice(0, newDotPos) + "." + digits.slice(newDotPos);
+        }
+    }
+    if (result.includes(".")) {
+        result = result.replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "");
+    }
+    return (negative ? "-" : "") + result;
+}
+function expandExponentToBigInt(s) {
+    const eIndex = s.search(/[eE]/);
+    const exp = parseInt(s.slice(eIndex + 1), 10);
+    const negative = s.startsWith("-");
+    const mantissa = s.slice(negative ? 1 : 0, eIndex);
+    const dotIndex = mantissa.indexOf(".");
+    let digits;
+    let shift;
+    if (dotIndex === -1) {
+        digits = mantissa;
+        shift = exp;
+    }
+    else {
+        digits = mantissa.slice(0, dotIndex) + mantissa.slice(dotIndex + 1);
+        const fracDigits = mantissa.length - dotIndex - 1;
+        shift = exp - fracDigits;
+    }
+    digits = digits.replace(/0+$/, "") || "0";
+    const result = BigInt(digits) * 10n ** BigInt(shift + (mantissa.replace(".", "").length - digits.length));
+    return negative ? -result : result;
+}
+
+const REVIVER_SYMBOL = Symbol.for("@aws-sdk/reviver");
+function needsReviver(schema) {
+    const ns = NormalizedSchema.of(schema);
+    const raw = ns.getSchema();
+    if (Array.isArray(raw) && ns.isStructSchema()) {
+        if (REVIVER_SYMBOL in raw) {
+            return raw[REVIVER_SYMBOL];
+        }
+        const result = _check(ns, new Set());
+        raw[REVIVER_SYMBOL] = result;
+        return result;
+    }
+    return _check(ns, new Set());
+}
+function _check(ns, seen) {
+    const raw = ns.getSchema();
+    if (seen.has(raw)) {
+        return false;
+    }
+    seen.add(raw);
+    if (ns.isBigIntegerSchema() || ns.isBigDecimalSchema()) {
+        return true;
+    }
+    if (ns.isStructSchema()) {
+        for (const [, memberSchema] of ns.structIterator()) {
+            if (_check(memberSchema, seen)) {
+                return true;
+            }
+        }
+    }
+    else if (ns.isListSchema() || ns.isMapSchema()) {
+        if (_check(ns.getValueSchema(), seen)) {
+            return true;
+        }
+    }
+    else if (ns.isDocumentSchema()) {
+        return true;
+    }
+    return false;
+}
+
+const collectBodyString = (streamBody, context) => collectBody$1(streamBody, context).then((body) => (context?.utf8Encoder ?? toUtf8$2)(body));
+
+async function parseJsonBody(streamBody, context, schema) {
+    let parsingInput;
+    if (detectBufferParsing() && typeof streamBody?.[Symbol.asyncIterator] === "function") {
+        const buffer = await collectBody$1(streamBody, context);
+        if (typeof Buffer === "function") {
+            if (Buffer.isBuffer(buffer)) {
+                parsingInput = buffer;
+            }
+            else {
+                parsingInput = Buffer.from(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+            }
+        }
+    }
+    if (!parsingInput) {
+        parsingInput = await collectBodyString(streamBody, context);
+    }
+    if (parsingInput.length === 0) {
+        return {};
+    }
+    const reviver = schema && needsReviver(schema) ? jsonReviver : undefined;
+    try {
+        return JSON.parse(parsingInput, reviver);
+    }
+    catch (e) {
+        if (e?.name === "SyntaxError") {
+            Object.defineProperty(e, "$responseBodyText", {
+                value: typeof parsingInput === "string" ? parsingInput : parsingInput.toString("utf8"),
+            });
+        }
+        throw e;
+    }
+}
+const findKey = (object, key) => Object.keys(object).find((k) => k.toLowerCase() === key.toLowerCase());
+const sanitizeErrorCode = (rawValue) => {
+    let cleanValue = rawValue;
+    if (typeof cleanValue === "number") {
+        cleanValue = cleanValue.toString();
+    }
+    if (cleanValue.indexOf(",") >= 0) {
+        cleanValue = cleanValue.split(",")[0];
+    }
+    if (cleanValue.indexOf(":") >= 0) {
+        cleanValue = cleanValue.split(":")[0];
+    }
+    if (cleanValue.indexOf("#") >= 0) {
+        cleanValue = cleanValue.split("#")[1];
+    }
+    return cleanValue;
+};
+const loadRestJsonErrorCode = (output, data) => {
+    return loadErrorCode(output, data, ["header", "code", "type"]);
+};
+const loadErrorCode = ({ headers }, data, order) => {
+    while (order.length > 0) {
+        const location = order.shift();
+        switch (location) {
+            case "header":
+                const headerKey = findKey(headers ?? {}, "x-amzn-errortype");
+                if (headerKey !== undefined) {
+                    return sanitizeErrorCode(headers[headerKey]);
+                }
+                break;
+            case "code":
+                const codeKey = findKey(data ?? {}, "code");
+                if (codeKey && data[codeKey] !== undefined) {
+                    return sanitizeErrorCode(data[codeKey]);
+                }
+                break;
+            case "type":
+                if (data?.__type !== undefined) {
+                    return sanitizeErrorCode(data.__type);
+                }
+                break;
+        }
+    }
+};
+
+function writeKey$1(obj) {
+    Object.defineProperty(obj, "__proto__", { value: undefined, writable: true, enumerable: true, configurable: true });
+}
+
+class JsonShapeDeserializer2 extends SerdeContextConfig {
+    settings;
+    constructor(settings) {
+        super();
+        this.settings = settings;
+    }
+    async read(schema, data) {
+        const reviver = needsReviver(schema) ? jsonReviver : undefined;
+        let parsed;
+        if (typeof data === "string") {
+            if (data.length === 0) {
+                return {};
+            }
+            parsed = JSON.parse(data, reviver);
+        }
+        else if (data instanceof Uint8Array && detectBufferParsing()) {
+            if (data.byteLength === 0) {
+                return {};
+            }
+            const buf = Buffer.isBuffer(data) ? data : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+            parsed = JSON.parse(buf, reviver);
+        }
+        else {
+            parsed = await parseJsonBody(data, this.serdeContext, schema);
+        }
+        return this._read(schema, parsed);
+    }
+    readObject(schema, data) {
+        return this._read(schema, data);
+    }
+    _read(schema, value) {
+        const isObject = value !== null && typeof value === "object";
+        const ns = NormalizedSchema.of(schema);
+        if (isObject) {
+            if (ns.isStructSchema()) {
+                return this._readStruct(ns, value);
+            }
+            if (Array.isArray(value) && ns.isListSchema()) {
+                const listMember = ns.getValueSchema();
+                if (this.needsTransform(listMember)) {
+                    for (let i = 0; i < value.length; ++i) {
+                        value[i] = this._read(listMember, value[i]);
+                    }
+                }
+                return value;
+            }
+            if (ns.isMapSchema()) {
+                const mapMember = ns.getValueSchema();
+                const map = value;
+                if (this.needsTransform(mapMember)) {
+                    for (const k in map) {
+                        if (k === "__proto__") {
+                            writeKey$1(map);
+                        }
+                        map[k] = this._read(mapMember, map[k]);
+                    }
+                }
+                return map;
+            }
+        }
+        if (ns.isBlobSchema() && typeof value === "string") {
+            return fromBase64$1(value);
+        }
+        const mediaType = ns.getMergedTraits().mediaType;
+        if (ns.isStringSchema() && typeof value === "string" && mediaType) {
+            const isJson = mediaType === "application/json" || mediaType.endsWith("+json");
+            if (isJson) {
+                return LazyJsonString.from(value);
+            }
+            return value;
+        }
+        if (ns.isTimestampSchema() && value != null) {
+            const format = determineTimestampFormat(ns, this.settings);
+            switch (format) {
+                case 5:
+                    return parseRfc3339DateTimeWithOffset(value);
+                case 6:
+                    return parseRfc7231DateTime(value);
+                case 7:
+                    return parseEpochTimestamp(value);
+                default:
+                    console.warn("Missing timestamp format, parsing value with Date constructor:", value);
+                    return new Date(value);
+            }
+        }
+        if (ns.isBigIntegerSchema() && (typeof value === "number" || typeof value === "string")) {
+            return BigInt(value);
+        }
+        if (ns.isBigDecimalSchema() && value != undefined) {
+            if (value instanceof NumericValue) {
+                return value;
+            }
+            const untyped = value;
+            if (untyped.type === "bigDecimal" && "string" in untyped) {
+                return new NumericValue(untyped.string, untyped.type);
+            }
+            return new NumericValue(String(value), "bigDecimal");
+        }
+        if (ns.isNumericSchema() && typeof value === "string") {
+            switch (value) {
+                case "Infinity":
+                    return Infinity;
+                case "-Infinity":
+                    return -Infinity;
+                case "NaN":
+                    return NaN;
+            }
+            return value;
+        }
+        if (ns.isDocumentSchema()) {
+            if (isObject) {
+                if (Array.isArray(value)) {
+                    for (let i = 0; i < value.length; ++i) {
+                        const v = value[i];
+                        if (!(v instanceof NumericValue)) {
+                            value[i] = this._read(ns, v);
+                        }
+                    }
+                }
+                else {
+                    const doc = value;
+                    for (const k in doc) {
+                        if (k === "__proto__") {
+                            writeKey$1(doc);
+                        }
+                        const v = doc[k];
+                        if (!(v instanceof NumericValue)) {
+                            doc[k] = this._read(ns, v);
+                        }
+                    }
+                }
+            }
+        }
+        return value;
+    }
+    _readStruct(ns, record) {
+        const union = ns.isUnionSchema();
+        const out = {};
+        let nameMap;
+        const hasType = typeof record.__type === "string";
+        const { jsonName } = this.settings;
+        if (jsonName && hasType) {
+            nameMap = {};
+        }
+        let unionSerde;
+        if (union) {
+            unionSerde = new UnionSerde(record, out);
+        }
+        for (const [memberName, memberSchema] of ns.structIterator()) {
+            let fromKey = memberName;
+            if (jsonName) {
+                fromKey = memberSchema.getMergedTraits().jsonName ?? fromKey;
+                if (hasType) {
+                    nameMap[fromKey] = memberName;
+                }
+            }
+            if (union) {
+                unionSerde.mark(fromKey);
+            }
+            if (record[fromKey] != null) {
+                out[memberName] = this._read(memberSchema, record[fromKey]);
+            }
+        }
+        if (union) {
+            unionSerde.writeUnknown();
+        }
+        else if (hasType) {
+            for (const k in record) {
+                const v = record[k];
+                const t = jsonName ? (nameMap[k] ?? k) : k;
+                if (!(t in out)) {
+                    out[t] = v;
+                }
+            }
+        }
+        return out;
+    }
+    needsTransform(ns) {
+        if (ns.isBlobSchema() || ns.isTimestampSchema() || ns.isBigIntegerSchema() || ns.isBigDecimalSchema()) {
+            return true;
+        }
+        if (ns.isDocumentSchema() || ns.isStructSchema() || ns.isListSchema() || ns.isMapSchema()) {
+            return true;
+        }
+        if (ns.isStringSchema() && ns.getMergedTraits().mediaType) {
+            return true;
+        }
+        return false;
+    }
+}
+
+class JsonBytesStringAdapter extends Uint8Array {
+    string = null;
+    static allocUnsafe(bytes) {
+        if (typeof Buffer === "function") {
+            const buffer = Buffer.allocUnsafe(bytes);
+            return new JsonBytesStringAdapter(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+        }
+        return new JsonBytesStringAdapter(bytes);
+    }
+    toString() {
+        return this.s();
+    }
+    valueOf() {
+        return this.s();
+    }
+    includes(searchString, position) {
+        if (typeof searchString === "string") {
+            return this.s().includes(searchString, position);
+        }
+        return Uint8Array.prototype.includes.call(this, searchString, position);
+    }
+    indexOf(searchString, position) {
+        if (typeof searchString === "string") {
+            return this.s().indexOf(searchString, position);
+        }
+        return Uint8Array.prototype.indexOf.call(this, searchString, position);
+    }
+    lastIndexOf(searchString, position) {
+        if (typeof searchString === "string") {
+            return this.s().lastIndexOf(searchString, position);
+        }
+        const fn = Uint8Array.prototype.lastIndexOf;
+        if (position !== undefined) {
+            return fn.call(this, searchString, position);
+        }
+        return fn.call(this, searchString);
+    }
+    startsWith(searchString, position) {
+        return this.s().startsWith(searchString, position);
+    }
+    endsWith(searchString, endPosition) {
+        return this.s().endsWith(searchString, endPosition);
+    }
+    match(regexp) {
+        return this.s().match(regexp);
+    }
+    replace(searchValue, replaceValue) {
+        return this.s().replace(searchValue, replaceValue);
+    }
+    search(regexp) {
+        return this.s().search(regexp);
+    }
+    split(separator, limit) {
+        return this.s().split(separator, limit);
+    }
+    substring(start, end) {
+        return this.s().substring(start, end);
+    }
+    trim() {
+        return this.s().trim();
+    }
+    trimStart() {
+        return this.s().trimStart();
+    }
+    trimEnd() {
+        return this.s().trimEnd();
+    }
+    charAt(pos) {
+        return this.s().charAt(pos);
+    }
+    charCodeAt(index) {
+        return this.s().charCodeAt(index);
+    }
+    padStart(maxLength, fillString) {
+        return this.s().padStart(maxLength, fillString);
+    }
+    padEnd(maxLength, fillString) {
+        return this.s().padEnd(maxLength, fillString);
+    }
+    repeat(count) {
+        return this.s().repeat(count);
+    }
+    toUpperCase() {
+        return this.s().toUpperCase();
+    }
+    toLowerCase() {
+        return this.s().toLowerCase();
+    }
+    s() {
+        if (this.string == null) {
+            const n = Date.now();
+            if (n > warned + 60_000) {
+                console.warn("@aws-sdk/core/protocols - WARN - JsonCodec2: you have called a string method on a Uint8Array request body. " +
+                    "It has been automatically converted to string. In a future version this will throw an error.");
+                warned = n;
+            }
+            this.string = toUtf8$2(this);
+        }
+        return this.string;
+    }
+}
+var warned = 0;
+
+const encoder = new TextEncoder();
+const OPEN_BRACE = 0x7b;
+const CLOSE_BRACE = 0x7d;
+const OPEN_BRACKET = 0x5b;
+const CLOSE_BRACKET = 0x5d;
+const QUOTE = 0x22;
+const COLON = 0x3a;
+const COMMA = 0x2c;
+const BACKSLASH = 0x5c;
+const TRUE = new Uint8Array([0x74, 0x72, 0x75, 0x65]);
+const FALSE = new Uint8Array([0x66, 0x61, 0x6c, 0x73, 0x65]);
+const NULL = new Uint8Array([0x6e, 0x75, 0x6c, 0x6c]);
+const ESCAPE_TABLE = new Array(128).fill(null);
+ESCAPE_TABLE[0x08] = "b";
+ESCAPE_TABLE[0x09] = "t";
+ESCAPE_TABLE[0x0a] = "n";
+ESCAPE_TABLE[0x0c] = "f";
+ESCAPE_TABLE[0x0d] = "r";
+ESCAPE_TABLE[0x22] = '"';
+ESCAPE_TABLE[0x5c] = "\\";
+for (let i = 0; i < 0x20; i++) {
+    if (ESCAPE_TABLE[i] === null) {
+        ESCAPE_TABLE[i] = "u00" + i.toString(16).padStart(2, "0");
+    }
+}
+const INITIAL_BUFFER_SIZE = 2048;
+function alloc(size) {
+    return JsonBytesStringAdapter.allocUnsafe(size);
+}
+class JsonShapeSerializer2 extends SerdeContextConfig {
+    settings;
+    json;
+    i = 0;
+    rootSchema;
+    rawValue;
+    passthrough = false;
+    constructor(settings) {
+        super();
+        this.settings = settings;
+        this.json = alloc(INITIAL_BUFFER_SIZE);
+    }
+    write(schema, value) {
+        this.i = 0;
+        this.rawValue = value;
+        this.rootSchema = NormalizedSchema.of(schema);
+        this.passthrough = this.rootSchema.isBlobSchema() || this.rootSchema.isStringSchema();
+        if (!this.passthrough) {
+            this.writeValue(this.rootSchema, value, undefined);
+        }
+    }
+    writeDiscriminatedDocument(schema, value) {
+        this.i = 0;
+        this.rootSchema = NormalizedSchema.of(schema);
+        const ns = this.rootSchema;
+        if (ns.isStructSchema() && value != null && typeof value === "object") {
+            this.writeValue(ns, value, undefined);
+            const prefix = `"__type":"${ns.getName(true) ?? "Unknown"}",`;
+            const z = prefix.length;
+            this.ensure(z);
+            this.json.copyWithin(1 + z, 1, this.i);
+            encoder.encodeInto(prefix, this.json.subarray(1));
+            this.i += z;
+        }
+        else {
+            this.writeValue(ns, value, undefined);
+        }
+    }
+    flush() {
+        this.rootSchema = undefined;
+        const finalPosition = this.i;
+        this.i = 0;
+        const raw = this.rawValue;
+        this.rawValue = undefined;
+        if (finalPosition === 0) {
+            return raw;
+        }
+        const result = this.json.subarray(0, finalPosition);
+        this.json = alloc(INITIAL_BUFFER_SIZE);
+        return result;
+    }
+    ensure(byteCount) {
+        const { i, json } = this;
+        if (i + byteCount > json.length) {
+            let newSize = json.length * 2;
+            while (newSize < i + byteCount) {
+                newSize *= 2;
+            }
+            const next = alloc(newSize);
+            next.set(this.json);
+            this.json = next;
+        }
+    }
+    writeAscii(s) {
+        const z = s.length;
+        this.ensure(z);
+        let { i, json } = this;
+        for (let j = 0; j < z; ++j) {
+            json[i] = s.charCodeAt(j);
+            i += 1;
+        }
+        this.i = i;
+    }
+    writeAsciiQuoted(s) {
+        const z = s.length;
+        this.ensure(z + 4);
+        let { json, i } = this;
+        json[i++] = QUOTE;
+        for (let j = 0; j < z; ++j) {
+            json[i++] = s.charCodeAt(j);
+        }
+        json[i++] = QUOTE;
+        this.i = i;
+    }
+    writeJsonString(s) {
+        this.ensure(s.length * 3 + 2);
+        this.json[this.i++] = QUOTE;
+        const z = s.length;
+        for (let j = 0; j < z; ++j) {
+            const c = s.charCodeAt(j);
+            if (c > 0x22 && c < 0x5c) {
+                this.json[this.i++] = c;
+            }
+            else if (c < 0x80) {
+                const esc = ESCAPE_TABLE[c];
+                if (esc !== null) {
+                    this.ensure(esc.length + 1);
+                    this.json[this.i++] = BACKSLASH;
+                    for (let k = 0; k < esc.length; k++) {
+                        this.json[this.i++] = esc.charCodeAt(k);
+                    }
+                }
+                else {
+                    this.json[this.i++] = c;
+                }
+            }
+            else if (c >= 0xd800 && c <= 0xdbff) {
+                const next = j + 1 < z ? s.charCodeAt(j + 1) : 0;
+                if (next >= 0xdc00 && next <= 0xdfff) {
+                    this.ensure(4);
+                    const { written } = encoder.encodeInto(s.substring(j, j + 2), this.json.subarray(this.i));
+                    this.i += written;
+                    ++j;
+                }
+                else {
+                    this.ensure(6);
+                    this.writeUnicodeEscape(c);
+                }
+            }
+            else if (c >= 0xdc00 && c <= 0xdfff) {
+                this.ensure(6);
+                this.writeUnicodeEscape(c);
+            }
+            else {
+                let { i, json } = this;
+                if (c < 0x800) {
+                    json[i++] = 0xc0 | (c >> 6);
+                    json[i++] = 0x80 | (c & 0x3f);
+                }
+                else {
+                    json[i++] = 0xe0 | (c >> 12);
+                    json[i++] = 0x80 | ((c >> 6) & 0x3f);
+                    json[i++] = 0x80 | (c & 0x3f);
+                }
+                this.i = i;
+            }
+        }
+        this.json[this.i++] = QUOTE;
+    }
+    writeUnicodeEscape(code) {
+        let { json, i } = this;
+        json[i++] = BACKSLASH;
+        json[i++] = 0x75;
+        const hex = code.toString(16).padStart(4, "0");
+        for (let j = 0; j < 4; ++j) {
+            json[i++] = hex.charCodeAt(j);
+        }
+        this.i = i;
+    }
+    static B64 = (() => {
+        const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const table = new Uint8Array(64);
+        for (let i = 0; i < 64; ++i) {
+            table[i] = chars.charCodeAt(i);
+        }
+        return table;
+    })();
+    writeBase64(data) {
+        const b64Len = Math.ceil(data.length / 3) * 4;
+        this.ensure(b64Len + 2);
+        const json = this.json;
+        const B64 = JsonShapeSerializer2.B64;
+        let i = this.i;
+        json[i++] = QUOTE;
+        const len = data.length;
+        const remainder = len % 3;
+        const mainLen = len - remainder;
+        for (let j = 0; j < mainLen; j += 3) {
+            const a = data[j];
+            const b = data[j + 1];
+            const c = data[j + 2];
+            json[i++] = B64[a >> 2];
+            json[i++] = B64[((a & 0x03) << 4) | (b >> 4)];
+            json[i++] = B64[((b & 0x0f) << 2) | (c >> 6)];
+            json[i++] = B64[c & 0x3f];
+        }
+        if (remainder === 2) {
+            const a = data[mainLen];
+            const b = data[mainLen + 1];
+            json[i++] = B64[a >> 2];
+            json[i++] = B64[((a & 0x03) << 4) | (b >> 4)];
+            json[i++] = B64[(b & 0x0f) << 2];
+            json[i++] = 0x3d;
+        }
+        else if (remainder === 1) {
+            const a = data[mainLen];
+            json[i++] = B64[a >> 2];
+            json[i++] = B64[(a & 0x03) << 4];
+            json[i++] = 0x3d;
+            json[i++] = 0x3d;
+        }
+        json[i++] = QUOTE;
+        this.i = i;
+    }
+    writeValue(schema, value, container) {
+        if (value == null) {
+            if (container?.isStructSchema()) {
+                if (value === undefined) {
+                    const ns = NormalizedSchema.of(schema);
+                    if (ns.isIdempotencyToken()) {
+                        this.writeAsciiQuoted(generateIdempotencyToken());
+                        return;
+                    }
+                }
+                return;
+            }
+            this.ensure(4);
+            this.json.set(NULL, this.i);
+            this.i += 4;
+            return;
+        }
+        const ns = NormalizedSchema.of(schema);
+        const isObject = typeof value === "object";
+        if (ns.isStringSchema()) {
+            const mediaType = ns.getMergedTraits().mediaType;
+            if (mediaType) {
+                const isJson = mediaType === "application/json" || mediaType.endsWith("+json");
+                if (isJson) {
+                    this.writeJsonString(LazyJsonString.from(value).toString());
+                    return;
+                }
+            }
+        }
+        if (isObject) {
+            if (ns.isStructSchema()) {
+                this.writeStruct(ns, value);
+                return;
+            }
+            if (Array.isArray(value) && (ns.isListSchema() || ns.isDocumentSchema())) {
+                this.writeList(ns, value, ns.isDocumentSchema());
+                return;
+            }
+            if (ns.isMapSchema()) {
+                this.writeMap(ns, value, false);
+                return;
+            }
+            if (value instanceof Uint8Array && (ns.isBlobSchema() || ns.isDocumentSchema())) {
+                this.writeBase64(value);
+                return;
+            }
+            if (value instanceof Date && (ns.isTimestampSchema() || ns.isDocumentSchema())) {
+                this.writeTimestamp(ns, value);
+                return;
+            }
+            if (value instanceof NumericValue) {
+                this.writeAscii(value.string);
+                return;
+            }
+            if (ns.isDocumentSchema()) {
+                if (Array.isArray(value)) {
+                    this.writeList(ns, value, true);
+                }
+                else {
+                    this.writeMap(ns, value, true);
+                }
+                return;
+            }
+            const json = JSON.stringify(value);
+            this.writeAscii(json);
+            return;
+        }
+        if (typeof value === "string") {
+            if (ns.isBlobSchema()) {
+                const b64 = (this.serdeContext?.base64Encoder ?? toBase64$2)(value);
+                this.writeAsciiQuoted(b64);
+                return;
+            }
+            this.writeJsonString(value);
+            return;
+        }
+        if (typeof value === "number") {
+            if (Math.abs(value) === Infinity || Number.isNaN(value)) {
+                this.writeAsciiQuoted(String(value));
+                return;
+            }
+            const numStr = String(value);
+            this.writeAscii(numStr);
+            return;
+        }
+        if (typeof value === "boolean") {
+            this.ensure(5);
+            let { i, json } = this;
+            if (value) {
+                json.set(TRUE, i);
+                i += 4;
+            }
+            else {
+                json.set(FALSE, i);
+                i += 5;
+            }
+            this.i = i;
+            return;
+        }
+        if (typeof value === "bigint") {
+            this.writeAscii(value.toString());
+            return;
+        }
+        this.writeAscii(String(value));
+    }
+    writeStruct(ns, value) {
+        this.ensure(2);
+        this.json[this.i++] = OPEN_BRACE;
+        let wroteAny = false;
+        const hasType = typeof value.__type === "string";
+        let writtenKeys;
+        if (hasType) {
+            writtenKeys = new Set();
+        }
+        for (const [memberName, memberSchema] of ns.structIterator()) {
+            const item = value[memberName];
+            if (item == null && !memberSchema.isIdempotencyToken()) {
+                continue;
+            }
+            if (wroteAny) {
+                this.ensure(1);
+                this.json[this.i++] = COMMA;
+            }
+            wroteAny = true;
+            const targetKey = this.settings.jsonName ? (memberSchema.getMergedTraits().jsonName ?? memberName) : memberName;
+            if (writtenKeys) {
+                writtenKeys.add(memberName);
+                writtenKeys.add(targetKey);
+            }
+            this.writeAsciiQuoted(targetKey);
+            this.json[this.i++] = COLON;
+            this.writeValue(memberSchema, item, ns);
+        }
+        if (!wroteAny && ns.isUnionSchema()) {
+            const { $unknown } = value;
+            if (Array.isArray($unknown)) {
+                const [k, v] = $unknown;
+                this.writeAsciiQuoted(k);
+                this.ensure(1);
+                this.json[this.i++] = COLON;
+                this.writeValue(15, v, ns);
+            }
+        }
+        else if (hasType) {
+            for (const k in value) {
+                if (writtenKeys.has(k)) {
+                    continue;
+                }
+                writtenKeys.add(k);
+                const v = value[k];
+                if (wroteAny) {
+                    this.ensure(1);
+                    this.json[this.i++] = COMMA;
+                }
+                wroteAny = true;
+                this.writeAsciiQuoted(k);
+                this.ensure(1);
+                this.json[this.i++] = COLON;
+                this.writeValue(15, v, undefined);
+            }
+        }
+        this.ensure(1);
+        this.json[this.i++] = CLOSE_BRACE;
+    }
+    writeList(ns, value, isDocument) {
+        const sparse = !!ns.getMergedTraits().sparse;
+        const valueSchema = ns.getValueSchema();
+        if (!isDocument) {
+            if (valueSchema.isStringSchema() || valueSchema.isNumericSchema() || valueSchema.isBooleanSchema()) {
+                let hasSpecials = false;
+                for (let i = 0; i < value.length; ++i) {
+                    const v = value[i];
+                    if (Number.isNaN(v) || v === Infinity || v === -Infinity || (v == null && !sparse)) {
+                        hasSpecials = true;
+                        break;
+                    }
+                }
+                let json;
+                if (!hasSpecials) {
+                    json = JSON.stringify(value);
+                }
+                else {
+                    const out = [];
+                    for (let i = 0; i < value.length; ++i) {
+                        const v = value[i];
+                        if (v == null && !sparse)
+                            continue;
+                        if (Number.isNaN(v) || v === Infinity || v === -Infinity) {
+                            out.push(String(v));
+                        }
+                        else {
+                            out.push(v);
+                        }
+                    }
+                    json = JSON.stringify(out);
+                }
+                this.ensure(json.length * 3);
+                this.i += encoder.encodeInto(json, this.json.subarray(this.i)).written;
+                return;
+            }
+        }
+        this.ensure(2);
+        this.json[this.i++] = OPEN_BRACKET;
+        let wroteFirstItem = false;
+        for (let i = 0; i < value.length; ++i) {
+            const item = value[i];
+            if (isDocument ? item === undefined : item == null && !sparse) {
+                continue;
+            }
+            if (wroteFirstItem) {
+                this.ensure(1);
+                this.json[this.i++] = COMMA;
+            }
+            this.writeValue(valueSchema, item, undefined);
+            wroteFirstItem = true;
+        }
+        this.ensure(1);
+        this.json[this.i++] = CLOSE_BRACKET;
+    }
+    writeMap(ns, value, isDocument) {
+        const sparse = !!ns.getMergedTraits().sparse;
+        const valueSchema = ns.getValueSchema();
+        if (!isDocument) {
+            if (valueSchema.isStringSchema() || valueSchema.isNumericSchema() || valueSchema.isBooleanSchema()) {
+                let modifications;
+                for (const k in value) {
+                    const v = value[k];
+                    if (Number.isNaN(v) || v === Infinity || v === -Infinity) {
+                        (modifications ??= {})[k] = v;
+                        value[k] = String(v);
+                    }
+                    else if (v === null && !sparse) {
+                        (modifications ??= {})[k] = null;
+                        value[k] = undefined;
+                    }
+                }
+                const json = JSON.stringify(value);
+                if (modifications) {
+                    Object.assign(value, modifications);
+                }
+                this.ensure(json.length * 3);
+                this.i += encoder.encodeInto(json, this.json.subarray(this.i)).written;
+                return;
+            }
+        }
+        this.ensure(2);
+        this.json[this.i++] = OPEN_BRACE;
+        let first = true;
+        for (const k in value) {
+            const v = value[k];
+            if (isDocument ? v === undefined : v == null && !sparse) {
+                continue;
+            }
+            if (!first) {
+                this.ensure(1);
+                this.json[this.i++] = COMMA;
+            }
+            first = false;
+            this.writeJsonString(k);
+            this.ensure(1);
+            this.json[this.i++] = COLON;
+            this.writeValue(valueSchema, v, undefined);
+        }
+        this.ensure(1);
+        this.json[this.i++] = CLOSE_BRACE;
+    }
+    writeTimestamp(ns, value) {
+        const format = determineTimestampFormat(ns, this.settings);
+        switch (format) {
+            case 5: {
+                const iso = value.toISOString().replace(".000Z", "Z");
+                this.writeAsciiQuoted(iso);
+                return;
+            }
+            case 6: {
+                this.writeAsciiQuoted(dateToUtcString(value));
+                return;
+            }
+            case 7: {
+                const epochSecs = String(value.getTime() / 1000);
+                this.writeAscii(epochSecs);
+                return;
+            }
+            default: {
+                const epochSecs = String(value.getTime() / 1000);
+                this.writeAscii(epochSecs);
+                return;
+            }
+        }
+    }
+}
+
+class JsonCodec2 extends SerdeContextConfig {
+    settings;
+    constructor(settings) {
+        super();
+        this.settings = settings;
+    }
+    createSerializer() {
+        const serializer = new JsonShapeSerializer2(this.settings);
+        serializer.setSerdeContext(this.serdeContext);
+        return serializer;
+    }
+    createDeserializer() {
+        const deserializer = new JsonShapeDeserializer2(this.settings);
+        deserializer.setSerdeContext(this.serdeContext);
+        return deserializer;
+    }
+}
+
+class AwsRestJsonProtocol extends HttpBindingProtocol {
+    serializer;
+    deserializer;
+    codec;
+    mixin = new ProtocolLib();
+    constructor({ defaultNamespace, errorTypeRegistries, jsonCodec, }) {
+        super({
+            defaultNamespace,
+            errorTypeRegistries,
+        });
+        const settings = {
+            timestampFormat: {
+                useTrait: true,
+                default: 7,
+            },
+            httpBindings: true,
+            jsonName: true,
+        };
+        this.codec = jsonCodec ?? new JsonCodec2(settings);
+        this.serializer = new HttpInterceptingShapeSerializer(this.codec.createSerializer(), settings);
+        this.deserializer = new HttpInterceptingShapeDeserializer(this.codec.createDeserializer(), settings);
+    }
+    getShapeId() {
+        return "aws.protocols#restJson1";
+    }
+    getPayloadCodec() {
+        return this.codec;
+    }
+    setSerdeContext(serdeContext) {
+        this.codec.setSerdeContext(serdeContext);
+        super.setSerdeContext(serdeContext);
+    }
+    async serializeRequest(operationSchema, input, context) {
+        const request = await super.serializeRequest(operationSchema, input, context);
+        const inputSchema = NormalizedSchema.of(operationSchema.input);
+        if (!request.headers["content-type"]) {
+            const contentType = this.mixin.resolveRestContentType(this.getDefaultContentType(), inputSchema);
+            if (contentType) {
+                request.headers["content-type"] = contentType;
+            }
+        }
+        if (request.body == null && request.headers["content-type"] === this.getDefaultContentType()) {
+            request.body = "{}";
+        }
+        return request;
+    }
+    async deserializeResponse(operationSchema, context, response) {
+        const output = await super.deserializeResponse(operationSchema, context, response);
+        const outputSchema = NormalizedSchema.of(operationSchema.output);
+        for (const [name, member] of outputSchema.structIterator()) {
+            if (member.getMemberTraits().httpPayload && !(name in output)) {
+                output[name] = null;
+            }
+        }
+        return output;
+    }
+    async handleError(operationSchema, context, response, dataObject, metadata) {
+        const errorIdentifier = loadRestJsonErrorCode(response, dataObject) ?? "Unknown";
+        this.mixin.compose(this.compositeErrorRegistry, errorIdentifier, this.options.defaultNamespace);
+        const { errorSchema, errorMetadata } = await this.mixin.getErrorSchemaOrThrowBaseException(errorIdentifier, this.options.defaultNamespace, response, dataObject, metadata);
+        const ns = NormalizedSchema.of(errorSchema);
+        const message = dataObject.message ?? dataObject.Message ?? "UnknownError";
+        const ErrorCtor = this.compositeErrorRegistry.getErrorCtor(errorSchema) ?? Error;
+        const exception = new ErrorCtor({});
+        await this.deserializeHttpMessage(errorSchema, context, response, dataObject);
+        const output = {};
+        const errorDeserializer = this.codec.createDeserializer();
+        for (const [name, member] of ns.structIterator()) {
+            const target = member.getMergedTraits().jsonName ?? name;
+            output[name] = errorDeserializer.readObject(member, dataObject[target]);
+        }
+        throw this.mixin.decorateServiceException(Object.assign(exception, errorMetadata, {
+            $fault: ns.getMergedTraits().error,
+            message,
+        }, output), dataObject);
+    }
+    getDefaultContentType() {
+        return "application/json";
+    }
+}
+
+const ATTR_ESCAPE_RE = /[&<>"]/g;
+const ATTR_ESCAPE_MAP = {
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+};
+function escapeAttribute(value) {
+    return value.replace(ATTR_ESCAPE_RE, (ch) => ATTR_ESCAPE_MAP[ch]);
+}
+
+const ELEMENT_ESCAPE_RE = /[&"'<>\r\n\u0085\u2028]/g;
+const ELEMENT_ESCAPE_MAP = {
+    "&": "&amp;",
+    '"': "&quot;",
+    "'": "&apos;",
+    "<": "&lt;",
+    ">": "&gt;",
+    "\r": "&#x0D;",
+    "\n": "&#x0A;",
+    "\u0085": "&#x85;",
+    "\u2028": "&#x2028;",
+};
+function escapeElement(value) {
+    return value.replace(ELEMENT_ESCAPE_RE, (ch) => ELEMENT_ESCAPE_MAP[ch]);
+}
+
+class XmlText {
+    value;
+    constructor(value) {
+        this.value = value;
+    }
+    toString() {
+        return escapeElement("" + this.value);
+    }
+}
+
+class XmlNode {
+    name;
+    children;
+    attributes = {};
+    static of(name, childText, withName) {
+        const node = new XmlNode(name);
+        if (childText !== undefined) {
+            node.addChildNode(new XmlText(childText));
+        }
+        if (withName !== undefined) {
+            node.withName(withName);
+        }
+        return node;
+    }
+    constructor(name, children = []) {
+        this.name = name;
+        this.children = children;
+    }
+    withName(name) {
+        this.name = name;
+        return this;
+    }
+    addAttribute(name, value) {
+        this.attributes[name] = value;
+        return this;
+    }
+    addChildNode(child) {
+        this.children.push(child);
+        return this;
+    }
+    removeAttribute(name) {
+        delete this.attributes[name];
+        return this;
+    }
+    n(name) {
+        this.name = name;
+        return this;
+    }
+    c(child) {
+        this.children.push(child);
+        return this;
+    }
+    a(name, value) {
+        if (value != null) {
+            this.attributes[name] = value;
+        }
+        return this;
+    }
+    cc(input, field, withName = field) {
+        if (input[field] != null) {
+            const node = XmlNode.of(field, input[field]).withName(withName);
+            this.c(node);
+        }
+    }
+    l(input, listName, memberName, valueProvider) {
+        if (input[listName] != null) {
+            const nodes = valueProvider();
+            nodes.map((node) => {
+                node.withName(memberName);
+                this.c(node);
+            });
+        }
+    }
+    lc(input, listName, memberName, valueProvider) {
+        if (input[listName] != null) {
+            const nodes = valueProvider();
+            const containerNode = new XmlNode(memberName);
+            nodes.map((node) => {
+                containerNode.c(node);
+            });
+            this.c(containerNode);
+        }
+    }
+    toString() {
+        const hasChildren = Boolean(this.children.length);
+        let xmlText = `<${this.name}`;
+        const attributes = this.attributes;
+        for (const attributeName of Object.keys(attributes)) {
+            const attribute = attributes[attributeName];
+            if (attribute != null) {
+                xmlText += ` ${attributeName}="${escapeAttribute("" + attribute)}"`;
+            }
+        }
+        return (xmlText += !hasChildren ? "/>" : `>${this.children.map((c) => c.toString()).join("")}</${this.name}>`);
+    }
+}
+
+function writeKey(obj) {
+    Object.defineProperty(obj, "__proto__", { value: undefined, writable: true, enumerable: true, configurable: true });
+}
+function parseXML(xml) {
+    const state = new AwsXmlParser(xml);
+    return state.parse();
+}
+class AwsXmlParser {
+    x;
+    i = 0;
+    z;
+    constructor(x) {
+        this.x = x;
+        this.x = x.replace(/\r\n?/g, "\n");
+        this.z = this.x.length;
+    }
+    parse() {
+        const p = this;
+        const { z } = p;
+        while (p.i < z) {
+            p.trim();
+            if (p.i >= z) {
+                break;
+            }
+            if (p.isNext("<?")) {
+                p.readTo("?>");
+                p.trim();
+            }
+            else if (p.isNext("<!--")) {
+                p.readTo("-->");
+                p.trim();
+            }
+            else if (p.isNext("<!DOCTYPE", false)) {
+                p.skipDoctype();
+                p.trim();
+            }
+            else if (p.x[p.i] === "<") {
+                const root = p.parseTag();
+                return { [root.tag]: root.value };
+            }
+            else {
+                throw new Error("@aws-sdk XML parse error: unexpected content.");
+            }
+        }
+        throw new Error("@aws-sdk XML parse error: no root element.");
+    }
+    isNext(s, caseSensitive = true) {
+        const p = this;
+        if (caseSensitive) {
+            return p.x.startsWith(s, p.i);
+        }
+        return p.x.toLowerCase().startsWith(s.toLowerCase(), p.i);
+    }
+    readTo(stop) {
+        const p = this;
+        const _i = p.x.indexOf(stop, p.i);
+        if (_i === -1) {
+            throw new Error(`@aws-sdk XML parse error: expected "${stop}" not found.`);
+        }
+        const result = p.x.slice(p.i, _i);
+        p.i = _i + stop.length;
+        return result;
+    }
+    trim() {
+        const p = this;
+        while (p.i < p.z && " \t\r\n".includes(p.x[p.i])) {
+            ++p.i;
+        }
+    }
+    readAttrValue() {
+        const p = this;
+        const quote = p.x[p.i];
+        ++p.i;
+        let value = "";
+        while (p.i < p.z && p.x[p.i] !== quote) {
+            value += p.x[p.i++];
+        }
+        ++p.i;
+        return p.decodeEntities(value);
+    }
+    parseTag() {
+        const p = this;
+        ++p.i;
+        let tag = "";
+        while (p.i < p.z && !" \t\r\n>/".includes(p.x[p.i])) {
+            tag += p.x[p.i++];
+        }
+        let hasAttrs = false;
+        const attrs = {};
+        while (p.i < p.z) {
+            p.trim();
+            if (">/".includes(p.x[p.i])) {
+                break;
+            }
+            let name = "";
+            while (p.i < p.z && !"= \t\r\n>/?".includes(p.x[p.i])) {
+                name += p.x[p.i++];
+            }
+            p.trim();
+            if (p.x[p.i] !== "=") {
+                break;
+            }
+            ++p.i;
+            p.trim();
+            if (name === "__proto__") {
+                writeKey(attrs);
+            }
+            attrs[name] = p.readAttrValue();
+            hasAttrs = true;
+        }
+        if (p.i >= p.z) {
+            throw new Error("@aws-sdk XML parse error: unexpected end of input.");
+        }
+        if (p.x[p.i] === "/") {
+            ++p.i;
+            if (p.i >= p.z || p.x[p.i] !== ">") {
+                throw new Error("@aws-sdk XML parse error: expected > at the end of self-closing tag.");
+            }
+            ++p.i;
+            return { tag, value: hasAttrs ? attrs : "" };
+        }
+        if (p.x[p.i] !== ">") {
+            throw new Error("@aws-sdk XML parse error: expected > at the end of opening tag.");
+        }
+        ++p.i;
+        const textParts = [];
+        const childTags = [];
+        let hasElementChild = false;
+        while (p.i < p.z) {
+            if (p.isNext("</")) {
+                break;
+            }
+            if (p.x[p.i] === "<") {
+                if (p.isNext("<!--")) {
+                    p.readTo("-->");
+                }
+                else if (p.isNext("<![CDATA[")) {
+                    p.i += 9;
+                    textParts.push(p.readTo("]]>"));
+                }
+                else if (p.isNext("<?")) {
+                    p.readTo("?>");
+                }
+                else {
+                    hasElementChild = true;
+                    childTags.push(p.parseTag());
+                }
+            }
+            else {
+                let text = "";
+                while (p.i < p.z && p.x[p.i] !== "<") {
+                    text += p.x[p.i++];
+                }
+                textParts.push(p.decodeEntities(text));
+            }
+        }
+        if (!p.isNext("</")) {
+            throw new Error(`@aws-sdk XML parse error: missing closing tag </${tag}>.`);
+        }
+        p.i += 2;
+        const closeTag = p.readTo(">").trim();
+        if (closeTag !== tag) {
+            throw new Error(`@aws-sdk XML parse error: mismatched tags <${tag}> and </${closeTag}>.`);
+        }
+        if (!hasAttrs && textParts.length === 0 && !hasElementChild) {
+            return { tag, value: "" };
+        }
+        if (!hasAttrs && !hasElementChild) {
+            const text = textParts.length === 1 ? textParts[0] : textParts.join("");
+            if (text.trim() === "" && text.includes("\n")) {
+                return { tag, value: "" };
+            }
+            return { tag, value: text };
+        }
+        const obj = {};
+        for (const text of textParts) {
+            if (text.trim() === "" && text.includes("\n")) {
+                continue;
+            }
+            obj["#text"] = "#text" in obj ? obj["#text"] + text : text;
+        }
+        for (const child of childTags) {
+            if (child.tag === "__proto__") {
+                writeKey(obj);
+            }
+            if (child.tag in obj) {
+                if (Array.isArray(obj[child.tag])) {
+                    obj[child.tag].push(child.value);
+                }
+                else {
+                    obj[child.tag] = [obj[child.tag], child.value];
+                }
+            }
+            else {
+                obj[child.tag] = child.value;
+            }
+        }
+        for (const [k, v] of Object.entries(attrs)) {
+            if (k === "__proto__") {
+                writeKey(obj);
+            }
+            obj[k] = v;
+        }
+        return { tag, value: obj };
+    }
+    static ENTITIES = {
+        amp: "&",
+        lt: "<",
+        gt: ">",
+        quot: '"',
+        apos: "'",
+    };
+    skipDoctype() {
+        const p = this;
+        p.i += 9;
+        let depth = 0;
+        while (p.i < p.z) {
+            const c = p.x[p.i];
+            if (c === "[") {
+                ++depth;
+            }
+            else if (c === "]") {
+                --depth;
+            }
+            else if (c === ">" && depth === 0) {
+                ++p.i;
+                return;
+            }
+            ++p.i;
+        }
+        throw new Error("@aws-sdk XML parse error: unclosed DOCTYPE.");
+    }
+    decodeEntities(s) {
+        return s.replace(/&(?:#x([0-9a-fA-F]{1,6})|#(\d{1,7})|([a-zA-Z][a-zA-Z0-9]{0,30}));/g, (_, hex, dec, named) => {
+            if (hex) {
+                return String.fromCharCode(parseInt(hex, 16));
+            }
+            if (dec) {
+                return String.fromCharCode(parseInt(dec, 10));
+            }
+            return AwsXmlParser.ENTITIES[named] ?? "";
+        });
+    }
+}
+
+class XmlShapeDeserializer extends SerdeContextConfig {
+    settings;
+    stringDeserializer;
+    constructor(settings) {
+        super();
+        this.settings = settings;
+        this.stringDeserializer = new FromStringShapeDeserializer(settings);
+    }
+    setSerdeContext(serdeContext) {
+        this.serdeContext = serdeContext;
+        this.stringDeserializer.setSerdeContext(serdeContext);
+    }
+    read(schema, bytes, key) {
+        const ns = NormalizedSchema.of(schema);
+        const memberSchemas = ns.getMemberSchemas();
+        const isEventPayload = ns.isStructSchema() &&
+            ns.isMemberSchema() &&
+            !!Object.values(memberSchemas).find((memberNs) => {
+                return !!memberNs.getMemberTraits().eventPayload;
+            });
+        if (isEventPayload) {
+            const output = {};
+            const memberName = Object.keys(memberSchemas)[0];
+            const eventMemberSchema = memberSchemas[memberName];
+            if (eventMemberSchema.isBlobSchema()) {
+                output[memberName] = bytes;
+            }
+            else {
+                output[memberName] = this.read(memberSchemas[memberName], bytes);
+            }
+            return output;
+        }
+        const xmlString = (this.serdeContext?.utf8Encoder ?? toUtf8$2)(bytes);
+        const parsedObject = this.parseXml(xmlString);
+        return this.readSchema(schema, key ? parsedObject[key] : parsedObject);
+    }
+    readSchema(_schema, value) {
+        const ns = NormalizedSchema.of(_schema);
+        if (ns.isUnitSchema()) {
+            return;
+        }
+        const traits = ns.getMergedTraits();
+        if (ns.isListSchema() && !Array.isArray(value)) {
+            return this.readSchema(ns, [value]);
+        }
+        if (value == null) {
+            return value;
+        }
+        if (typeof value === "object") {
+            const flat = !!traits.xmlFlattened;
+            if (ns.isListSchema()) {
+                const listValue = ns.getValueSchema();
+                const buffer = [];
+                const sourceKey = listValue.getMergedTraits().xmlName ?? "member";
+                const source = flat ? value : (value[0] ?? value)[sourceKey];
+                if (source == null) {
+                    return buffer;
+                }
+                const sourceArray = Array.isArray(source) ? source : [source];
+                for (const v of sourceArray) {
+                    buffer.push(this.readSchema(listValue, v));
+                }
+                return buffer;
+            }
+            const buffer = {};
+            if (ns.isMapSchema()) {
+                const keyNs = ns.getKeySchema();
+                const memberNs = ns.getValueSchema();
+                let entries;
+                if (flat) {
+                    entries = Array.isArray(value) ? value : [value];
+                }
+                else {
+                    entries = Array.isArray(value.entry) ? value.entry : [value.entry];
+                }
+                const keyProperty = keyNs.getMergedTraits().xmlName ?? "key";
+                const valueProperty = memberNs.getMergedTraits().xmlName ?? "value";
+                for (const entry of entries) {
+                    const key = entry[keyProperty];
+                    const value = entry[valueProperty];
+                    if (key === "__proto__") {
+                        writeKey$1(buffer);
+                    }
+                    buffer[key] = this.readSchema(memberNs, value);
+                }
+                return buffer;
+            }
+            if (ns.isStructSchema()) {
+                const union = ns.isUnionSchema();
+                let unionSerde;
+                if (union) {
+                    unionSerde = new UnionSerde(value, buffer);
+                }
+                for (const [memberName, memberSchema] of ns.structIterator()) {
+                    const memberTraits = memberSchema.getMergedTraits();
+                    const xmlObjectKey = !memberTraits.httpPayload
+                        ? (memberSchema.getMemberTraits().xmlName ?? memberName)
+                        : (memberTraits.xmlName ?? memberSchema.getName());
+                    if (union) {
+                        unionSerde.mark(xmlObjectKey);
+                    }
+                    if (value[xmlObjectKey] != null) {
+                        buffer[memberName] = this.readSchema(memberSchema, value[xmlObjectKey]);
+                    }
+                }
+                if (union) {
+                    unionSerde.writeUnknown();
+                }
+                return buffer;
+            }
+            if (ns.isDocumentSchema()) {
+                return value;
+            }
+            throw new Error(`@aws-sdk/core/protocols - xml deserializer unhandled schema type for ${ns.getName(true)}`);
+        }
+        if (ns.isListSchema()) {
+            return [];
+        }
+        if (ns.isMapSchema() || ns.isStructSchema()) {
+            return {};
+        }
+        return this.stringDeserializer.read(ns, value);
+    }
+    parseXml(xml) {
+        if (xml.length) {
+            let parsedObj;
+            try {
+                parsedObj = parseXML(xml);
+            }
+            catch (e) {
+                if (e && typeof e === "object") {
+                    Object.defineProperty(e, "$responseBodyText", {
+                        value: xml,
+                    });
+                }
+                throw e;
+            }
+            const textNodeName = "#text";
+            const key = Object.keys(parsedObj)[0];
+            const parsedObjToReturn = parsedObj[key];
+            if (parsedObjToReturn[textNodeName]) {
+                parsedObjToReturn[key] = parsedObjToReturn[textNodeName];
+                delete parsedObjToReturn[textNodeName];
+            }
+            return getValueFromTextNode(parsedObjToReturn);
+        }
+        return {};
+    }
+}
+
+class QueryShapeSerializer extends SerdeContextConfig {
+    settings;
+    buffer;
+    constructor(settings) {
+        super();
+        this.settings = settings;
+    }
+    write(schema, value, prefix = "") {
+        if (this.buffer === undefined) {
+            this.buffer = "";
+        }
+        const ns = NormalizedSchema.of(schema);
+        if (prefix && !prefix.endsWith(".")) {
+            prefix += ".";
+        }
+        if (ns.isBlobSchema()) {
+            if (typeof value === "string" || value instanceof Uint8Array) {
+                this.writeKey(prefix);
+                this.writeValue((this.serdeContext?.base64Encoder ?? toBase64$2)(value));
+            }
+        }
+        else if (ns.isBooleanSchema() || ns.isNumericSchema() || ns.isStringSchema()) {
+            if (value != null) {
+                this.writeKey(prefix);
+                this.writeValue(String(value));
+            }
+            else if (ns.isIdempotencyToken()) {
+                this.writeKey(prefix);
+                this.writeValue(generateIdempotencyToken());
+            }
+        }
+        else if (ns.isBigIntegerSchema()) {
+            if (value != null) {
+                this.writeKey(prefix);
+                this.writeValue(String(value));
+            }
+        }
+        else if (ns.isBigDecimalSchema()) {
+            if (value != null) {
+                this.writeKey(prefix);
+                this.writeValue(value instanceof NumericValue ? value.string : String(value));
+            }
+        }
+        else if (ns.isTimestampSchema()) {
+            if (value instanceof Date) {
+                this.writeKey(prefix);
+                const format = determineTimestampFormat(ns, this.settings);
+                switch (format) {
+                    case 5:
+                        this.writeValue(value.toISOString().replace(".000Z", "Z"));
+                        break;
+                    case 6:
+                        this.writeValue(dateToUtcString(value));
+                        break;
+                    case 7:
+                        this.writeValue(String(value.getTime() / 1000));
+                        break;
+                }
+            }
+        }
+        else if (ns.isDocumentSchema()) {
+            if (Array.isArray(value)) {
+                this.write(64 | 15, value, prefix);
+            }
+            else if (value instanceof Date) {
+                this.write(4, value, prefix);
+            }
+            else if (value instanceof Uint8Array) {
+                this.write(21, value, prefix);
+            }
+            else if (value && typeof value === "object") {
+                this.write(128 | 15, value, prefix);
+            }
+            else {
+                this.writeKey(prefix);
+                this.writeValue(String(value));
+            }
+        }
+        else if (ns.isListSchema()) {
+            if (Array.isArray(value)) {
+                if (value.length === 0) {
+                    if (this.settings.serializeEmptyLists) {
+                        this.writeKey(prefix);
+                        this.writeValue("");
+                    }
+                }
+                else {
+                    const member = ns.getValueSchema();
+                    const flat = this.settings.flattenLists || ns.getMergedTraits().xmlFlattened;
+                    let i = 1;
+                    for (const item of value) {
+                        if (item == null) {
+                            continue;
+                        }
+                        const traits = member.getMergedTraits();
+                        const suffix = this.getKey("member", traits.xmlName, traits.ec2QueryName);
+                        const key = flat ? `${prefix}${i}` : `${prefix}${suffix}.${i}`;
+                        this.write(member, item, key);
+                        ++i;
+                    }
+                }
+            }
+        }
+        else if (ns.isMapSchema()) {
+            if (value && typeof value === "object") {
+                const keySchema = ns.getKeySchema();
+                const memberSchema = ns.getValueSchema();
+                const flat = ns.getMergedTraits().xmlFlattened;
+                let i = 1;
+                for (const k in value) {
+                    const v = value[k];
+                    if (v == null) {
+                        continue;
+                    }
+                    const keyTraits = keySchema.getMergedTraits();
+                    const keySuffix = this.getKey("key", keyTraits.xmlName, keyTraits.ec2QueryName);
+                    const key = flat ? `${prefix}${i}.${keySuffix}` : `${prefix}entry.${i}.${keySuffix}`;
+                    const valTraits = memberSchema.getMergedTraits();
+                    const valueSuffix = this.getKey("value", valTraits.xmlName, valTraits.ec2QueryName);
+                    const valueKey = flat ? `${prefix}${i}.${valueSuffix}` : `${prefix}entry.${i}.${valueSuffix}`;
+                    this.write(keySchema, k, key);
+                    this.write(memberSchema, v, valueKey);
+                    ++i;
+                }
+            }
+        }
+        else if (ns.isStructSchema()) {
+            if (value && typeof value === "object") {
+                let didWriteMember = false;
+                for (const [memberName, member] of ns.structIterator()) {
+                    if (value[memberName] == null && !member.isIdempotencyToken()) {
+                        continue;
+                    }
+                    const traits = member.getMergedTraits();
+                    const suffix = this.getKey(memberName, traits.xmlName, traits.ec2QueryName, "struct");
+                    const key = `${prefix}${suffix}`;
+                    this.write(member, value[memberName], key);
+                    didWriteMember = true;
+                }
+                if (!didWriteMember && ns.isUnionSchema()) {
+                    const { $unknown } = value;
+                    if (Array.isArray($unknown)) {
+                        const [k, v] = $unknown;
+                        const key = `${prefix}${k}`;
+                        this.write(15, v, key);
+                    }
+                }
+            }
+        }
+        else if (ns.isUnitSchema()) ;
+        else {
+            throw new Error(`@aws-sdk/core/protocols - QuerySerializer unrecognized schema type ${ns.getName(true)}`);
+        }
+    }
+    flush() {
+        if (this.buffer === undefined) {
+            throw new Error("@aws-sdk/core/protocols - QuerySerializer cannot flush with nothing written to buffer.");
+        }
+        const str = this.buffer;
+        delete this.buffer;
+        return str;
+    }
+    getKey(memberName, xmlName, ec2QueryName, keySource) {
+        const { ec2, capitalizeKeys } = this.settings;
+        if (ec2 && ec2QueryName) {
+            return ec2QueryName;
+        }
+        const key = xmlName ?? memberName;
+        if (capitalizeKeys && keySource === "struct") {
+            return key[0].toUpperCase() + key.slice(1);
+        }
+        return key;
+    }
+    writeKey(key) {
+        if (key.endsWith(".")) {
+            key = key.slice(0, key.length - 1);
+        }
+        this.buffer += `&${extendedEncodeURIComponent(key)}=`;
+    }
+    writeValue(value) {
+        this.buffer += extendedEncodeURIComponent(value);
+    }
+}
+
+class AwsQueryProtocol extends RpcProtocol {
+    options;
+    serializer;
+    deserializer;
+    mixin = new ProtocolLib();
+    constructor(options) {
+        super({
+            defaultNamespace: options.defaultNamespace,
+            errorTypeRegistries: options.errorTypeRegistries,
+        });
+        this.options = options;
+        const settings = {
+            timestampFormat: {
+                useTrait: true,
+                default: 5,
+            },
+            httpBindings: false,
+            xmlNamespace: options.xmlNamespace,
+            serviceNamespace: options.defaultNamespace,
+            serializeEmptyLists: true,
+        };
+        this.serializer = new QueryShapeSerializer(settings);
+        this.deserializer = new XmlShapeDeserializer(settings);
+    }
+    getShapeId() {
+        return "aws.protocols#awsQuery";
+    }
+    setSerdeContext(serdeContext) {
+        this.serializer.setSerdeContext(serdeContext);
+        this.deserializer.setSerdeContext(serdeContext);
+    }
+    getPayloadCodec() {
+        throw new Error("AWSQuery protocol has no payload codec.");
+    }
+    async serializeRequest(operationSchema, input, context) {
+        const request = await super.serializeRequest(operationSchema, input, context);
+        if (!request.path.endsWith("/")) {
+            request.path += "/";
+        }
+        request.headers["content-type"] = "application/x-www-form-urlencoded";
+        if (deref(operationSchema.input) === "unit" || !request.body) {
+            request.body = "";
+        }
+        const action = operationSchema.name.split("#")[1] ?? operationSchema.name;
+        request.body = `Action=${action}&Version=${this.options.version}` + request.body;
+        if (request.body.endsWith("&")) {
+            request.body = request.body.slice(-1);
+        }
+        return request;
+    }
+    async deserializeResponse(operationSchema, context, response) {
+        const deserializer = this.deserializer;
+        const ns = NormalizedSchema.of(operationSchema.output);
+        const dataObject = {};
+        if (response.statusCode >= 300) {
+            const bytes = await collectBody$1(response.body, context);
+            if (bytes.byteLength > 0) {
+                Object.assign(dataObject, await deserializer.read(15, bytes));
+            }
+            await this.handleError(operationSchema, context, response, dataObject, this.deserializeMetadata(response));
+        }
+        for (const header in response.headers) {
+            const value = response.headers[header];
+            delete response.headers[header];
+            response.headers[header.toLowerCase()] = value;
+        }
+        const shortName = operationSchema.name.split("#")[1] ?? operationSchema.name;
+        const awsQueryResultKey = ns.isStructSchema() && this.useNestedResult() ? shortName + "Result" : undefined;
+        const bytes = await collectBody$1(response.body, context);
+        if (bytes.byteLength > 0) {
+            Object.assign(dataObject, await deserializer.read(ns, bytes, awsQueryResultKey));
+        }
+        dataObject.$metadata = this.deserializeMetadata(response);
+        return dataObject;
+    }
+    useNestedResult() {
+        return true;
+    }
+    async handleError(operationSchema, context, response, dataObject, metadata) {
+        const errorIdentifier = this.loadQueryErrorCode(response, dataObject) ?? "Unknown";
+        this.mixin.compose(this.compositeErrorRegistry, errorIdentifier, this.options.defaultNamespace);
+        const errorData = this.loadQueryError(dataObject) ?? {};
+        const message = this.loadQueryErrorMessage(dataObject);
+        errorData.message = message;
+        errorData.Error = {
+            Type: errorData.Type,
+            Code: errorData.Code,
+            Message: message,
+        };
+        const { errorSchema, errorMetadata } = await this.mixin.getErrorSchemaOrThrowBaseException(errorIdentifier, this.options.defaultNamespace, response, errorData, metadata, this.mixin.findQueryCompatibleError);
+        const ns = NormalizedSchema.of(errorSchema);
+        const ErrorCtor = this.compositeErrorRegistry.getErrorCtor(errorSchema) ?? Error;
+        const exception = new ErrorCtor({});
+        const output = {
+            Type: errorData.Error.Type,
+            Code: errorData.Error.Code,
+            Error: errorData.Error,
+        };
+        for (const [name, member] of ns.structIterator()) {
+            const target = member.getMergedTraits().xmlName ?? name;
+            const value = errorData[target] ?? dataObject[target];
+            output[name] = this.deserializer.readSchema(member, value);
+        }
+        throw this.mixin.decorateServiceException(Object.assign(exception, errorMetadata, {
+            $fault: ns.getMergedTraits().error,
+            message,
+        }, output), dataObject);
+    }
+    loadQueryErrorCode(output, data) {
+        const code = (data.Errors?.[0]?.Error ?? data.Errors?.Error ?? data.Error)?.Code;
+        if (code !== undefined) {
+            return code;
+        }
+        if (output.statusCode == 404) {
+            return "NotFound";
+        }
+    }
+    loadQueryError(data) {
+        return data.Errors?.[0]?.Error ?? data.Errors?.Error ?? data.Error;
+    }
+    loadQueryErrorMessage(data) {
+        const errorData = this.loadQueryError(data);
+        return errorData?.message ?? errorData?.Message ?? data.message ?? data.Message ?? "Unknown";
+    }
+    getDefaultContentType() {
+        return "application/x-www-form-urlencoded";
+    }
+}
+
+const loadRestXmlErrorCode = (output, data) => {
+    if (data?.Error?.Code !== undefined) {
+        return data.Error.Code;
+    }
+    if (data?.Code !== undefined) {
+        return data.Code;
+    }
+    if (output.statusCode == 404) {
+        return "NotFound";
+    }
+};
+
+class XmlShapeSerializer extends SerdeContextConfig {
+    settings;
+    stringBuffer;
+    byteBuffer;
+    buffer;
+    constructor(settings) {
+        super();
+        this.settings = settings;
+    }
+    write(schema, value) {
+        const ns = NormalizedSchema.of(schema);
+        if (ns.isStringSchema() && typeof value === "string") {
+            this.stringBuffer = value;
+        }
+        else if (ns.isBlobSchema()) {
+            this.byteBuffer =
+                "byteLength" in value
+                    ? value
+                    : (this.serdeContext?.base64Decoder ?? fromBase64$1)(value);
+        }
+        else {
+            this.buffer = this.writeStruct(ns, value, undefined);
+            const traits = ns.getMergedTraits();
+            if (traits.httpPayload && !traits.xmlName) {
+                this.buffer.withName(ns.getName());
+            }
+        }
+    }
+    flush() {
+        if (this.byteBuffer !== undefined) {
+            const bytes = this.byteBuffer;
+            delete this.byteBuffer;
+            return bytes;
+        }
+        if (this.stringBuffer !== undefined) {
+            const str = this.stringBuffer;
+            delete this.stringBuffer;
+            return str;
+        }
+        const buffer = this.buffer;
+        if (this.settings.xmlNamespace) {
+            if (!buffer?.attributes?.["xmlns"]) {
+                buffer.addAttribute("xmlns", this.settings.xmlNamespace);
+            }
+        }
+        delete this.buffer;
+        return buffer.toString();
+    }
+    writeStruct(ns, value, parentXmlns) {
+        const traits = ns.getMergedTraits();
+        const name = ns.isMemberSchema() && !traits.httpPayload
+            ? (ns.getMemberTraits().xmlName ?? ns.getMemberName())
+            : (traits.xmlName ?? ns.getName());
+        if (!name || !ns.isStructSchema()) {
+            throw new Error(`@aws-sdk/core/protocols - xml serializer, cannot write struct with empty name or non-struct, schema=${ns.getName(true)}.`);
+        }
+        const structXmlNode = XmlNode.of(name);
+        const [xmlnsAttr, xmlns] = this.getXmlnsAttribute(ns, parentXmlns);
+        for (const [memberName, memberSchema] of ns.structIterator()) {
+            const val = value[memberName];
+            if (val != null || memberSchema.isIdempotencyToken()) {
+                if (memberSchema.getMergedTraits().xmlAttribute) {
+                    structXmlNode.addAttribute(memberSchema.getMergedTraits().xmlName ?? memberName, this.writeSimple(memberSchema, val));
+                    continue;
+                }
+                if (memberSchema.isListSchema()) {
+                    this.writeList(memberSchema, val, structXmlNode, xmlns);
+                }
+                else if (memberSchema.isMapSchema()) {
+                    this.writeMap(memberSchema, val, structXmlNode, xmlns);
+                }
+                else if (memberSchema.isStructSchema()) {
+                    structXmlNode.addChildNode(this.writeStruct(memberSchema, val, xmlns));
+                }
+                else {
+                    const memberNode = XmlNode.of(memberSchema.getMergedTraits().xmlName ?? memberSchema.getMemberName());
+                    this.writeSimpleInto(memberSchema, val, memberNode, xmlns);
+                    structXmlNode.addChildNode(memberNode);
+                }
+            }
+        }
+        const { $unknown } = value;
+        if ($unknown && ns.isUnionSchema() && Array.isArray($unknown) && Object.keys(value).length === 1) {
+            const [k, v] = $unknown;
+            const node = XmlNode.of(k);
+            if (typeof v !== "string") {
+                if (value instanceof XmlNode || value instanceof XmlText) {
+                    structXmlNode.addChildNode(value);
+                }
+                else {
+                    throw new Error(`@aws-sdk - $unknown union member in XML requires ` +
+                        `value of type string, @aws-sdk/xml-builder::XmlNode or XmlText.`);
+                }
+            }
+            this.writeSimpleInto(0, v, node, xmlns);
+            structXmlNode.addChildNode(node);
+        }
+        if (xmlns) {
+            structXmlNode.addAttribute(xmlnsAttr, xmlns);
+        }
+        return structXmlNode;
+    }
+    writeList(listMember, array, container, parentXmlns) {
+        if (!listMember.isMemberSchema()) {
+            throw new Error(`@aws-sdk/core/protocols - xml serializer, cannot write non-member list: ${listMember.getName(true)}`);
+        }
+        const listTraits = listMember.getMergedTraits();
+        const listValueSchema = listMember.getValueSchema();
+        const listValueTraits = listValueSchema.getMergedTraits();
+        const sparse = !!listValueTraits.sparse;
+        const flat = !!listTraits.xmlFlattened;
+        const [xmlnsAttr, xmlns] = this.getXmlnsAttribute(listMember, parentXmlns);
+        const writeItem = (container, value) => {
+            if (listValueSchema.isListSchema()) {
+                this.writeList(listValueSchema, Array.isArray(value) ? value : [value], container, xmlns);
+            }
+            else if (listValueSchema.isMapSchema()) {
+                this.writeMap(listValueSchema, value, container, xmlns);
+            }
+            else if (listValueSchema.isStructSchema()) {
+                const struct = this.writeStruct(listValueSchema, value, xmlns);
+                container.addChildNode(struct.withName(flat ? (listTraits.xmlName ?? listMember.getMemberName()) : (listValueTraits.xmlName ?? "member")));
+            }
+            else {
+                const listItemNode = XmlNode.of(flat ? (listTraits.xmlName ?? listMember.getMemberName()) : (listValueTraits.xmlName ?? "member"));
+                this.writeSimpleInto(listValueSchema, value, listItemNode, xmlns);
+                container.addChildNode(listItemNode);
+            }
+        };
+        if (flat) {
+            for (const value of array) {
+                if (sparse || value != null) {
+                    writeItem(container, value);
+                }
+            }
+        }
+        else {
+            const listNode = XmlNode.of(listTraits.xmlName ?? listMember.getMemberName());
+            if (xmlns) {
+                listNode.addAttribute(xmlnsAttr, xmlns);
+            }
+            for (const value of array) {
+                if (sparse || value != null) {
+                    writeItem(listNode, value);
+                }
+            }
+            container.addChildNode(listNode);
+        }
+    }
+    writeMap(mapMember, map, container, parentXmlns, containerIsMap = false) {
+        if (!mapMember.isMemberSchema()) {
+            throw new Error(`@aws-sdk/core/protocols - xml serializer, cannot write non-member map: ${mapMember.getName(true)}`);
+        }
+        const mapTraits = mapMember.getMergedTraits();
+        const mapKeySchema = mapMember.getKeySchema();
+        const mapKeyTraits = mapKeySchema.getMergedTraits();
+        const keyTag = mapKeyTraits.xmlName ?? "key";
+        const mapValueSchema = mapMember.getValueSchema();
+        const mapValueTraits = mapValueSchema.getMergedTraits();
+        const valueTag = mapValueTraits.xmlName ?? "value";
+        const sparse = !!mapValueTraits.sparse;
+        const flat = !!mapTraits.xmlFlattened;
+        const [xmlnsAttr, xmlns] = this.getXmlnsAttribute(mapMember, parentXmlns);
+        const addKeyValue = (entry, key, val) => {
+            const keyNode = XmlNode.of(keyTag, key);
+            const [keyXmlnsAttr, keyXmlns] = this.getXmlnsAttribute(mapKeySchema, xmlns);
+            if (keyXmlns) {
+                keyNode.addAttribute(keyXmlnsAttr, keyXmlns);
+            }
+            entry.addChildNode(keyNode);
+            let valueNode = XmlNode.of(valueTag);
+            if (mapValueSchema.isListSchema()) {
+                this.writeList(mapValueSchema, val, valueNode, xmlns);
+            }
+            else if (mapValueSchema.isMapSchema()) {
+                this.writeMap(mapValueSchema, val, valueNode, xmlns, true);
+            }
+            else if (mapValueSchema.isStructSchema()) {
+                valueNode = this.writeStruct(mapValueSchema, val, xmlns);
+            }
+            else {
+                this.writeSimpleInto(mapValueSchema, val, valueNode, xmlns);
+            }
+            entry.addChildNode(valueNode);
+        };
+        if (flat) {
+            for (const key in map) {
+                const val = map[key];
+                if (sparse || val != null) {
+                    const entry = XmlNode.of(mapTraits.xmlName ?? mapMember.getMemberName());
+                    addKeyValue(entry, key, val);
+                    container.addChildNode(entry);
+                }
+            }
+        }
+        else {
+            let mapNode;
+            if (!containerIsMap) {
+                mapNode = XmlNode.of(mapTraits.xmlName ?? mapMember.getMemberName());
+                if (xmlns) {
+                    mapNode.addAttribute(xmlnsAttr, xmlns);
+                }
+                container.addChildNode(mapNode);
+            }
+            for (const key in map) {
+                const val = map[key];
+                if (sparse || val != null) {
+                    const entry = XmlNode.of("entry");
+                    addKeyValue(entry, key, val);
+                    (containerIsMap ? container : mapNode).addChildNode(entry);
+                }
+            }
+        }
+    }
+    writeSimple(_schema, value) {
+        if (null === value) {
+            throw new Error("@aws-sdk/core/protocols - (XML serializer) cannot write null value.");
+        }
+        const ns = NormalizedSchema.of(_schema);
+        let nodeContents = null;
+        if (value && typeof value === "object") {
+            if (ns.isBlobSchema()) {
+                nodeContents = (this.serdeContext?.base64Encoder ?? toBase64$2)(value);
+            }
+            else if (ns.isTimestampSchema() && value instanceof Date) {
+                const format = determineTimestampFormat(ns, this.settings);
+                switch (format) {
+                    case 5:
+                        nodeContents = value.toISOString().replace(".000Z", "Z");
+                        break;
+                    case 6:
+                        nodeContents = dateToUtcString(value);
+                        break;
+                    case 7:
+                        nodeContents = String(value.getTime() / 1000);
+                        break;
+                    default:
+                        console.warn("Missing timestamp format, using http date", value);
+                        nodeContents = dateToUtcString(value);
+                        break;
+                }
+            }
+            else if (ns.isBigDecimalSchema() && value) {
+                if (value instanceof NumericValue) {
+                    return value.string;
+                }
+                return String(value);
+            }
+            else if (ns.isMapSchema() || ns.isListSchema()) {
+                throw new Error("@aws-sdk/core/protocols - xml serializer, cannot call _write() on List/Map schema, call writeList or writeMap() instead.");
+            }
+            else {
+                throw new Error(`@aws-sdk/core/protocols - xml serializer, unhandled schema type for object value and schema: ${ns.getName(true)}`);
+            }
+        }
+        if (ns.isBooleanSchema() || ns.isNumericSchema() || ns.isBigIntegerSchema() || ns.isBigDecimalSchema()) {
+            nodeContents = String(value);
+        }
+        if (ns.isStringSchema()) {
+            if (value === undefined && ns.isIdempotencyToken()) {
+                nodeContents = generateIdempotencyToken();
+            }
+            else {
+                nodeContents = String(value);
+            }
+        }
+        if (nodeContents === null) {
+            throw new Error(`Unhandled schema-value pair ${ns.getName(true)}=${value}`);
+        }
+        return nodeContents;
+    }
+    writeSimpleInto(_schema, value, into, parentXmlns) {
+        const nodeContents = this.writeSimple(_schema, value);
+        const ns = NormalizedSchema.of(_schema);
+        const content = new XmlText(nodeContents);
+        const [xmlnsAttr, xmlns] = this.getXmlnsAttribute(ns, parentXmlns);
+        if (xmlns) {
+            into.addAttribute(xmlnsAttr, xmlns);
+        }
+        into.addChildNode(content);
+    }
+    getXmlnsAttribute(ns, parentXmlns) {
+        const traits = ns.getMergedTraits();
+        const [prefix, xmlns] = traits.xmlNamespace ?? [];
+        if (xmlns && xmlns !== parentXmlns) {
+            return [prefix ? `xmlns:${prefix}` : "xmlns", xmlns];
+        }
+        return [void 0, void 0];
+    }
+}
+
+class XmlCodec extends SerdeContextConfig {
+    settings;
+    constructor(settings) {
+        super();
+        this.settings = settings;
+    }
+    createSerializer() {
+        const serializer = new XmlShapeSerializer(this.settings);
+        serializer.setSerdeContext(this.serdeContext);
+        return serializer;
+    }
+    createDeserializer() {
+        const deserializer = new XmlShapeDeserializer(this.settings);
+        deserializer.setSerdeContext(this.serdeContext);
+        return deserializer;
+    }
+}
+
+class AwsRestXmlProtocol extends HttpBindingProtocol {
+    codec;
+    serializer;
+    deserializer;
+    mixin = new ProtocolLib();
+    constructor(options) {
+        super(options);
+        const settings = {
+            timestampFormat: {
+                useTrait: true,
+                default: 5,
+            },
+            httpBindings: true,
+            xmlNamespace: options.xmlNamespace,
+            serviceNamespace: options.defaultNamespace,
+        };
+        this.codec = new XmlCodec(settings);
+        this.serializer = new HttpInterceptingShapeSerializer(this.codec.createSerializer(), settings);
+        this.deserializer = new HttpInterceptingShapeDeserializer(this.codec.createDeserializer(), settings);
+    }
+    getPayloadCodec() {
+        return this.codec;
+    }
+    getShapeId() {
+        return "aws.protocols#restXml";
+    }
+    async serializeRequest(operationSchema, input, context) {
+        const request = await super.serializeRequest(operationSchema, input, context);
+        const inputSchema = NormalizedSchema.of(operationSchema.input);
+        if (!request.headers["content-type"]) {
+            const contentType = this.mixin.resolveRestContentType(this.getDefaultContentType(), inputSchema);
+            if (contentType) {
+                request.headers["content-type"] = contentType;
+            }
+        }
+        if (typeof request.body === "string" &&
+            request.headers["content-type"] === this.getDefaultContentType() &&
+            !request.body.startsWith("<?xml ") &&
+            !this.hasUnstructuredPayloadBinding(inputSchema)) {
+            request.body = '<?xml version="1.0" encoding="UTF-8"?>' + request.body;
+        }
+        return request;
+    }
+    async deserializeResponse(operationSchema, context, response) {
+        return super.deserializeResponse(operationSchema, context, response);
+    }
+    async handleError(operationSchema, context, response, dataObject, metadata) {
+        const errorIdentifier = loadRestXmlErrorCode(response, dataObject) ?? "Unknown";
+        this.mixin.compose(this.compositeErrorRegistry, errorIdentifier, this.options.defaultNamespace);
+        if (dataObject.Error && typeof dataObject.Error === "object") {
+            for (const key of Object.keys(dataObject.Error)) {
+                dataObject[key] = dataObject.Error[key];
+                if (key.toLowerCase() === "message") {
+                    dataObject.message = dataObject.Error[key];
+                }
+            }
+        }
+        if (dataObject.RequestId && !metadata.requestId) {
+            metadata.requestId = dataObject.RequestId;
+        }
+        const { errorSchema, errorMetadata } = await this.mixin.getErrorSchemaOrThrowBaseException(errorIdentifier, this.options.defaultNamespace, response, dataObject, metadata);
+        const ns = NormalizedSchema.of(errorSchema);
+        const message = dataObject.Error?.message ??
+            dataObject.Error?.Message ??
+            dataObject.message ??
+            dataObject.Message ??
+            "UnknownError";
+        const ErrorCtor = this.compositeErrorRegistry.getErrorCtor(errorSchema) ?? Error;
+        const exception = new ErrorCtor({});
+        await this.deserializeHttpMessage(errorSchema, context, response, dataObject);
+        const output = {};
+        const errorDeserializer = this.codec.createDeserializer();
+        for (const [name, member] of ns.structIterator()) {
+            const target = member.getMergedTraits().xmlName ?? name;
+            const value = dataObject.Error?.[target] ?? dataObject[target];
+            output[name] = errorDeserializer.readSchema(member, value);
+        }
+        throw this.mixin.decorateServiceException(Object.assign(exception, errorMetadata, {
+            $fault: ns.getMergedTraits().error,
+            message,
+        }, output), dataObject);
+    }
+    getDefaultContentType() {
+        return "application/xml";
+    }
+    hasUnstructuredPayloadBinding(ns) {
+        for (const [, member] of ns.structIterator()) {
+            if (member.getMergedTraits().httpPayload) {
+                return !(member.isStructSchema() || member.isMapSchema() || member.isListSchema());
+            }
+        }
+        return false;
+    }
+}
 
 const isArrayBuffer = (arg) => (typeof ArrayBuffer === "function" && arg instanceof ArrayBuffer) ||
     Object.prototype.toString.call(arg) === "[object ArrayBuffer]";
@@ -5047,28 +11461,6 @@ const toBase64 = (_input) => {
     }
     return fromArrayBuffer(input.buffer, input.byteOffset, input.byteLength).toString("base64");
 };
-
-class Uint8ArrayBlobAdapter extends Uint8Array {
-    static fromString(source, encoding = "utf-8") {
-        if (typeof source === "string") {
-            if (encoding === "base64") {
-                return Uint8ArrayBlobAdapter.mutate(fromBase64(source));
-            }
-            return Uint8ArrayBlobAdapter.mutate(fromUtf8$2(source));
-        }
-        throw new Error(`Unsupported conversion from ${typeof source} to Uint8ArrayBlobAdapter.`);
-    }
-    static mutate(source) {
-        Object.setPrototypeOf(source, Uint8ArrayBlobAdapter.prototype);
-        return source;
-    }
-    transformToString(encoding = "utf-8") {
-        if (encoding === "base64") {
-            return toBase64(this);
-        }
-        return toUtf8(this);
-    }
-}
 
 let ChecksumStream$1 = class ChecksumStream extends Duplex {
     expectedChecksum;
@@ -5464,7 +11856,7 @@ const headStream = (stream, bytes) => {
         });
     });
 };
-let Collector$1 = class Collector extends Writable {
+let Collector$1 = class Collector extends Writable$1 {
     buffers = [];
     limit = Infinity;
     bytesBuffered = 0;
@@ -5827,7 +12219,7 @@ or increase socketAcquisitionWarningTimeout=(millis) in the NodeHttpHandler conf
             };
             const requestFunc = isSSL ? request : request$1;
             const req = requestFunc(nodeHttpsOptions, (res) => {
-                const httpResponse = new HttpResponse({
+                const httpResponse = new HttpResponse$1({
                     statusCode: res.statusCode || -1,
                     reason: res.statusMessage,
                     headers: getTransformedHeaders(res.headers),
@@ -5890,7 +12282,7 @@ or increase socketAcquisitionWarningTimeout=(millis) in the NodeHttpHandler conf
     }
 }
 
-class Collector extends Writable {
+class Collector extends Writable$1 {
     bufferedBytes = [];
     _write(chunk, encoding, callback) {
         this.bufferedBytes.push(chunk);
@@ -6152,2210 +12544,42 @@ async function splitStream(stream) {
     return [stream1, stream2];
 }
 
-const collectBody$1 = async (streamBody = new Uint8Array(), context) => {
-    if (streamBody instanceof Uint8Array) {
-        return Uint8ArrayBlobAdapter.mutate(streamBody);
-    }
-    if (!streamBody) {
-        return Uint8ArrayBlobAdapter.mutate(new Uint8Array());
-    }
-    const fromContext = context.streamCollector(streamBody);
-    return Uint8ArrayBlobAdapter.mutate(await fromContext);
-};
+const CLIENT_SUPPORTED_ALGORITHMS = [
+    ChecksumAlgorithm.CRC32,
+    ChecksumAlgorithm.CRC32C,
+    ChecksumAlgorithm.CRC64NVME,
+    ChecksumAlgorithm.SHA1,
+    ChecksumAlgorithm.SHA256,
+];
+const PRIORITY_ORDER_ALGORITHMS = [
+    ChecksumAlgorithm.SHA256,
+    ChecksumAlgorithm.SHA1,
+    ChecksumAlgorithm.CRC32,
+    ChecksumAlgorithm.CRC32C,
+    ChecksumAlgorithm.CRC64NVME,
+];
 
-function extendedEncodeURIComponent(str) {
-    return encodeURIComponent(str).replace(/[!'()*]/g, function (c) {
-        return "%" + c.charCodeAt(0).toString(16).toUpperCase();
-    });
-}
-
-const deref = (schemaRef) => {
-    if (typeof schemaRef === "function") {
-        return schemaRef();
+const getChecksumAlgorithmForRequest = (input, { requestChecksumRequired, requestAlgorithmMember, requestChecksumCalculation }) => {
+    if (!requestAlgorithmMember) {
+        return requestChecksumCalculation === RequestChecksumCalculation.WHEN_SUPPORTED || requestChecksumRequired
+            ? DEFAULT_CHECKSUM_ALGORITHM
+            : undefined;
     }
-    return schemaRef;
-};
-
-const operation = (namespace, name, traits, input, output) => ({
-    name,
-    namespace,
-    traits,
-    input,
-    output,
-});
-
-const schemaDeserializationMiddleware = (config) => (next, context) => async (args) => {
-    const { response } = await next(args);
-    const { operationSchema } = getSmithyContext(context);
-    const [, ns, n, t, i, o] = operationSchema ?? [];
-    try {
-        const parsed = await config.protocol.deserializeResponse(operation(ns, n, t, i, o), {
-            ...config,
-            ...context,
-        }, response);
-        return {
-            response,
-            output: parsed,
-        };
-    }
-    catch (error) {
-        Object.defineProperty(error, "$response", {
-            value: response,
-            enumerable: false,
-            writable: false,
-            configurable: false,
-        });
-        if (!("$metadata" in error)) {
-            const hint = `Deserialization error: to see the raw response, inspect the hidden field {error}.$response on this object.`;
-            try {
-                error.message += "\n  " + hint;
-            }
-            catch (e) {
-                if (!context.logger || context.logger?.constructor?.name === "NoOpLogger") {
-                    console.warn(hint);
-                }
-                else {
-                    context.logger?.warn?.(hint);
-                }
-            }
-            if (typeof error.$responseBodyText !== "undefined") {
-                if (error.$response) {
-                    error.$response.body = error.$responseBodyText;
-                }
-            }
-            try {
-                if (HttpResponse.isInstance(response)) {
-                    const { headers = {} } = response;
-                    const headerEntries = Object.entries(headers);
-                    error.$metadata = {
-                        httpStatusCode: response.statusCode,
-                        requestId: findHeader(/^x-[\w-]+-request-?id$/, headerEntries),
-                        extendedRequestId: findHeader(/^x-[\w-]+-id-2$/, headerEntries),
-                        cfId: findHeader(/^x-[\w-]+-cf-id$/, headerEntries),
-                    };
-                }
-            }
-            catch (e) {
-            }
-        }
-        throw error;
-    }
-};
-const findHeader = (pattern, headers) => {
-    return (headers.find(([k]) => {
-        return k.match(pattern);
-    }) || [void 0, void 1])[1];
-};
-
-const schemaSerializationMiddleware = (config) => (next, context) => async (args) => {
-    const { operationSchema } = getSmithyContext(context);
-    const [, ns, n, t, i, o] = operationSchema ?? [];
-    const endpoint = context.endpointV2?.url && config.urlParser
-        ? async () => config.urlParser(context.endpointV2.url)
-        : config.endpoint;
-    const request = await config.protocol.serializeRequest(operation(ns, n, t, i, o), args.input, {
-        ...config,
-        ...context,
-        endpoint,
-    });
-    return next({
-        ...args,
-        request,
-    });
-};
-
-const deserializerMiddlewareOption = {
-    name: "deserializerMiddleware",
-    step: "deserialize",
-    tags: ["DESERIALIZER"],
-    override: true,
-};
-const serializerMiddlewareOption = {
-    name: "serializerMiddleware",
-    step: "serialize",
-    tags: ["SERIALIZER"],
-    override: true,
-};
-function getSchemaSerdePlugin(config) {
-    return {
-        applyToStack: (commandStack) => {
-            commandStack.add(schemaSerializationMiddleware(config), serializerMiddlewareOption);
-            commandStack.add(schemaDeserializationMiddleware(config), deserializerMiddlewareOption);
-            config.protocol.setSerdeContext(config);
-        },
-    };
-}
-
-function translateTraits(indicator) {
-    if (typeof indicator === "object") {
-        return indicator;
-    }
-    indicator = indicator | 0;
-    const traits = {};
-    let i = 0;
-    for (const trait of [
-        "httpLabel",
-        "idempotent",
-        "idempotencyToken",
-        "sensitive",
-        "httpPayload",
-        "httpResponseCode",
-        "httpQueryParams",
-    ]) {
-        if (((indicator >> i++) & 1) === 1) {
-            traits[trait] = 1;
-        }
-    }
-    return traits;
-}
-
-const anno = {
-    it: Symbol.for("@smithy/nor-struct-it"),
-};
-class NormalizedSchema {
-    ref;
-    memberName;
-    static symbol = Symbol.for("@smithy/nor");
-    symbol = NormalizedSchema.symbol;
-    name;
-    schema;
-    _isMemberSchema;
-    traits;
-    memberTraits;
-    normalizedTraits;
-    constructor(ref, memberName) {
-        this.ref = ref;
-        this.memberName = memberName;
-        const traitStack = [];
-        let _ref = ref;
-        let schema = ref;
-        this._isMemberSchema = false;
-        while (isMemberSchema(_ref)) {
-            traitStack.push(_ref[1]);
-            _ref = _ref[0];
-            schema = deref(_ref);
-            this._isMemberSchema = true;
-        }
-        if (traitStack.length > 0) {
-            this.memberTraits = {};
-            for (let i = traitStack.length - 1; i >= 0; --i) {
-                const traitSet = traitStack[i];
-                Object.assign(this.memberTraits, translateTraits(traitSet));
-            }
-        }
-        else {
-            this.memberTraits = 0;
-        }
-        if (schema instanceof NormalizedSchema) {
-            const computedMemberTraits = this.memberTraits;
-            Object.assign(this, schema);
-            this.memberTraits = Object.assign({}, computedMemberTraits, schema.getMemberTraits(), this.getMemberTraits());
-            this.normalizedTraits = void 0;
-            this.memberName = memberName ?? schema.memberName;
-            return;
-        }
-        this.schema = deref(schema);
-        if (isStaticSchema(this.schema)) {
-            this.name = `${this.schema[1]}#${this.schema[2]}`;
-            this.traits = this.schema[3];
-        }
-        else {
-            this.name = this.memberName ?? String(schema);
-            this.traits = 0;
-        }
-        if (this._isMemberSchema && !memberName) {
-            throw new Error(`@smithy/core/schema - NormalizedSchema member init ${this.getName(true)} missing member name.`);
-        }
-    }
-    static [Symbol.hasInstance](lhs) {
-        const isPrototype = this.prototype.isPrototypeOf(lhs);
-        if (!isPrototype && typeof lhs === "object" && lhs !== null) {
-            const ns = lhs;
-            return ns.symbol === this.symbol;
-        }
-        return isPrototype;
-    }
-    static of(ref) {
-        const sc = deref(ref);
-        if (sc instanceof NormalizedSchema) {
-            return sc;
-        }
-        if (isMemberSchema(sc)) {
-            const [ns, traits] = sc;
-            if (ns instanceof NormalizedSchema) {
-                Object.assign(ns.getMergedTraits(), translateTraits(traits));
-                return ns;
-            }
-            throw new Error(`@smithy/core/schema - may not init unwrapped member schema=${JSON.stringify(ref, null, 2)}.`);
-        }
-        return new NormalizedSchema(sc);
-    }
-    getSchema() {
-        const sc = this.schema;
-        if (sc[0] === 0) {
-            return sc[4];
-        }
-        return sc;
-    }
-    getName(withNamespace = false) {
-        const { name } = this;
-        const short = !withNamespace && name && name.includes("#");
-        return short ? name.split("#")[1] : name || undefined;
-    }
-    getMemberName() {
-        return this.memberName;
-    }
-    isMemberSchema() {
-        return this._isMemberSchema;
-    }
-    isListSchema() {
-        const sc = this.getSchema();
-        return typeof sc === "number"
-            ? sc >= 64 && sc < 128
-            : sc[0] === 1;
-    }
-    isMapSchema() {
-        const sc = this.getSchema();
-        return typeof sc === "number"
-            ? sc >= 128 && sc <= 0b1111_1111
-            : sc[0] === 2;
-    }
-    isStructSchema() {
-        const sc = this.getSchema();
-        const id = sc[0];
-        return (id === 3 ||
-            id === -3 ||
-            id === 4);
-    }
-    isUnionSchema() {
-        const sc = this.getSchema();
-        return sc[0] === 4;
-    }
-    isBlobSchema() {
-        const sc = this.getSchema();
-        return sc === 21 || sc === 42;
-    }
-    isTimestampSchema() {
-        const sc = this.getSchema();
-        return (typeof sc === "number" &&
-            sc >= 4 &&
-            sc <= 7);
-    }
-    isUnitSchema() {
-        return this.getSchema() === "unit";
-    }
-    isDocumentSchema() {
-        return this.getSchema() === 15;
-    }
-    isStringSchema() {
-        return this.getSchema() === 0;
-    }
-    isBooleanSchema() {
-        return this.getSchema() === 2;
-    }
-    isNumericSchema() {
-        return this.getSchema() === 1;
-    }
-    isBigIntegerSchema() {
-        return this.getSchema() === 17;
-    }
-    isBigDecimalSchema() {
-        return this.getSchema() === 19;
-    }
-    isStreaming() {
-        const { streaming } = this.getMergedTraits();
-        return !!streaming || this.getSchema() === 42;
-    }
-    isIdempotencyToken() {
-        return !!this.getMergedTraits().idempotencyToken;
-    }
-    getMergedTraits() {
-        return (this.normalizedTraits ??
-            (this.normalizedTraits = {
-                ...this.getOwnTraits(),
-                ...this.getMemberTraits(),
-            }));
-    }
-    getMemberTraits() {
-        return translateTraits(this.memberTraits);
-    }
-    getOwnTraits() {
-        return translateTraits(this.traits);
-    }
-    getKeySchema() {
-        const [isDoc, isMap] = [this.isDocumentSchema(), this.isMapSchema()];
-        if (!isDoc && !isMap) {
-            throw new Error(`@smithy/core/schema - cannot get key for non-map: ${this.getName(true)}`);
-        }
-        const schema = this.getSchema();
-        const memberSchema = isDoc
-            ? 15
-            : schema[4] ?? 0;
-        return member([memberSchema, 0], "key");
-    }
-    getValueSchema() {
-        const sc = this.getSchema();
-        const [isDoc, isMap, isList] = [this.isDocumentSchema(), this.isMapSchema(), this.isListSchema()];
-        const memberSchema = typeof sc === "number"
-            ? 0b0011_1111 & sc
-            : sc && typeof sc === "object" && (isMap || isList)
-                ? sc[3 + sc[0]]
-                : isDoc
-                    ? 15
-                    : void 0;
-        if (memberSchema != null) {
-            return member([memberSchema, 0], isMap ? "value" : "member");
-        }
-        throw new Error(`@smithy/core/schema - ${this.getName(true)} has no value member.`);
-    }
-    getMemberSchema(memberName) {
-        const struct = this.getSchema();
-        if (this.isStructSchema() && struct[4].includes(memberName)) {
-            const i = struct[4].indexOf(memberName);
-            const memberSchema = struct[5][i];
-            return member(isMemberSchema(memberSchema) ? memberSchema : [memberSchema, 0], memberName);
-        }
-        if (this.isDocumentSchema()) {
-            return member([15, 0], memberName);
-        }
-        throw new Error(`@smithy/core/schema - ${this.getName(true)} has no no member=${memberName}.`);
-    }
-    getMemberSchemas() {
-        const buffer = {};
-        try {
-            for (const [k, v] of this.structIterator()) {
-                buffer[k] = v;
-            }
-        }
-        catch (ignored) { }
-        return buffer;
-    }
-    getEventStreamMember() {
-        if (this.isStructSchema()) {
-            for (const [memberName, memberSchema] of this.structIterator()) {
-                if (memberSchema.isStreaming() && memberSchema.isStructSchema()) {
-                    return memberName;
-                }
-            }
-        }
-        return "";
-    }
-    *structIterator() {
-        if (this.isUnitSchema()) {
-            return;
-        }
-        if (!this.isStructSchema()) {
-            throw new Error("@smithy/core/schema - cannot iterate non-struct schema.");
-        }
-        const struct = this.getSchema();
-        const z = struct[4].length;
-        let it = struct[anno.it];
-        if (it && z === it.length) {
-            yield* it;
-            return;
-        }
-        it = Array(z);
-        for (let i = 0; i < z; ++i) {
-            const k = struct[4][i];
-            const v = member([struct[5][i], 0], k);
-            yield (it[i] = [k, v]);
-        }
-        struct[anno.it] = it;
-    }
-}
-function member(memberSchema, memberName) {
-    if (memberSchema instanceof NormalizedSchema) {
-        return Object.assign(memberSchema, {
-            memberName,
-            _isMemberSchema: true,
-        });
-    }
-    const internalCtorAccess = NormalizedSchema;
-    return new internalCtorAccess(memberSchema, memberName);
-}
-const isMemberSchema = (sc) => Array.isArray(sc) && sc.length === 2;
-const isStaticSchema = (sc) => Array.isArray(sc) && sc.length >= 5;
-
-class TypeRegistry {
-    namespace;
-    schemas;
-    exceptions;
-    static registries = new Map();
-    constructor(namespace, schemas = new Map(), exceptions = new Map()) {
-        this.namespace = namespace;
-        this.schemas = schemas;
-        this.exceptions = exceptions;
-    }
-    static for(namespace) {
-        if (!TypeRegistry.registries.has(namespace)) {
-            TypeRegistry.registries.set(namespace, new TypeRegistry(namespace));
-        }
-        return TypeRegistry.registries.get(namespace);
-    }
-    register(shapeId, schema) {
-        const qualifiedName = this.normalizeShapeId(shapeId);
-        const registry = TypeRegistry.for(qualifiedName.split("#")[0]);
-        registry.schemas.set(qualifiedName, schema);
-    }
-    getSchema(shapeId) {
-        const id = this.normalizeShapeId(shapeId);
-        if (!this.schemas.has(id)) {
-            throw new Error(`@smithy/core/schema - schema not found for ${id}`);
-        }
-        return this.schemas.get(id);
-    }
-    registerError(es, ctor) {
-        const $error = es;
-        const registry = TypeRegistry.for($error[1]);
-        registry.schemas.set($error[1] + "#" + $error[2], $error);
-        registry.exceptions.set($error, ctor);
-    }
-    getErrorCtor(es) {
-        const $error = es;
-        const registry = TypeRegistry.for($error[1]);
-        return registry.exceptions.get($error);
-    }
-    getBaseException() {
-        for (const exceptionKey of this.exceptions.keys()) {
-            if (Array.isArray(exceptionKey)) {
-                const [, ns, name] = exceptionKey;
-                const id = ns + "#" + name;
-                if (id.startsWith("smithy.ts.sdk.synthetic.") && id.endsWith("ServiceException")) {
-                    return exceptionKey;
-                }
-            }
-        }
+    if (!input[requestAlgorithmMember]) {
         return undefined;
     }
-    find(predicate) {
-        return [...this.schemas.values()].find(predicate);
+    const checksumAlgorithm = input[requestAlgorithmMember];
+    if (!CLIENT_SUPPORTED_ALGORITHMS.includes(checksumAlgorithm)) {
+        throw new Error(`The checksum algorithm "${checksumAlgorithm}" is not supported by the client.` +
+            ` Select one of ${CLIENT_SUPPORTED_ALGORITHMS}.`);
     }
-    clear() {
-        this.schemas.clear();
-        this.exceptions.clear();
-    }
-    normalizeShapeId(shapeId) {
-        if (shapeId.includes("#")) {
-            return shapeId;
-        }
-        return this.namespace + "#" + shapeId;
-    }
-}
-
-const expectNumber = (value) => {
-    if (value === null || value === undefined) {
-        return undefined;
-    }
-    if (typeof value === "string") {
-        const parsed = parseFloat(value);
-        if (!Number.isNaN(parsed)) {
-            if (String(parsed) !== String(value)) {
-                logger.warn(stackTraceWarning(`Expected number but observed string: ${value}`));
-            }
-            return parsed;
-        }
-    }
-    if (typeof value === "number") {
-        return value;
-    }
-    throw new TypeError(`Expected number, got ${typeof value}: ${value}`);
-};
-const MAX_FLOAT = Math.ceil(2 ** 127 * (2 - 2 ** -23));
-const expectFloat32 = (value) => {
-    const expected = expectNumber(value);
-    if (expected !== undefined && !Number.isNaN(expected) && expected !== Infinity && expected !== -Infinity) {
-        if (Math.abs(expected) > MAX_FLOAT) {
-            throw new TypeError(`Expected 32-bit float, got ${value}`);
-        }
-    }
-    return expected;
-};
-const expectLong = (value) => {
-    if (value === null || value === undefined) {
-        return undefined;
-    }
-    if (Number.isInteger(value) && !Number.isNaN(value)) {
-        return value;
-    }
-    throw new TypeError(`Expected integer, got ${typeof value}: ${value}`);
-};
-const expectShort = (value) => expectSizedInt(value, 16);
-const expectByte = (value) => expectSizedInt(value, 8);
-const expectSizedInt = (value, size) => {
-    const expected = expectLong(value);
-    if (expected !== undefined && castInt(expected, size) !== expected) {
-        throw new TypeError(`Expected ${size}-bit integer, got ${value}`);
-    }
-    return expected;
-};
-const castInt = (value, size) => {
-    switch (size) {
-        case 32:
-            return Int32Array.of(value)[0];
-        case 16:
-            return Int16Array.of(value)[0];
-        case 8:
-            return Int8Array.of(value)[0];
-    }
-};
-const strictParseDouble = (value) => {
-    if (typeof value == "string") {
-        return expectNumber(parseNumber(value));
-    }
-    return expectNumber(value);
-};
-const strictParseFloat32 = (value) => {
-    if (typeof value == "string") {
-        return expectFloat32(parseNumber(value));
-    }
-    return expectFloat32(value);
-};
-const NUMBER_REGEX = /(-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)|(-?Infinity)|(NaN)/g;
-const parseNumber = (value) => {
-    const matches = value.match(NUMBER_REGEX);
-    if (matches === null || matches[0].length !== value.length) {
-        throw new TypeError(`Expected real number, got implicit NaN`);
-    }
-    return parseFloat(value);
-};
-const strictParseShort = (value) => {
-    if (typeof value === "string") {
-        return expectShort(parseNumber(value));
-    }
-    return expectShort(value);
-};
-const strictParseByte = (value) => {
-    if (typeof value === "string") {
-        return expectByte(parseNumber(value));
-    }
-    return expectByte(value);
-};
-const stackTraceWarning = (message) => {
-    return String(new TypeError(message).stack || message)
-        .split("\n")
-        .slice(0, 5)
-        .filter((s) => !s.includes("stackTraceWarning"))
-        .join("\n");
-};
-const logger = {
-    warn: console.warn,
+    return checksumAlgorithm;
 };
 
-const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-function dateToUtcString(date) {
-    const year = date.getUTCFullYear();
-    const month = date.getUTCMonth();
-    const dayOfWeek = date.getUTCDay();
-    const dayOfMonthInt = date.getUTCDate();
-    const hoursInt = date.getUTCHours();
-    const minutesInt = date.getUTCMinutes();
-    const secondsInt = date.getUTCSeconds();
-    const dayOfMonthString = dayOfMonthInt < 10 ? `0${dayOfMonthInt}` : `${dayOfMonthInt}`;
-    const hoursString = hoursInt < 10 ? `0${hoursInt}` : `${hoursInt}`;
-    const minutesString = minutesInt < 10 ? `0${minutesInt}` : `${minutesInt}`;
-    const secondsString = secondsInt < 10 ? `0${secondsInt}` : `${secondsInt}`;
-    return `${DAYS[dayOfWeek]}, ${dayOfMonthString} ${MONTHS[month]} ${year} ${hoursString}:${minutesString}:${secondsString} GMT`;
-}
-const RFC3339 = new RegExp(/^(\d{4})-(\d{2})-(\d{2})[tT](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?[zZ]$/);
-const parseRfc3339DateTime = (value) => {
-    if (value === null || value === undefined) {
-        return undefined;
-    }
-    if (typeof value !== "string") {
-        throw new TypeError("RFC-3339 date-times must be expressed as strings");
-    }
-    const match = RFC3339.exec(value);
-    if (!match) {
-        throw new TypeError("Invalid RFC-3339 date-time value");
-    }
-    const [_, yearStr, monthStr, dayStr, hours, minutes, seconds, fractionalMilliseconds] = match;
-    const year = strictParseShort(stripLeadingZeroes(yearStr));
-    const month = parseDateValue(monthStr, "month", 1, 12);
-    const day = parseDateValue(dayStr, "day", 1, 31);
-    return buildDate(year, month, day, { hours, minutes, seconds, fractionalMilliseconds });
-};
-const RFC3339_WITH_OFFSET$1 = new RegExp(/^(\d{4})-(\d{2})-(\d{2})[tT](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(([-+]\d{2}\:\d{2})|[zZ])$/);
-const parseRfc3339DateTimeWithOffset = (value) => {
-    if (value === null || value === undefined) {
-        return undefined;
-    }
-    if (typeof value !== "string") {
-        throw new TypeError("RFC-3339 date-times must be expressed as strings");
-    }
-    const match = RFC3339_WITH_OFFSET$1.exec(value);
-    if (!match) {
-        throw new TypeError("Invalid RFC-3339 date-time value");
-    }
-    const [_, yearStr, monthStr, dayStr, hours, minutes, seconds, fractionalMilliseconds, offsetStr] = match;
-    const year = strictParseShort(stripLeadingZeroes(yearStr));
-    const month = parseDateValue(monthStr, "month", 1, 12);
-    const day = parseDateValue(dayStr, "day", 1, 31);
-    const date = buildDate(year, month, day, { hours, minutes, seconds, fractionalMilliseconds });
-    if (offsetStr.toUpperCase() != "Z") {
-        date.setTime(date.getTime() - parseOffsetToMilliseconds(offsetStr));
-    }
-    return date;
-};
-const IMF_FIXDATE$1 = new RegExp(/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), (\d{2}) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (\d{4}) (\d{1,2}):(\d{2}):(\d{2})(?:\.(\d+))? GMT$/);
-const RFC_850_DATE$1 = new RegExp(/^(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), (\d{2})-(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-(\d{2}) (\d{1,2}):(\d{2}):(\d{2})(?:\.(\d+))? GMT$/);
-const ASC_TIME$1 = new RegExp(/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) ( [1-9]|\d{2}) (\d{1,2}):(\d{2}):(\d{2})(?:\.(\d+))? (\d{4})$/);
-const parseRfc7231DateTime = (value) => {
-    if (value === null || value === undefined) {
-        return undefined;
-    }
-    if (typeof value !== "string") {
-        throw new TypeError("RFC-7231 date-times must be expressed as strings");
-    }
-    let match = IMF_FIXDATE$1.exec(value);
-    if (match) {
-        const [_, dayStr, monthStr, yearStr, hours, minutes, seconds, fractionalMilliseconds] = match;
-        return buildDate(strictParseShort(stripLeadingZeroes(yearStr)), parseMonthByShortName(monthStr), parseDateValue(dayStr, "day", 1, 31), { hours, minutes, seconds, fractionalMilliseconds });
-    }
-    match = RFC_850_DATE$1.exec(value);
-    if (match) {
-        const [_, dayStr, monthStr, yearStr, hours, minutes, seconds, fractionalMilliseconds] = match;
-        return adjustRfc850Year(buildDate(parseTwoDigitYear(yearStr), parseMonthByShortName(monthStr), parseDateValue(dayStr, "day", 1, 31), {
-            hours,
-            minutes,
-            seconds,
-            fractionalMilliseconds,
-        }));
-    }
-    match = ASC_TIME$1.exec(value);
-    if (match) {
-        const [_, monthStr, dayStr, hours, minutes, seconds, fractionalMilliseconds, yearStr] = match;
-        return buildDate(strictParseShort(stripLeadingZeroes(yearStr)), parseMonthByShortName(monthStr), parseDateValue(dayStr.trimLeft(), "day", 1, 31), { hours, minutes, seconds, fractionalMilliseconds });
-    }
-    throw new TypeError("Invalid RFC-7231 date-time value");
-};
-const parseEpochTimestamp = (value) => {
-    if (value === null || value === undefined) {
-        return undefined;
-    }
-    let valueAsDouble;
-    if (typeof value === "number") {
-        valueAsDouble = value;
-    }
-    else if (typeof value === "string") {
-        valueAsDouble = strictParseDouble(value);
-    }
-    else if (typeof value === "object" && value.tag === 1) {
-        valueAsDouble = value.value;
-    }
-    else {
-        throw new TypeError("Epoch timestamps must be expressed as floating point numbers or their string representation");
-    }
-    if (Number.isNaN(valueAsDouble) || valueAsDouble === Infinity || valueAsDouble === -Infinity) {
-        throw new TypeError("Epoch timestamps must be valid, non-Infinite, non-NaN numerics");
-    }
-    return new Date(Math.round(valueAsDouble * 1000));
-};
-const buildDate = (year, month, day, time) => {
-    const adjustedMonth = month - 1;
-    validateDayOfMonth(year, adjustedMonth, day);
-    return new Date(Date.UTC(year, adjustedMonth, day, parseDateValue(time.hours, "hour", 0, 23), parseDateValue(time.minutes, "minute", 0, 59), parseDateValue(time.seconds, "seconds", 0, 60), parseMilliseconds(time.fractionalMilliseconds)));
-};
-const parseTwoDigitYear = (value) => {
-    const thisYear = new Date().getUTCFullYear();
-    const valueInThisCentury = Math.floor(thisYear / 100) * 100 + strictParseShort(stripLeadingZeroes(value));
-    if (valueInThisCentury < thisYear) {
-        return valueInThisCentury + 100;
-    }
-    return valueInThisCentury;
-};
-const FIFTY_YEARS_IN_MILLIS = 50 * 365 * 24 * 60 * 60 * 1000;
-const adjustRfc850Year = (input) => {
-    if (input.getTime() - new Date().getTime() > FIFTY_YEARS_IN_MILLIS) {
-        return new Date(Date.UTC(input.getUTCFullYear() - 100, input.getUTCMonth(), input.getUTCDate(), input.getUTCHours(), input.getUTCMinutes(), input.getUTCSeconds(), input.getUTCMilliseconds()));
-    }
-    return input;
-};
-const parseMonthByShortName = (value) => {
-    const monthIdx = MONTHS.indexOf(value);
-    if (monthIdx < 0) {
-        throw new TypeError(`Invalid month: ${value}`);
-    }
-    return monthIdx + 1;
-};
-const DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-const validateDayOfMonth = (year, month, day) => {
-    let maxDays = DAYS_IN_MONTH[month];
-    if (month === 1 && isLeapYear(year)) {
-        maxDays = 29;
-    }
-    if (day > maxDays) {
-        throw new TypeError(`Invalid day for ${MONTHS[month]} in ${year}: ${day}`);
-    }
-};
-const isLeapYear = (year) => {
-    return year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
-};
-const parseDateValue = (value, type, lower, upper) => {
-    const dateVal = strictParseByte(stripLeadingZeroes(value));
-    if (dateVal < lower || dateVal > upper) {
-        throw new TypeError(`${type} must be between ${lower} and ${upper}, inclusive`);
-    }
-    return dateVal;
-};
-const parseMilliseconds = (value) => {
-    if (value === null || value === undefined) {
-        return 0;
-    }
-    return strictParseFloat32("0." + value) * 1000;
-};
-const parseOffsetToMilliseconds = (value) => {
-    const directionStr = value[0];
-    let direction = 1;
-    if (directionStr == "+") {
-        direction = 1;
-    }
-    else if (directionStr == "-") {
-        direction = -1;
-    }
-    else {
-        throw new TypeError(`Offset direction, ${directionStr}, must be "+" or "-"`);
-    }
-    const hour = Number(value.substring(1, 3));
-    const minute = Number(value.substring(4, 6));
-    return direction * (hour * 60 + minute) * 60 * 1000;
-};
-const stripLeadingZeroes = (value) => {
-    let idx = 0;
-    while (idx < value.length - 1 && value.charAt(idx) === "0") {
-        idx++;
-    }
-    if (idx === 0) {
-        return value;
-    }
-    return value.slice(idx);
-};
+const getChecksumLocationName = (algorithm) => algorithm === ChecksumAlgorithm.MD5 ? "content-md5" : `x-amz-checksum-${algorithm.toLowerCase()}`;
 
-const randomUUID = crypto$1.randomUUID.bind(crypto$1);
-
-const decimalToHex = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, "0"));
-const v4 = () => {
-    if (randomUUID) {
-        return randomUUID();
-    }
-    const rnds = new Uint8Array(16);
-    crypto.getRandomValues(rnds);
-    rnds[6] = (rnds[6] & 0x0f) | 0x40;
-    rnds[8] = (rnds[8] & 0x3f) | 0x80;
-    return (decimalToHex[rnds[0]] +
-        decimalToHex[rnds[1]] +
-        decimalToHex[rnds[2]] +
-        decimalToHex[rnds[3]] +
-        "-" +
-        decimalToHex[rnds[4]] +
-        decimalToHex[rnds[5]] +
-        "-" +
-        decimalToHex[rnds[6]] +
-        decimalToHex[rnds[7]] +
-        "-" +
-        decimalToHex[rnds[8]] +
-        decimalToHex[rnds[9]] +
-        "-" +
-        decimalToHex[rnds[10]] +
-        decimalToHex[rnds[11]] +
-        decimalToHex[rnds[12]] +
-        decimalToHex[rnds[13]] +
-        decimalToHex[rnds[14]] +
-        decimalToHex[rnds[15]]);
-};
-
-const LazyJsonString = function LazyJsonString(val) {
-    const str = Object.assign(new String(val), {
-        deserializeJSON() {
-            return JSON.parse(String(val));
-        },
-        toString() {
-            return String(val);
-        },
-        toJSON() {
-            return String(val);
-        },
-    });
-    return str;
-};
-LazyJsonString.from = (object) => {
-    if (object && typeof object === "object" && (object instanceof LazyJsonString || "deserializeJSON" in object)) {
-        return object;
-    }
-    else if (typeof object === "string" || Object.getPrototypeOf(object) === String.prototype) {
-        return LazyJsonString(String(object));
-    }
-    return LazyJsonString(JSON.stringify(object));
-};
-LazyJsonString.fromObject = LazyJsonString.from;
-
-function quoteHeader(part) {
-    if (part.includes(",") || part.includes('"')) {
-        part = `"${part.replace(/"/g, '\\"')}"`;
-    }
-    return part;
-}
-
-const ddd = `(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)(?:[ne|u?r]?s?day)?`;
-const mmm = `(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)`;
-const time = `(\\d?\\d):(\\d{2}):(\\d{2})(?:\\.(\\d+))?`;
-const date = `(\\d?\\d)`;
-const year = `(\\d{4})`;
-const RFC3339_WITH_OFFSET = new RegExp(/^(\d{4})-(\d\d)-(\d\d)[tT](\d\d):(\d\d):(\d\d)(\.(\d+))?(([-+]\d\d:\d\d)|[zZ])$/);
-const IMF_FIXDATE = new RegExp(`^${ddd}, ${date} ${mmm} ${year} ${time} GMT$`);
-const RFC_850_DATE = new RegExp(`^${ddd}, ${date}-${mmm}-(\\d\\d) ${time} GMT$`);
-const ASC_TIME = new RegExp(`^${ddd} ${mmm} ( [1-9]|\\d\\d) ${time} ${year}$`);
-const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-const _parseEpochTimestamp = (value) => {
-    if (value == null) {
-        return void 0;
-    }
-    let num = NaN;
-    if (typeof value === "number") {
-        num = value;
-    }
-    else if (typeof value === "string") {
-        if (!/^-?\d*\.?\d+$/.test(value)) {
-            throw new TypeError(`parseEpochTimestamp - numeric string invalid.`);
-        }
-        num = Number.parseFloat(value);
-    }
-    else if (typeof value === "object" && value.tag === 1) {
-        num = value.value;
-    }
-    if (isNaN(num) || Math.abs(num) === Infinity) {
-        throw new TypeError("Epoch timestamps must be valid finite numbers.");
-    }
-    return new Date(Math.round(num * 1000));
-};
-const _parseRfc3339DateTimeWithOffset = (value) => {
-    if (value == null) {
-        return void 0;
-    }
-    if (typeof value !== "string") {
-        throw new TypeError("RFC3339 timestamps must be strings");
-    }
-    const matches = RFC3339_WITH_OFFSET.exec(value);
-    if (!matches) {
-        throw new TypeError(`Invalid RFC3339 timestamp format ${value}`);
-    }
-    const [, yearStr, monthStr, dayStr, hours, minutes, seconds, , ms, offsetStr] = matches;
-    range(monthStr, 1, 12);
-    range(dayStr, 1, 31);
-    range(hours, 0, 23);
-    range(minutes, 0, 59);
-    range(seconds, 0, 60);
-    const date = new Date(Date.UTC(Number(yearStr), Number(monthStr) - 1, Number(dayStr), Number(hours), Number(minutes), Number(seconds), Number(ms) ? Math.round(parseFloat(`0.${ms}`) * 1000) : 0));
-    date.setUTCFullYear(Number(yearStr));
-    if (offsetStr.toUpperCase() != "Z") {
-        const [, sign, offsetH, offsetM] = /([+-])(\d\d):(\d\d)/.exec(offsetStr) || [void 0, "+", 0, 0];
-        const scalar = sign === "-" ? 1 : -1;
-        date.setTime(date.getTime() + scalar * (Number(offsetH) * 60 * 60 * 1000 + Number(offsetM) * 60 * 1000));
-    }
-    return date;
-};
-const _parseRfc7231DateTime = (value) => {
-    if (value == null) {
-        return void 0;
-    }
-    if (typeof value !== "string") {
-        throw new TypeError("RFC7231 timestamps must be strings.");
-    }
-    let day;
-    let month;
-    let year;
-    let hour;
-    let minute;
-    let second;
-    let fraction;
-    let matches;
-    if ((matches = IMF_FIXDATE.exec(value))) {
-        [, day, month, year, hour, minute, second, fraction] = matches;
-    }
-    else if ((matches = RFC_850_DATE.exec(value))) {
-        [, day, month, year, hour, minute, second, fraction] = matches;
-        year = (Number(year) + 1900).toString();
-    }
-    else if ((matches = ASC_TIME.exec(value))) {
-        [, month, day, hour, minute, second, fraction, year] = matches;
-    }
-    if (year && second) {
-        const timestamp = Date.UTC(Number(year), months.indexOf(month), Number(day), Number(hour), Number(minute), Number(second), fraction ? Math.round(parseFloat(`0.${fraction}`) * 1000) : 0);
-        range(day, 1, 31);
-        range(hour, 0, 23);
-        range(minute, 0, 59);
-        range(second, 0, 60);
-        const date = new Date(timestamp);
-        date.setUTCFullYear(Number(year));
-        return date;
-    }
-    throw new TypeError(`Invalid RFC7231 date-time value ${value}.`);
-};
-function range(v, min, max) {
-    const _v = Number(v);
-    if (_v < min || _v > max) {
-        throw new Error(`Value ${_v} out of range [${min}, ${max}]`);
-    }
-}
-
-function splitEvery(value, delimiter, numDelimiters) {
-    if (numDelimiters <= 0 || !Number.isInteger(numDelimiters)) {
-        throw new Error("Invalid number of delimiters (" + numDelimiters + ") for splitEvery.");
-    }
-    const segments = value.split(delimiter);
-    if (numDelimiters === 1) {
-        return segments;
-    }
-    const compoundSegments = [];
-    let currentSegment = "";
-    for (let i = 0; i < segments.length; i++) {
-        if (currentSegment === "") {
-            currentSegment = segments[i];
-        }
-        else {
-            currentSegment += delimiter + segments[i];
-        }
-        if ((i + 1) % numDelimiters === 0) {
-            compoundSegments.push(currentSegment);
-            currentSegment = "";
-        }
-    }
-    if (currentSegment !== "") {
-        compoundSegments.push(currentSegment);
-    }
-    return compoundSegments;
-}
-
-const splitHeader = (value) => {
-    const z = value.length;
-    const values = [];
-    let withinQuotes = false;
-    let prevChar = undefined;
-    let anchor = 0;
-    for (let i = 0; i < z; ++i) {
-        const char = value[i];
-        switch (char) {
-            case `"`:
-                if (prevChar !== "\\") {
-                    withinQuotes = !withinQuotes;
-                }
-                break;
-            case ",":
-                if (!withinQuotes) {
-                    values.push(value.slice(anchor, i));
-                    anchor = i + 1;
-                }
-                break;
-        }
-        prevChar = char;
-    }
-    values.push(value.slice(anchor));
-    return values.map((v) => {
-        v = v.trim();
-        const z = v.length;
-        if (z < 2) {
-            return v;
-        }
-        if (v[0] === `"` && v[z - 1] === `"`) {
-            v = v.slice(1, z - 1);
-        }
-        return v.replace(/\\"/g, '"');
-    });
-};
-
-const format = /^-?\d*(\.\d+)?$/;
-class NumericValue {
-    string;
-    type;
-    constructor(string, type) {
-        this.string = string;
-        this.type = type;
-        if (!format.test(string)) {
-            throw new Error(`@smithy/core/serde - NumericValue must only contain [0-9], at most one decimal point ".", and an optional negation prefix "-".`);
-        }
-    }
-    toString() {
-        return this.string;
-    }
-    static [Symbol.hasInstance](object) {
-        if (!object || typeof object !== "object") {
-            return false;
-        }
-        const _nv = object;
-        return NumericValue.prototype.isPrototypeOf(object) || (_nv.type === "bigDecimal" && format.test(_nv.string));
-    }
-}
-
-class SerdeContext {
-    serdeContext;
-    setSerdeContext(serdeContext) {
-        this.serdeContext = serdeContext;
-    }
-}
-
-class HttpProtocol extends SerdeContext {
-    options;
-    constructor(options) {
-        super();
-        this.options = options;
-    }
-    getRequestType() {
-        return HttpRequest;
-    }
-    getResponseType() {
-        return HttpResponse;
-    }
-    setSerdeContext(serdeContext) {
-        this.serdeContext = serdeContext;
-        this.serializer.setSerdeContext(serdeContext);
-        this.deserializer.setSerdeContext(serdeContext);
-        if (this.getPayloadCodec()) {
-            this.getPayloadCodec().setSerdeContext(serdeContext);
-        }
-    }
-    updateServiceEndpoint(request, endpoint) {
-        if ("url" in endpoint) {
-            request.protocol = endpoint.url.protocol;
-            request.hostname = endpoint.url.hostname;
-            request.port = endpoint.url.port ? Number(endpoint.url.port) : undefined;
-            request.path = endpoint.url.pathname;
-            request.fragment = endpoint.url.hash || void 0;
-            request.username = endpoint.url.username || void 0;
-            request.password = endpoint.url.password || void 0;
-            if (!request.query) {
-                request.query = {};
-            }
-            for (const [k, v] of endpoint.url.searchParams.entries()) {
-                request.query[k] = v;
-            }
-            return request;
-        }
-        else {
-            request.protocol = endpoint.protocol;
-            request.hostname = endpoint.hostname;
-            request.port = endpoint.port ? Number(endpoint.port) : undefined;
-            request.path = endpoint.path;
-            request.query = {
-                ...endpoint.query,
-            };
-            return request;
-        }
-    }
-    setHostPrefix(request, operationSchema, input) {
-        if (this.serdeContext?.disableHostPrefix) {
-            return;
-        }
-        const inputNs = NormalizedSchema.of(operationSchema.input);
-        const opTraits = translateTraits(operationSchema.traits ?? {});
-        if (opTraits.endpoint) {
-            let hostPrefix = opTraits.endpoint?.[0];
-            if (typeof hostPrefix === "string") {
-                const hostLabelInputs = [...inputNs.structIterator()].filter(([, member]) => member.getMergedTraits().hostLabel);
-                for (const [name] of hostLabelInputs) {
-                    const replacement = input[name];
-                    if (typeof replacement !== "string") {
-                        throw new Error(`@smithy/core/schema - ${name} in input must be a string as hostLabel.`);
-                    }
-                    hostPrefix = hostPrefix.replace(`{${name}}`, replacement);
-                }
-                request.hostname = hostPrefix + request.hostname;
-            }
-        }
-    }
-    deserializeMetadata(output) {
-        return {
-            httpStatusCode: output.statusCode,
-            requestId: output.headers["x-amzn-requestid"] ?? output.headers["x-amzn-request-id"] ?? output.headers["x-amz-request-id"],
-            extendedRequestId: output.headers["x-amz-id-2"],
-            cfId: output.headers["x-amz-cf-id"],
-        };
-    }
-    async serializeEventStream({ eventStream, requestSchema, initialRequest, }) {
-        const eventStreamSerde = await this.loadEventStreamCapability();
-        return eventStreamSerde.serializeEventStream({
-            eventStream,
-            requestSchema,
-            initialRequest,
-        });
-    }
-    async deserializeEventStream({ response, responseSchema, initialResponseContainer, }) {
-        const eventStreamSerde = await this.loadEventStreamCapability();
-        return eventStreamSerde.deserializeEventStream({
-            response,
-            responseSchema,
-            initialResponseContainer,
-        });
-    }
-    async loadEventStreamCapability() {
-        const { EventStreamSerde } = await Promise.resolve().then(function () { return index$9; });
-        return new EventStreamSerde({
-            marshaller: this.getEventStreamMarshaller(),
-            serializer: this.serializer,
-            deserializer: this.deserializer,
-            serdeContext: this.serdeContext,
-            defaultContentType: this.getDefaultContentType(),
-        });
-    }
-    getDefaultContentType() {
-        throw new Error(`@smithy/core/protocols - ${this.constructor.name} getDefaultContentType() implementation missing.`);
-    }
-    async deserializeHttpMessage(schema, context, response, arg4, arg5) {
-        return [];
-    }
-    getEventStreamMarshaller() {
-        const context = this.serdeContext;
-        if (!context.eventStreamMarshaller) {
-            throw new Error("@smithy/core - HttpProtocol: eventStreamMarshaller missing in serdeContext.");
-        }
-        return context.eventStreamMarshaller;
-    }
-}
-
-class HttpBindingProtocol extends HttpProtocol {
-    async serializeRequest(operationSchema, _input, context) {
-        const input = {
-            ...(_input ?? {}),
-        };
-        const serializer = this.serializer;
-        const query = {};
-        const headers = {};
-        const endpoint = await context.endpoint();
-        const ns = NormalizedSchema.of(operationSchema?.input);
-        const schema = ns.getSchema();
-        let hasNonHttpBindingMember = false;
-        let payload;
-        const request = new HttpRequest({
-            protocol: "",
-            hostname: "",
-            port: undefined,
-            path: "",
-            fragment: undefined,
-            query: query,
-            headers: headers,
-            body: undefined,
-        });
-        if (endpoint) {
-            this.updateServiceEndpoint(request, endpoint);
-            this.setHostPrefix(request, operationSchema, input);
-            const opTraits = translateTraits(operationSchema.traits);
-            if (opTraits.http) {
-                request.method = opTraits.http[0];
-                const [path, search] = opTraits.http[1].split("?");
-                if (request.path == "/") {
-                    request.path = path;
-                }
-                else {
-                    request.path += path;
-                }
-                const traitSearchParams = new URLSearchParams(search ?? "");
-                Object.assign(query, Object.fromEntries(traitSearchParams));
-            }
-        }
-        for (const [memberName, memberNs] of ns.structIterator()) {
-            const memberTraits = memberNs.getMergedTraits() ?? {};
-            const inputMemberValue = input[memberName];
-            if (inputMemberValue == null && !memberNs.isIdempotencyToken()) {
-                if (memberTraits.httpLabel) {
-                    if (request.path.includes(`{${memberName}+}`) || request.path.includes(`{${memberName}}`)) {
-                        throw new Error(`No value provided for input HTTP label: ${memberName}.`);
-                    }
-                }
-                continue;
-            }
-            if (memberTraits.httpPayload) {
-                const isStreaming = memberNs.isStreaming();
-                if (isStreaming) {
-                    const isEventStream = memberNs.isStructSchema();
-                    if (isEventStream) {
-                        if (input[memberName]) {
-                            payload = await this.serializeEventStream({
-                                eventStream: input[memberName],
-                                requestSchema: ns,
-                            });
-                        }
-                    }
-                    else {
-                        payload = inputMemberValue;
-                    }
-                }
-                else {
-                    serializer.write(memberNs, inputMemberValue);
-                    payload = serializer.flush();
-                }
-                delete input[memberName];
-            }
-            else if (memberTraits.httpLabel) {
-                serializer.write(memberNs, inputMemberValue);
-                const replacement = serializer.flush();
-                if (request.path.includes(`{${memberName}+}`)) {
-                    request.path = request.path.replace(`{${memberName}+}`, replacement.split("/").map(extendedEncodeURIComponent).join("/"));
-                }
-                else if (request.path.includes(`{${memberName}}`)) {
-                    request.path = request.path.replace(`{${memberName}}`, extendedEncodeURIComponent(replacement));
-                }
-                delete input[memberName];
-            }
-            else if (memberTraits.httpHeader) {
-                serializer.write(memberNs, inputMemberValue);
-                headers[memberTraits.httpHeader.toLowerCase()] = String(serializer.flush());
-                delete input[memberName];
-            }
-            else if (typeof memberTraits.httpPrefixHeaders === "string") {
-                for (const [key, val] of Object.entries(inputMemberValue)) {
-                    const amalgam = memberTraits.httpPrefixHeaders + key;
-                    serializer.write([memberNs.getValueSchema(), { httpHeader: amalgam }], val);
-                    headers[amalgam.toLowerCase()] = serializer.flush();
-                }
-                delete input[memberName];
-            }
-            else if (memberTraits.httpQuery || memberTraits.httpQueryParams) {
-                this.serializeQuery(memberNs, inputMemberValue, query);
-                delete input[memberName];
-            }
-            else {
-                hasNonHttpBindingMember = true;
-            }
-        }
-        if (hasNonHttpBindingMember && input) {
-            serializer.write(schema, input);
-            payload = serializer.flush();
-        }
-        request.headers = headers;
-        request.query = query;
-        request.body = payload;
-        return request;
-    }
-    serializeQuery(ns, data, query) {
-        const serializer = this.serializer;
-        const traits = ns.getMergedTraits();
-        if (traits.httpQueryParams) {
-            for (const [key, val] of Object.entries(data)) {
-                if (!(key in query)) {
-                    const valueSchema = ns.getValueSchema();
-                    Object.assign(valueSchema.getMergedTraits(), {
-                        ...traits,
-                        httpQuery: key,
-                        httpQueryParams: undefined,
-                    });
-                    this.serializeQuery(valueSchema, val, query);
-                }
-            }
-            return;
-        }
-        if (ns.isListSchema()) {
-            const sparse = !!ns.getMergedTraits().sparse;
-            const buffer = [];
-            for (const item of data) {
-                serializer.write([ns.getValueSchema(), traits], item);
-                const serializable = serializer.flush();
-                if (sparse || serializable !== undefined) {
-                    buffer.push(serializable);
-                }
-            }
-            query[traits.httpQuery] = buffer;
-        }
-        else {
-            serializer.write([ns, traits], data);
-            query[traits.httpQuery] = serializer.flush();
-        }
-    }
-    async deserializeResponse(operationSchema, context, response) {
-        const deserializer = this.deserializer;
-        const ns = NormalizedSchema.of(operationSchema.output);
-        const dataObject = {};
-        if (response.statusCode >= 300) {
-            const bytes = await collectBody$1(response.body, context);
-            if (bytes.byteLength > 0) {
-                Object.assign(dataObject, await deserializer.read(15, bytes));
-            }
-            await this.handleError(operationSchema, context, response, dataObject, this.deserializeMetadata(response));
-            throw new Error("@smithy/core/protocols - HTTP Protocol error handler failed to throw.");
-        }
-        for (const header in response.headers) {
-            const value = response.headers[header];
-            delete response.headers[header];
-            response.headers[header.toLowerCase()] = value;
-        }
-        const nonHttpBindingMembers = await this.deserializeHttpMessage(ns, context, response, dataObject);
-        if (nonHttpBindingMembers.length) {
-            const bytes = await collectBody$1(response.body, context);
-            if (bytes.byteLength > 0) {
-                const dataFromBody = await deserializer.read(ns, bytes);
-                for (const member of nonHttpBindingMembers) {
-                    dataObject[member] = dataFromBody[member];
-                }
-            }
-        }
-        else if (nonHttpBindingMembers.discardResponseBody) {
-            await collectBody$1(response.body, context);
-        }
-        dataObject.$metadata = this.deserializeMetadata(response);
-        return dataObject;
-    }
-    async deserializeHttpMessage(schema, context, response, arg4, arg5) {
-        let dataObject;
-        if (arg4 instanceof Set) {
-            dataObject = arg5;
-        }
-        else {
-            dataObject = arg4;
-        }
-        let discardResponseBody = true;
-        const deserializer = this.deserializer;
-        const ns = NormalizedSchema.of(schema);
-        const nonHttpBindingMembers = [];
-        for (const [memberName, memberSchema] of ns.structIterator()) {
-            const memberTraits = memberSchema.getMemberTraits();
-            if (memberTraits.httpPayload) {
-                discardResponseBody = false;
-                const isStreaming = memberSchema.isStreaming();
-                if (isStreaming) {
-                    const isEventStream = memberSchema.isStructSchema();
-                    if (isEventStream) {
-                        dataObject[memberName] = await this.deserializeEventStream({
-                            response,
-                            responseSchema: ns,
-                        });
-                    }
-                    else {
-                        dataObject[memberName] = sdkStreamMixin(response.body);
-                    }
-                }
-                else if (response.body) {
-                    const bytes = await collectBody$1(response.body, context);
-                    if (bytes.byteLength > 0) {
-                        dataObject[memberName] = await deserializer.read(memberSchema, bytes);
-                    }
-                }
-            }
-            else if (memberTraits.httpHeader) {
-                const key = String(memberTraits.httpHeader).toLowerCase();
-                const value = response.headers[key];
-                if (null != value) {
-                    if (memberSchema.isListSchema()) {
-                        const headerListValueSchema = memberSchema.getValueSchema();
-                        headerListValueSchema.getMergedTraits().httpHeader = key;
-                        let sections;
-                        if (headerListValueSchema.isTimestampSchema() &&
-                            headerListValueSchema.getSchema() === 4) {
-                            sections = splitEvery(value, ",", 2);
-                        }
-                        else {
-                            sections = splitHeader(value);
-                        }
-                        const list = [];
-                        for (const section of sections) {
-                            list.push(await deserializer.read(headerListValueSchema, section.trim()));
-                        }
-                        dataObject[memberName] = list;
-                    }
-                    else {
-                        dataObject[memberName] = await deserializer.read(memberSchema, value);
-                    }
-                }
-            }
-            else if (memberTraits.httpPrefixHeaders !== undefined) {
-                dataObject[memberName] = {};
-                for (const [header, value] of Object.entries(response.headers)) {
-                    if (header.startsWith(memberTraits.httpPrefixHeaders)) {
-                        const valueSchema = memberSchema.getValueSchema();
-                        valueSchema.getMergedTraits().httpHeader = header;
-                        dataObject[memberName][header.slice(memberTraits.httpPrefixHeaders.length)] = await deserializer.read(valueSchema, value);
-                    }
-                }
-            }
-            else if (memberTraits.httpResponseCode) {
-                dataObject[memberName] = response.statusCode;
-            }
-            else {
-                nonHttpBindingMembers.push(memberName);
-            }
-        }
-        nonHttpBindingMembers.discardResponseBody = discardResponseBody;
-        return nonHttpBindingMembers;
-    }
-}
-
-class RpcProtocol extends HttpProtocol {
-    async serializeRequest(operationSchema, input, context) {
-        const serializer = this.serializer;
-        const query = {};
-        const headers = {};
-        const endpoint = await context.endpoint();
-        const ns = NormalizedSchema.of(operationSchema?.input);
-        const schema = ns.getSchema();
-        let payload;
-        const request = new HttpRequest({
-            protocol: "",
-            hostname: "",
-            port: undefined,
-            path: "/",
-            fragment: undefined,
-            query: query,
-            headers: headers,
-            body: undefined,
-        });
-        if (endpoint) {
-            this.updateServiceEndpoint(request, endpoint);
-            this.setHostPrefix(request, operationSchema, input);
-        }
-        const _input = {
-            ...input,
-        };
-        if (input) {
-            const eventStreamMember = ns.getEventStreamMember();
-            if (eventStreamMember) {
-                if (_input[eventStreamMember]) {
-                    const initialRequest = {};
-                    for (const [memberName, memberSchema] of ns.structIterator()) {
-                        if (memberName !== eventStreamMember && _input[memberName]) {
-                            serializer.write(memberSchema, _input[memberName]);
-                            initialRequest[memberName] = serializer.flush();
-                        }
-                    }
-                    payload = await this.serializeEventStream({
-                        eventStream: _input[eventStreamMember],
-                        requestSchema: ns,
-                        initialRequest,
-                    });
-                }
-            }
-            else {
-                serializer.write(schema, _input);
-                payload = serializer.flush();
-            }
-        }
-        request.headers = headers;
-        request.query = query;
-        request.body = payload;
-        request.method = "POST";
-        return request;
-    }
-    async deserializeResponse(operationSchema, context, response) {
-        const deserializer = this.deserializer;
-        const ns = NormalizedSchema.of(operationSchema.output);
-        const dataObject = {};
-        if (response.statusCode >= 300) {
-            const bytes = await collectBody$1(response.body, context);
-            if (bytes.byteLength > 0) {
-                Object.assign(dataObject, await deserializer.read(15, bytes));
-            }
-            await this.handleError(operationSchema, context, response, dataObject, this.deserializeMetadata(response));
-            throw new Error("@smithy/core/protocols - RPC Protocol error handler failed to throw.");
-        }
-        for (const header in response.headers) {
-            const value = response.headers[header];
-            delete response.headers[header];
-            response.headers[header.toLowerCase()] = value;
-        }
-        const eventStreamMember = ns.getEventStreamMember();
-        if (eventStreamMember) {
-            dataObject[eventStreamMember] = await this.deserializeEventStream({
-                response,
-                responseSchema: ns,
-                initialResponseContainer: dataObject,
-            });
-        }
-        else {
-            const bytes = await collectBody$1(response.body, context);
-            if (bytes.byteLength > 0) {
-                Object.assign(dataObject, await deserializer.read(ns, bytes));
-            }
-        }
-        dataObject.$metadata = this.deserializeMetadata(response);
-        return dataObject;
-    }
-}
-
-function determineTimestampFormat(ns, settings) {
-    if (settings.timestampFormat.useTrait) {
-        if (ns.isTimestampSchema() &&
-            (ns.getSchema() === 5 ||
-                ns.getSchema() === 6 ||
-                ns.getSchema() === 7)) {
-            return ns.getSchema();
-        }
-    }
-    const { httpLabel, httpPrefixHeaders, httpHeader, httpQuery } = ns.getMergedTraits();
-    const bindingFormat = settings.httpBindings
-        ? typeof httpPrefixHeaders === "string" || Boolean(httpHeader)
-            ? 6
-            : Boolean(httpQuery) || Boolean(httpLabel)
-                ? 5
-                : undefined
-        : undefined;
-    return bindingFormat ?? settings.timestampFormat.default;
-}
-
-class FromStringShapeDeserializer extends SerdeContext {
-    settings;
-    constructor(settings) {
-        super();
-        this.settings = settings;
-    }
-    read(_schema, data) {
-        const ns = NormalizedSchema.of(_schema);
-        if (ns.isListSchema()) {
-            return splitHeader(data).map((item) => this.read(ns.getValueSchema(), item));
-        }
-        if (ns.isBlobSchema()) {
-            return (this.serdeContext?.base64Decoder ?? fromBase64)(data);
-        }
-        if (ns.isTimestampSchema()) {
-            const format = determineTimestampFormat(ns, this.settings);
-            switch (format) {
-                case 5:
-                    return _parseRfc3339DateTimeWithOffset(data);
-                case 6:
-                    return _parseRfc7231DateTime(data);
-                case 7:
-                    return _parseEpochTimestamp(data);
-                default:
-                    console.warn("Missing timestamp format, parsing value with Date constructor:", data);
-                    return new Date(data);
-            }
-        }
-        if (ns.isStringSchema()) {
-            const mediaType = ns.getMergedTraits().mediaType;
-            let intermediateValue = data;
-            if (mediaType) {
-                if (ns.getMergedTraits().httpHeader) {
-                    intermediateValue = this.base64ToUtf8(intermediateValue);
-                }
-                const isJson = mediaType === "application/json" || mediaType.endsWith("+json");
-                if (isJson) {
-                    intermediateValue = LazyJsonString.from(intermediateValue);
-                }
-                return intermediateValue;
-            }
-        }
-        if (ns.isNumericSchema()) {
-            return Number(data);
-        }
-        if (ns.isBigIntegerSchema()) {
-            return BigInt(data);
-        }
-        if (ns.isBigDecimalSchema()) {
-            return new NumericValue(data, "bigDecimal");
-        }
-        if (ns.isBooleanSchema()) {
-            return String(data).toLowerCase() === "true";
-        }
-        return data;
-    }
-    base64ToUtf8(base64String) {
-        return (this.serdeContext?.utf8Encoder ?? toUtf8)((this.serdeContext?.base64Decoder ?? fromBase64)(base64String));
-    }
-}
-
-class HttpInterceptingShapeDeserializer extends SerdeContext {
-    codecDeserializer;
-    stringDeserializer;
-    constructor(codecDeserializer, codecSettings) {
-        super();
-        this.codecDeserializer = codecDeserializer;
-        this.stringDeserializer = new FromStringShapeDeserializer(codecSettings);
-    }
-    setSerdeContext(serdeContext) {
-        this.stringDeserializer.setSerdeContext(serdeContext);
-        this.codecDeserializer.setSerdeContext(serdeContext);
-        this.serdeContext = serdeContext;
-    }
-    read(schema, data) {
-        const ns = NormalizedSchema.of(schema);
-        const traits = ns.getMergedTraits();
-        const toString = this.serdeContext?.utf8Encoder ?? toUtf8;
-        if (traits.httpHeader || traits.httpResponseCode) {
-            return this.stringDeserializer.read(ns, toString(data));
-        }
-        if (traits.httpPayload) {
-            if (ns.isBlobSchema()) {
-                const toBytes = this.serdeContext?.utf8Decoder ?? fromUtf8$2;
-                if (typeof data === "string") {
-                    return toBytes(data);
-                }
-                return data;
-            }
-            else if (ns.isStringSchema()) {
-                if ("byteLength" in data) {
-                    return toString(data);
-                }
-                return data;
-            }
-        }
-        return this.codecDeserializer.read(ns, data);
-    }
-}
-
-class ToStringShapeSerializer extends SerdeContext {
-    settings;
-    stringBuffer = "";
-    constructor(settings) {
-        super();
-        this.settings = settings;
-    }
-    write(schema, value) {
-        const ns = NormalizedSchema.of(schema);
-        switch (typeof value) {
-            case "object":
-                if (value === null) {
-                    this.stringBuffer = "null";
-                    return;
-                }
-                if (ns.isTimestampSchema()) {
-                    if (!(value instanceof Date)) {
-                        throw new Error(`@smithy/core/protocols - received non-Date value ${value} when schema expected Date in ${ns.getName(true)}`);
-                    }
-                    const format = determineTimestampFormat(ns, this.settings);
-                    switch (format) {
-                        case 5:
-                            this.stringBuffer = value.toISOString().replace(".000Z", "Z");
-                            break;
-                        case 6:
-                            this.stringBuffer = dateToUtcString(value);
-                            break;
-                        case 7:
-                            this.stringBuffer = String(value.getTime() / 1000);
-                            break;
-                        default:
-                            console.warn("Missing timestamp format, using epoch seconds", value);
-                            this.stringBuffer = String(value.getTime() / 1000);
-                    }
-                    return;
-                }
-                if (ns.isBlobSchema() && "byteLength" in value) {
-                    this.stringBuffer = (this.serdeContext?.base64Encoder ?? toBase64)(value);
-                    return;
-                }
-                if (ns.isListSchema() && Array.isArray(value)) {
-                    let buffer = "";
-                    for (const item of value) {
-                        this.write([ns.getValueSchema(), ns.getMergedTraits()], item);
-                        const headerItem = this.flush();
-                        const serialized = ns.getValueSchema().isTimestampSchema() ? headerItem : quoteHeader(headerItem);
-                        if (buffer !== "") {
-                            buffer += ", ";
-                        }
-                        buffer += serialized;
-                    }
-                    this.stringBuffer = buffer;
-                    return;
-                }
-                this.stringBuffer = JSON.stringify(value, null, 2);
-                break;
-            case "string":
-                const mediaType = ns.getMergedTraits().mediaType;
-                let intermediateValue = value;
-                if (mediaType) {
-                    const isJson = mediaType === "application/json" || mediaType.endsWith("+json");
-                    if (isJson) {
-                        intermediateValue = LazyJsonString.from(intermediateValue);
-                    }
-                    if (ns.getMergedTraits().httpHeader) {
-                        this.stringBuffer = (this.serdeContext?.base64Encoder ?? toBase64)(intermediateValue.toString());
-                        return;
-                    }
-                }
-                this.stringBuffer = value;
-                break;
-            default:
-                if (ns.isIdempotencyToken()) {
-                    this.stringBuffer = v4();
-                }
-                else {
-                    this.stringBuffer = String(value);
-                }
-        }
-    }
-    flush() {
-        const buffer = this.stringBuffer;
-        this.stringBuffer = "";
-        return buffer;
-    }
-}
-
-class HttpInterceptingShapeSerializer {
-    codecSerializer;
-    stringSerializer;
-    buffer;
-    constructor(codecSerializer, codecSettings, stringSerializer = new ToStringShapeSerializer(codecSettings)) {
-        this.codecSerializer = codecSerializer;
-        this.stringSerializer = stringSerializer;
-    }
-    setSerdeContext(serdeContext) {
-        this.codecSerializer.setSerdeContext(serdeContext);
-        this.stringSerializer.setSerdeContext(serdeContext);
-    }
-    write(schema, value) {
-        const ns = NormalizedSchema.of(schema);
-        const traits = ns.getMergedTraits();
-        if (traits.httpHeader || traits.httpLabel || traits.httpQuery) {
-            this.stringSerializer.write(ns, value);
-            this.buffer = this.stringSerializer.flush();
-            return;
-        }
-        return this.codecSerializer.write(ns, value);
-    }
-    flush() {
-        if (this.buffer !== undefined) {
-            const buffer = this.buffer;
-            this.buffer = undefined;
-            return buffer;
-        }
-        return this.codecSerializer.flush();
-    }
-}
-
-function setFeature(context, feature, value) {
-    if (!context.__smithy_context) {
-        context.__smithy_context = {
-            features: {},
-        };
-    }
-    else if (!context.__smithy_context.features) {
-        context.__smithy_context.features = {};
-    }
-    context.__smithy_context.features[feature] = value;
-}
-
-class DefaultIdentityProviderConfig {
-    authSchemes = new Map();
-    constructor(config) {
-        for (const [key, value] of Object.entries(config)) {
-            if (value !== undefined) {
-                this.authSchemes.set(key, value);
-            }
-        }
-    }
-    getIdentityProvider(schemeId) {
-        return this.authSchemes.get(schemeId);
-    }
-}
-
-class NoAuthSigner {
-    async sign(httpRequest, identity, signingProperties) {
-        return httpRequest;
-    }
-}
-
-const createIsIdentityExpiredFunction = (expirationMs) => function isIdentityExpired(identity) {
-    return doesIdentityRequireRefresh(identity) && identity.expiration.getTime() - Date.now() < expirationMs;
-};
-const EXPIRATION_MS = 300_000;
-const isIdentityExpired = createIsIdentityExpiredFunction(EXPIRATION_MS);
-const doesIdentityRequireRefresh = (identity) => identity.expiration !== undefined;
-const memoizeIdentityProvider = (provider, isExpired, requiresRefresh) => {
-    if (provider === undefined) {
-        return undefined;
-    }
-    const normalizedProvider = typeof provider !== "function" ? async () => Promise.resolve(provider) : provider;
-    let resolved;
-    let pending;
-    let hasResult;
-    let isConstant = false;
-    const coalesceProvider = async (options) => {
-        if (!pending) {
-            pending = normalizedProvider(options);
-        }
-        try {
-            resolved = await pending;
-            hasResult = true;
-            isConstant = false;
-        }
-        finally {
-            pending = undefined;
-        }
-        return resolved;
-    };
-    if (isExpired === undefined) {
-        return async (options) => {
-            if (!hasResult || options?.forceRefresh) {
-                resolved = await coalesceProvider(options);
-            }
-            return resolved;
-        };
-    }
-    return async (options) => {
-        if (!hasResult || options?.forceRefresh) {
-            resolved = await coalesceProvider(options);
-        }
-        if (isConstant) {
-            return resolved;
-        }
-        if (!requiresRefresh(resolved)) {
-            isConstant = true;
-            return resolved;
-        }
-        if (isExpired(resolved)) {
-            await coalesceProvider(options);
-            return resolved;
-        }
-        return resolved;
-    };
-};
-
-class ProviderError extends Error {
-    name = "ProviderError";
-    tryNextLink;
-    constructor(message, options = true) {
-        let logger;
-        let tryNextLink = true;
-        if (typeof options === "boolean") {
-            logger = undefined;
-            tryNextLink = options;
-        }
-        else if (options != null && typeof options === "object") {
-            logger = options.logger;
-            tryNextLink = options.tryNextLink ?? true;
-        }
-        super(message);
-        this.tryNextLink = tryNextLink;
-        Object.setPrototypeOf(this, ProviderError.prototype);
-        logger?.debug?.(`@smithy/property-provider ${tryNextLink ? "->" : "(!)"} ${message}`);
-    }
-    static from(error, options = true) {
-        return Object.assign(new this(error.message, options), error);
-    }
-}
-
-class CredentialsProviderError extends ProviderError {
-    name = "CredentialsProviderError";
-    constructor(message, options = true) {
-        super(message, options);
-        Object.setPrototypeOf(this, CredentialsProviderError.prototype);
-    }
-}
-
-class TokenProviderError extends ProviderError {
-    name = "TokenProviderError";
-    constructor(message, options = true) {
-        super(message, options);
-        Object.setPrototypeOf(this, TokenProviderError.prototype);
-    }
-}
-
-const chain = (...providers) => async () => {
-    if (providers.length === 0) {
-        throw new ProviderError("No providers in chain");
-    }
-    let lastProviderError;
-    for (const provider of providers) {
-        try {
-            const credentials = await provider();
-            return credentials;
-        }
-        catch (err) {
-            lastProviderError = err;
-            if (err?.tryNextLink) {
-                continue;
-            }
-            throw err;
-        }
-    }
-    throw lastProviderError;
-};
-
-const fromStatic$1 = (staticValue) => () => Promise.resolve(staticValue);
-
-const memoize = (provider, isExpired, requiresRefresh) => {
-    let resolved;
-    let pending;
-    let hasResult;
-    let isConstant = false;
-    const coalesceProvider = async () => {
-        if (!pending) {
-            pending = provider();
-        }
-        try {
-            resolved = await pending;
-            hasResult = true;
-            isConstant = false;
-        }
-        finally {
-            pending = undefined;
-        }
-        return resolved;
-    };
-    if (isExpired === undefined) {
-        return async (options) => {
-            if (!hasResult || options?.forceRefresh) {
-                resolved = await coalesceProvider();
-            }
-            return resolved;
-        };
-    }
-    return async (options) => {
-        if (!hasResult || options?.forceRefresh) {
-            resolved = await coalesceProvider();
-        }
-        if (isConstant) {
-            return resolved;
-        }
-        if (requiresRefresh && !requiresRefresh(resolved)) {
-            isConstant = true;
-            return resolved;
-        }
-        if (isExpired(resolved)) {
-            await coalesceProvider();
-            return resolved;
-        }
-        return resolved;
-    };
-};
-
-const resolveAwsSdkSigV4AConfig = (config) => {
-    config.sigv4aSigningRegionSet = normalizeProvider(config.sigv4aSigningRegionSet);
-    return config;
-};
-const NODE_SIGV4A_CONFIG_OPTIONS = {
-    environmentVariableSelector(env) {
-        if (env.AWS_SIGV4A_SIGNING_REGION_SET) {
-            return env.AWS_SIGV4A_SIGNING_REGION_SET.split(",").map((_) => _.trim());
-        }
-        throw new ProviderError("AWS_SIGV4A_SIGNING_REGION_SET not set in env.", {
-            tryNextLink: true,
-        });
-    },
-    configFileSelector(profile) {
-        if (profile.sigv4a_signing_region_set) {
-            return (profile.sigv4a_signing_region_set ?? "").split(",").map((_) => _.trim());
-        }
-        throw new ProviderError("sigv4a_signing_region_set not set in profile.", {
-            tryNextLink: true,
-        });
-    },
-    default: undefined,
-};
-
-const ALGORITHM_QUERY_PARAM = "X-Amz-Algorithm";
-const CREDENTIAL_QUERY_PARAM = "X-Amz-Credential";
-const AMZ_DATE_QUERY_PARAM = "X-Amz-Date";
-const SIGNED_HEADERS_QUERY_PARAM = "X-Amz-SignedHeaders";
-const EXPIRES_QUERY_PARAM = "X-Amz-Expires";
-const SIGNATURE_QUERY_PARAM = "X-Amz-Signature";
-const TOKEN_QUERY_PARAM = "X-Amz-Security-Token";
-const AUTH_HEADER = "authorization";
-const AMZ_DATE_HEADER = AMZ_DATE_QUERY_PARAM.toLowerCase();
-const DATE_HEADER = "date";
-const GENERATED_HEADERS = [AUTH_HEADER, AMZ_DATE_HEADER, DATE_HEADER];
-const SIGNATURE_HEADER = SIGNATURE_QUERY_PARAM.toLowerCase();
-const SHA256_HEADER = "x-amz-content-sha256";
-const TOKEN_HEADER = TOKEN_QUERY_PARAM.toLowerCase();
-const ALWAYS_UNSIGNABLE_HEADERS = {
-    authorization: true,
-    "cache-control": true,
-    connection: true,
-    expect: true,
-    from: true,
-    "keep-alive": true,
-    "max-forwards": true,
-    pragma: true,
-    referer: true,
-    te: true,
-    trailer: true,
-    "transfer-encoding": true,
-    upgrade: true,
-    "user-agent": true,
-    "x-amzn-trace-id": true,
-};
-const PROXY_HEADER_PATTERN = /^proxy-/;
-const SEC_HEADER_PATTERN = /^sec-/;
-const ALGORITHM_IDENTIFIER = "AWS4-HMAC-SHA256";
-const EVENT_ALGORITHM_IDENTIFIER = "AWS4-HMAC-SHA256-PAYLOAD";
-const UNSIGNED_PAYLOAD = "UNSIGNED-PAYLOAD";
-const MAX_CACHE_SIZE = 50;
-const KEY_TYPE_IDENTIFIER = "aws4_request";
-const MAX_PRESIGNED_TTL = 60 * 60 * 24 * 7;
-
-const signingKeyCache = {};
-const cacheQueue = [];
-const createScope = (shortDate, region, service) => `${shortDate}/${region}/${service}/${KEY_TYPE_IDENTIFIER}`;
-const getSigningKey = async (sha256Constructor, credentials, shortDate, region, service) => {
-    const credsHash = await hmac(sha256Constructor, credentials.secretAccessKey, credentials.accessKeyId);
-    const cacheKey = `${shortDate}:${region}:${service}:${toHex(credsHash)}:${credentials.sessionToken}`;
-    if (cacheKey in signingKeyCache) {
-        return signingKeyCache[cacheKey];
-    }
-    cacheQueue.push(cacheKey);
-    while (cacheQueue.length > MAX_CACHE_SIZE) {
-        delete signingKeyCache[cacheQueue.shift()];
-    }
-    let key = `AWS4${credentials.secretAccessKey}`;
-    for (const signable of [shortDate, region, service, KEY_TYPE_IDENTIFIER]) {
-        key = await hmac(sha256Constructor, key, signable);
-    }
-    return (signingKeyCache[cacheKey] = key);
-};
-const hmac = (ctor, secret, data) => {
-    const hash = new ctor(secret);
-    hash.update(toUint8Array(data));
-    return hash.digest();
-};
-
-const getCanonicalHeaders = ({ headers }, unsignableHeaders, signableHeaders) => {
-    const canonical = {};
-    for (const headerName of Object.keys(headers).sort()) {
-        if (headers[headerName] == undefined) {
-            continue;
-        }
-        const canonicalHeaderName = headerName.toLowerCase();
-        if (canonicalHeaderName in ALWAYS_UNSIGNABLE_HEADERS ||
-            unsignableHeaders?.has(canonicalHeaderName) ||
-            PROXY_HEADER_PATTERN.test(canonicalHeaderName) ||
-            SEC_HEADER_PATTERN.test(canonicalHeaderName)) {
-            if (!signableHeaders || (signableHeaders && !signableHeaders.has(canonicalHeaderName))) {
-                continue;
-            }
-        }
-        canonical[canonicalHeaderName] = headers[headerName].trim().replace(/\s+/g, " ");
-    }
-    return canonical;
-};
-
-const getPayloadHash = async ({ headers, body }, hashConstructor) => {
-    for (const headerName of Object.keys(headers)) {
-        if (headerName.toLowerCase() === SHA256_HEADER) {
-            return headers[headerName];
-        }
-    }
-    if (body == undefined) {
-        return "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-    }
-    else if (typeof body === "string" || ArrayBuffer.isView(body) || isArrayBuffer(body)) {
-        const hashCtor = new hashConstructor();
-        hashCtor.update(toUint8Array(body));
-        return toHex(await hashCtor.digest());
-    }
-    return UNSIGNED_PAYLOAD;
-};
-
-class HeaderFormatter {
-    format(headers) {
-        const chunks = [];
-        for (const headerName of Object.keys(headers)) {
-            const bytes = fromUtf8$2(headerName);
-            chunks.push(Uint8Array.from([bytes.byteLength]), bytes, this.formatHeaderValue(headers[headerName]));
-        }
-        const out = new Uint8Array(chunks.reduce((carry, bytes) => carry + bytes.byteLength, 0));
-        let position = 0;
-        for (const chunk of chunks) {
-            out.set(chunk, position);
-            position += chunk.byteLength;
-        }
-        return out;
-    }
-    formatHeaderValue(header) {
-        switch (header.type) {
-            case "boolean":
-                return Uint8Array.from([header.value ? 0 : 1]);
-            case "byte":
-                return Uint8Array.from([2, header.value]);
-            case "short":
-                const shortView = new DataView(new ArrayBuffer(3));
-                shortView.setUint8(0, 3);
-                shortView.setInt16(1, header.value, false);
-                return new Uint8Array(shortView.buffer);
-            case "integer":
-                const intView = new DataView(new ArrayBuffer(5));
-                intView.setUint8(0, 4);
-                intView.setInt32(1, header.value, false);
-                return new Uint8Array(intView.buffer);
-            case "long":
-                const longBytes = new Uint8Array(9);
-                longBytes[0] = 5;
-                longBytes.set(header.value.bytes, 1);
-                return longBytes;
-            case "binary":
-                const binView = new DataView(new ArrayBuffer(3 + header.value.byteLength));
-                binView.setUint8(0, 6);
-                binView.setUint16(1, header.value.byteLength, false);
-                const binBytes = new Uint8Array(binView.buffer);
-                binBytes.set(header.value, 3);
-                return binBytes;
-            case "string":
-                const utf8Bytes = fromUtf8$2(header.value);
-                const strView = new DataView(new ArrayBuffer(3 + utf8Bytes.byteLength));
-                strView.setUint8(0, 7);
-                strView.setUint16(1, utf8Bytes.byteLength, false);
-                const strBytes = new Uint8Array(strView.buffer);
-                strBytes.set(utf8Bytes, 3);
-                return strBytes;
-            case "timestamp":
-                const tsBytes = new Uint8Array(9);
-                tsBytes[0] = 8;
-                tsBytes.set(Int64$1.fromNumber(header.value.valueOf()).bytes, 1);
-                return tsBytes;
-            case "uuid":
-                if (!UUID_PATTERN$1.test(header.value)) {
-                    throw new Error(`Invalid UUID received: ${header.value}`);
-                }
-                const uuidBytes = new Uint8Array(17);
-                uuidBytes[0] = 9;
-                uuidBytes.set(fromHex(header.value.replace(/\-/g, "")), 1);
-                return uuidBytes;
-        }
-    }
-}
-var HEADER_VALUE_TYPE$1;
-(function (HEADER_VALUE_TYPE) {
-    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["boolTrue"] = 0] = "boolTrue";
-    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["boolFalse"] = 1] = "boolFalse";
-    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["byte"] = 2] = "byte";
-    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["short"] = 3] = "short";
-    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["integer"] = 4] = "integer";
-    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["long"] = 5] = "long";
-    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["byteArray"] = 6] = "byteArray";
-    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["string"] = 7] = "string";
-    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["timestamp"] = 8] = "timestamp";
-    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["uuid"] = 9] = "uuid";
-})(HEADER_VALUE_TYPE$1 || (HEADER_VALUE_TYPE$1 = {}));
-const UUID_PATTERN$1 = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
-let Int64$1 = class Int64 {
-    bytes;
-    constructor(bytes) {
-        this.bytes = bytes;
-        if (bytes.byteLength !== 8) {
-            throw new Error("Int64 buffers must be exactly 8 bytes");
-        }
-    }
-    static fromNumber(number) {
-        if (number > 9_223_372_036_854_775_807 || number < -9_223_372_036_854_775_808) {
-            throw new Error(`${number} is too large (or, if negative, too small) to represent as an Int64`);
-        }
-        const bytes = new Uint8Array(8);
-        for (let i = 7, remaining = Math.abs(Math.round(number)); i > -1 && remaining > 0; i--, remaining /= 256) {
-            bytes[i] = remaining;
-        }
-        if (number < 0) {
-            negate$1(bytes);
-        }
-        return new Int64(bytes);
-    }
-    valueOf() {
-        const bytes = this.bytes.slice(0);
-        const negative = bytes[0] & 0b10000000;
-        if (negative) {
-            negate$1(bytes);
-        }
-        return parseInt(toHex(bytes), 16) * (negative ? -1 : 1);
-    }
-    toString() {
-        return String(this.valueOf());
-    }
-};
-function negate$1(bytes) {
-    for (let i = 0; i < 8; i++) {
-        bytes[i] ^= 0xff;
-    }
-    for (let i = 7; i > -1; i--) {
-        bytes[i]++;
-        if (bytes[i] !== 0)
-            break;
-    }
-}
-
-const hasHeader$1 = (soughtHeader, headers) => {
-    soughtHeader = soughtHeader.toLowerCase();
+const hasHeader = (header, headers) => {
+    const soughtHeader = header.toLowerCase();
     for (const headerName of Object.keys(headers)) {
         if (soughtHeader === headerName.toLowerCase()) {
             return true;
@@ -8364,411 +12588,1016 @@ const hasHeader$1 = (soughtHeader, headers) => {
     return false;
 };
 
-const moveHeadersToQuery = (request, options = {}) => {
-    const { headers, query = {} } = HttpRequest.clone(request);
-    for (const name of Object.keys(headers)) {
-        const lname = name.toLowerCase();
-        if ((lname.slice(0, 6) === "x-amz-" && !options.unhoistableHeaders?.has(lname)) ||
-            options.hoistableHeaders?.has(lname)) {
-            query[name] = headers[name];
-            delete headers[name];
+const hasHeaderWithPrefix = (headerPrefix, headers) => {
+    const soughtHeaderPrefix = headerPrefix.toLowerCase();
+    for (const headerName of Object.keys(headers)) {
+        if (headerName.toLowerCase().startsWith(soughtHeaderPrefix)) {
+            return true;
         }
     }
-    return {
-        ...request,
-        headers,
-        query,
+    return false;
+};
+
+const isStreaming = (body) => body !== undefined && typeof body !== "string" && !ArrayBuffer.isView(body) && !isArrayBuffer(body);
+
+/******************************************************************************
+Copyright (c) Microsoft Corporation.
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
+OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+PERFORMANCE OF THIS SOFTWARE.
+***************************************************************************** */
+/* global Reflect, Promise, SuppressedError, Symbol, Iterator */
+
+
+function __awaiter(thisArg, _arguments, P, generator) {
+  function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+  return new (P || (P = Promise))(function (resolve, reject) {
+      function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+      function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+      function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+      step((generator = generator.apply(thisArg, _arguments || [])).next());
+  });
+}
+
+function __generator(thisArg, body) {
+  var _ = { label: 0, sent: function() { if (t[0] & 1) throw t[1]; return t[1]; }, trys: [], ops: [] }, f, y, t, g = Object.create((typeof Iterator === "function" ? Iterator : Object).prototype);
+  return g.next = verb(0), g["throw"] = verb(1), g["return"] = verb(2), typeof Symbol === "function" && (g[Symbol.iterator] = function() { return this; }), g;
+  function verb(n) { return function (v) { return step([n, v]); }; }
+  function step(op) {
+      if (f) throw new TypeError("Generator is already executing.");
+      while (g && (g = 0, op[0] && (_ = 0)), _) try {
+          if (f = 1, y && (t = op[0] & 2 ? y["return"] : op[0] ? y["throw"] || ((t = y["return"]) && t.call(y), 0) : y.next) && !(t = t.call(y, op[1])).done) return t;
+          if (y = 0, t) op = [op[0] & 2, t.value];
+          switch (op[0]) {
+              case 0: case 1: t = op; break;
+              case 4: _.label++; return { value: op[1], done: false };
+              case 5: _.label++; y = op[1]; op = [0]; continue;
+              case 7: op = _.ops.pop(); _.trys.pop(); continue;
+              default:
+                  if (!(t = _.trys, t = t.length > 0 && t[t.length - 1]) && (op[0] === 6 || op[0] === 2)) { _ = 0; continue; }
+                  if (op[0] === 3 && (!t || (op[1] > t[0] && op[1] < t[3]))) { _.label = op[1]; break; }
+                  if (op[0] === 6 && _.label < t[1]) { _.label = t[1]; t = op; break; }
+                  if (t && _.label < t[2]) { _.label = t[2]; _.ops.push(op); break; }
+                  if (t[2]) _.ops.pop();
+                  _.trys.pop(); continue;
+          }
+          op = body.call(thisArg, _);
+      } catch (e) { op = [6, e]; y = 0; } finally { f = t = 0; }
+      if (op[0] & 5) throw op[1]; return { value: op[0] ? op[1] : void 0, done: true };
+  }
+}
+
+function __values(o) {
+  var s = typeof Symbol === "function" && Symbol.iterator, m = s && o[s], i = 0;
+  if (m) return m.call(o);
+  if (o && typeof o.length === "number") return {
+      next: function () {
+          if (o && i >= o.length) o = void 0;
+          return { value: o && o[i++], done: !o };
+      }
+  };
+  throw new TypeError(s ? "Object is not iterable." : "Symbol.iterator is not defined.");
+}
+
+typeof SuppressedError === "function" ? SuppressedError : function (error, suppressed, message) {
+  var e = new Error(message);
+  return e.name = "SuppressedError", e.error = error, e.suppressed = suppressed, e;
+};
+
+const fromString = (input, encoding) => {
+    if (typeof input !== "string") {
+        throw new TypeError(`The "input" argument must be of type string. Received type ${typeof input} (${input})`);
+    }
+    return encoding ? Buffer$1.from(input, encoding) : Buffer$1.from(input);
+};
+
+const fromUtf8$1 = (input) => {
+    const buf = fromString(input, "utf8");
+    return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength / Uint8Array.BYTES_PER_ELEMENT);
+};
+
+// Copyright Amazon.com Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+// Quick polyfill
+var fromUtf8 = typeof Buffer !== "undefined" && Buffer.from
+    ? function (input) { return Buffer.from(input, "utf8"); }
+    : fromUtf8$1;
+function convertToBuffer(data) {
+    // Already a Uint8, do nothing
+    if (data instanceof Uint8Array)
+        return data;
+    if (typeof data === "string") {
+        return fromUtf8(data);
+    }
+    if (ArrayBuffer.isView(data)) {
+        return new Uint8Array(data.buffer, data.byteOffset, data.byteLength / Uint8Array.BYTES_PER_ELEMENT);
+    }
+    return new Uint8Array(data);
+}
+
+// Copyright Amazon.com Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+function isEmptyData(data) {
+    if (typeof data === "string") {
+        return data.length === 0;
+    }
+    return data.byteLength === 0;
+}
+
+// Copyright Amazon.com Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+function numToUint8(num) {
+    return new Uint8Array([
+        (num & 0xff000000) >> 24,
+        (num & 0x00ff0000) >> 16,
+        (num & 0x0000ff00) >> 8,
+        num & 0x000000ff,
+    ]);
+}
+
+// Copyright Amazon.com Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+// IE 11 does not support Array.from, so we do it manually
+function uint32ArrayFrom(a_lookUpTable) {
+    if (!Uint32Array.from) {
+        var return_array = new Uint32Array(a_lookUpTable.length);
+        var a_index = 0;
+        while (a_index < a_lookUpTable.length) {
+            return_array[a_index] = a_lookUpTable[a_index];
+            a_index += 1;
+        }
+        return return_array;
+    }
+    return Uint32Array.from(a_lookUpTable);
+}
+
+// Copyright Amazon.com Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+var AwsCrc32c = /** @class */ (function () {
+    function AwsCrc32c() {
+        this.crc32c = new Crc32c();
+    }
+    AwsCrc32c.prototype.update = function (toHash) {
+        if (isEmptyData(toHash))
+            return;
+        this.crc32c.update(convertToBuffer(toHash));
     };
-};
+    AwsCrc32c.prototype.digest = function () {
+        return __awaiter(this, void 0, void 0, function () {
+            return __generator(this, function (_a) {
+                return [2 /*return*/, numToUint8(this.crc32c.digest())];
+            });
+        });
+    };
+    AwsCrc32c.prototype.reset = function () {
+        this.crc32c = new Crc32c();
+    };
+    return AwsCrc32c;
+}());
 
-const prepareRequest = (request) => {
-    request = HttpRequest.clone(request);
-    for (const headerName of Object.keys(request.headers)) {
-        if (GENERATED_HEADERS.indexOf(headerName.toLowerCase()) > -1) {
-            delete request.headers[headerName];
-        }
+// Copyright Amazon.com Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+var Crc32c = /** @class */ (function () {
+    function Crc32c() {
+        this.checksum = 0xffffffff;
     }
-    return request;
-};
+    Crc32c.prototype.update = function (data) {
+        var e_1, _a;
+        try {
+            for (var data_1 = __values(data), data_1_1 = data_1.next(); !data_1_1.done; data_1_1 = data_1.next()) {
+                var byte = data_1_1.value;
+                this.checksum =
+                    (this.checksum >>> 8) ^ lookupTable$1[(this.checksum ^ byte) & 0xff];
+            }
+        }
+        catch (e_1_1) { e_1 = { error: e_1_1 }; }
+        finally {
+            try {
+                if (data_1_1 && !data_1_1.done && (_a = data_1.return)) _a.call(data_1);
+            }
+            finally { if (e_1) throw e_1.error; }
+        }
+        return this;
+    };
+    Crc32c.prototype.digest = function () {
+        return (this.checksum ^ 0xffffffff) >>> 0;
+    };
+    return Crc32c;
+}());
+// prettier-ignore
+var a_lookupTable = [
+    0x00000000, 0xF26B8303, 0xE13B70F7, 0x1350F3F4, 0xC79A971F, 0x35F1141C, 0x26A1E7E8, 0xD4CA64EB,
+    0x8AD958CF, 0x78B2DBCC, 0x6BE22838, 0x9989AB3B, 0x4D43CFD0, 0xBF284CD3, 0xAC78BF27, 0x5E133C24,
+    0x105EC76F, 0xE235446C, 0xF165B798, 0x030E349B, 0xD7C45070, 0x25AFD373, 0x36FF2087, 0xC494A384,
+    0x9A879FA0, 0x68EC1CA3, 0x7BBCEF57, 0x89D76C54, 0x5D1D08BF, 0xAF768BBC, 0xBC267848, 0x4E4DFB4B,
+    0x20BD8EDE, 0xD2D60DDD, 0xC186FE29, 0x33ED7D2A, 0xE72719C1, 0x154C9AC2, 0x061C6936, 0xF477EA35,
+    0xAA64D611, 0x580F5512, 0x4B5FA6E6, 0xB93425E5, 0x6DFE410E, 0x9F95C20D, 0x8CC531F9, 0x7EAEB2FA,
+    0x30E349B1, 0xC288CAB2, 0xD1D83946, 0x23B3BA45, 0xF779DEAE, 0x05125DAD, 0x1642AE59, 0xE4292D5A,
+    0xBA3A117E, 0x4851927D, 0x5B016189, 0xA96AE28A, 0x7DA08661, 0x8FCB0562, 0x9C9BF696, 0x6EF07595,
+    0x417B1DBC, 0xB3109EBF, 0xA0406D4B, 0x522BEE48, 0x86E18AA3, 0x748A09A0, 0x67DAFA54, 0x95B17957,
+    0xCBA24573, 0x39C9C670, 0x2A993584, 0xD8F2B687, 0x0C38D26C, 0xFE53516F, 0xED03A29B, 0x1F682198,
+    0x5125DAD3, 0xA34E59D0, 0xB01EAA24, 0x42752927, 0x96BF4DCC, 0x64D4CECF, 0x77843D3B, 0x85EFBE38,
+    0xDBFC821C, 0x2997011F, 0x3AC7F2EB, 0xC8AC71E8, 0x1C661503, 0xEE0D9600, 0xFD5D65F4, 0x0F36E6F7,
+    0x61C69362, 0x93AD1061, 0x80FDE395, 0x72966096, 0xA65C047D, 0x5437877E, 0x4767748A, 0xB50CF789,
+    0xEB1FCBAD, 0x197448AE, 0x0A24BB5A, 0xF84F3859, 0x2C855CB2, 0xDEEEDFB1, 0xCDBE2C45, 0x3FD5AF46,
+    0x7198540D, 0x83F3D70E, 0x90A324FA, 0x62C8A7F9, 0xB602C312, 0x44694011, 0x5739B3E5, 0xA55230E6,
+    0xFB410CC2, 0x092A8FC1, 0x1A7A7C35, 0xE811FF36, 0x3CDB9BDD, 0xCEB018DE, 0xDDE0EB2A, 0x2F8B6829,
+    0x82F63B78, 0x709DB87B, 0x63CD4B8F, 0x91A6C88C, 0x456CAC67, 0xB7072F64, 0xA457DC90, 0x563C5F93,
+    0x082F63B7, 0xFA44E0B4, 0xE9141340, 0x1B7F9043, 0xCFB5F4A8, 0x3DDE77AB, 0x2E8E845F, 0xDCE5075C,
+    0x92A8FC17, 0x60C37F14, 0x73938CE0, 0x81F80FE3, 0x55326B08, 0xA759E80B, 0xB4091BFF, 0x466298FC,
+    0x1871A4D8, 0xEA1A27DB, 0xF94AD42F, 0x0B21572C, 0xDFEB33C7, 0x2D80B0C4, 0x3ED04330, 0xCCBBC033,
+    0xA24BB5A6, 0x502036A5, 0x4370C551, 0xB11B4652, 0x65D122B9, 0x97BAA1BA, 0x84EA524E, 0x7681D14D,
+    0x2892ED69, 0xDAF96E6A, 0xC9A99D9E, 0x3BC21E9D, 0xEF087A76, 0x1D63F975, 0x0E330A81, 0xFC588982,
+    0xB21572C9, 0x407EF1CA, 0x532E023E, 0xA145813D, 0x758FE5D6, 0x87E466D5, 0x94B49521, 0x66DF1622,
+    0x38CC2A06, 0xCAA7A905, 0xD9F75AF1, 0x2B9CD9F2, 0xFF56BD19, 0x0D3D3E1A, 0x1E6DCDEE, 0xEC064EED,
+    0xC38D26C4, 0x31E6A5C7, 0x22B65633, 0xD0DDD530, 0x0417B1DB, 0xF67C32D8, 0xE52CC12C, 0x1747422F,
+    0x49547E0B, 0xBB3FFD08, 0xA86F0EFC, 0x5A048DFF, 0x8ECEE914, 0x7CA56A17, 0x6FF599E3, 0x9D9E1AE0,
+    0xD3D3E1AB, 0x21B862A8, 0x32E8915C, 0xC083125F, 0x144976B4, 0xE622F5B7, 0xF5720643, 0x07198540,
+    0x590AB964, 0xAB613A67, 0xB831C993, 0x4A5A4A90, 0x9E902E7B, 0x6CFBAD78, 0x7FAB5E8C, 0x8DC0DD8F,
+    0xE330A81A, 0x115B2B19, 0x020BD8ED, 0xF0605BEE, 0x24AA3F05, 0xD6C1BC06, 0xC5914FF2, 0x37FACCF1,
+    0x69E9F0D5, 0x9B8273D6, 0x88D28022, 0x7AB90321, 0xAE7367CA, 0x5C18E4C9, 0x4F48173D, 0xBD23943E,
+    0xF36E6F75, 0x0105EC76, 0x12551F82, 0xE03E9C81, 0x34F4F86A, 0xC69F7B69, 0xD5CF889D, 0x27A40B9E,
+    0x79B737BA, 0x8BDCB4B9, 0x988C474D, 0x6AE7C44E, 0xBE2DA0A5, 0x4C4623A6, 0x5F16D052, 0xAD7D5351,
+];
+var lookupTable$1 = uint32ArrayFrom(a_lookupTable);
 
-const getCanonicalQuery = ({ query = {} }) => {
-    const keys = [];
-    const serialized = {};
-    for (const key of Object.keys(query)) {
-        if (key.toLowerCase() === SIGNATURE_HEADER) {
-            continue;
-        }
-        const encodedKey = escapeUri(key);
-        keys.push(encodedKey);
-        const value = query[key];
-        if (typeof value === "string") {
-            serialized[encodedKey] = `${encodedKey}=${escapeUri(value)}`;
-        }
-        else if (Array.isArray(value)) {
-            serialized[encodedKey] = value
-                .slice(0)
-                .reduce((encoded, value) => encoded.concat([`${encodedKey}=${escapeUri(value)}`]), [])
-                .sort()
-                .join("&");
-        }
-    }
-    return keys
-        .sort()
-        .map((key) => serialized[key])
-        .filter((serialized) => serialized)
-        .join("&");
-};
-
-const iso8601 = (time) => toDate(time)
-    .toISOString()
-    .replace(/\.\d{3}Z$/, "Z");
-const toDate = (time) => {
-    if (typeof time === "number") {
-        return new Date(time * 1000);
-    }
-    if (typeof time === "string") {
-        if (Number(time)) {
-            return new Date(Number(time) * 1000);
-        }
-        return new Date(time);
-    }
-    return time;
-};
-
-class SignatureV4Base {
-    service;
-    regionProvider;
-    credentialProvider;
-    sha256;
-    uriEscapePath;
-    applyChecksum;
-    constructor({ applyChecksum, credentials, region, service, sha256, uriEscapePath = true, }) {
-        this.service = service;
-        this.sha256 = sha256;
-        this.uriEscapePath = uriEscapePath;
-        this.applyChecksum = typeof applyChecksum === "boolean" ? applyChecksum : true;
-        this.regionProvider = normalizeProvider$1(region);
-        this.credentialProvider = normalizeProvider$1(credentials);
-    }
-    createCanonicalRequest(request, canonicalHeaders, payloadHash) {
-        const sortedHeaders = Object.keys(canonicalHeaders).sort();
-        return `${request.method}
-${this.getCanonicalPath(request)}
-${getCanonicalQuery(request)}
-${sortedHeaders.map((name) => `${name}:${canonicalHeaders[name]}`).join("\n")}
-
-${sortedHeaders.join(";")}
-${payloadHash}`;
-    }
-    async createStringToSign(longDate, credentialScope, canonicalRequest, algorithmIdentifier) {
-        const hash = new this.sha256();
-        hash.update(toUint8Array(canonicalRequest));
-        const hashedRequest = await hash.digest();
-        return `${algorithmIdentifier}
-${longDate}
-${credentialScope}
-${toHex(hashedRequest)}`;
-    }
-    getCanonicalPath({ path }) {
-        if (this.uriEscapePath) {
-            const normalizedPathSegments = [];
-            for (const pathSegment of path.split("/")) {
-                if (pathSegment?.length === 0)
-                    continue;
-                if (pathSegment === ".")
-                    continue;
-                if (pathSegment === "..") {
-                    normalizedPathSegments.pop();
+const generateCRC64NVMETable = () => {
+    const sliceLength = 8;
+    const tables = new Array(sliceLength);
+    for (let slice = 0; slice < sliceLength; slice++) {
+        const table = new Array(512);
+        for (let i = 0; i < 256; i++) {
+            let crc = BigInt(i);
+            for (let j = 0; j < 8 * (slice + 1); j++) {
+                if (crc & 1n) {
+                    crc = (crc >> 1n) ^ 0x9a6c9329ac4bc9b5n;
                 }
                 else {
-                    normalizedPathSegments.push(pathSegment);
+                    crc = crc >> 1n;
                 }
             }
-            const normalizedPath = `${path?.startsWith("/") ? "/" : ""}${normalizedPathSegments.join("/")}${normalizedPathSegments.length > 0 && path?.endsWith("/") ? "/" : ""}`;
-            const doubleEncoded = escapeUri(normalizedPath);
-            return doubleEncoded.replace(/%2F/g, "/");
+            table[i * 2] = Number((crc >> 32n) & 0xffffffffn);
+            table[i * 2 + 1] = Number(crc & 0xffffffffn);
         }
-        return path;
+        tables[slice] = new Uint32Array(table);
     }
-    validateResolvedCredentials(credentials) {
-        if (typeof credentials !== "object" ||
-            typeof credentials.accessKeyId !== "string" ||
-            typeof credentials.secretAccessKey !== "string") {
-            throw new Error("Resolved credential object is not valid");
-        }
-    }
-    formatDate(now) {
-        const longDate = iso8601(now).replace(/[\-:]/g, "");
-        return {
-            longDate,
-            shortDate: longDate.slice(0, 8),
-        };
-    }
-    getCanonicalHeaderList(headers) {
-        return Object.keys(headers).sort().join(";");
-    }
-}
-
-class SignatureV4 extends SignatureV4Base {
-    headerFormatter = new HeaderFormatter();
-    constructor({ applyChecksum, credentials, region, service, sha256, uriEscapePath = true, }) {
-        super({
-            applyChecksum,
-            credentials,
-            region,
-            service,
-            sha256,
-            uriEscapePath,
-        });
-    }
-    async presign(originalRequest, options = {}) {
-        const { signingDate = new Date(), expiresIn = 3600, unsignableHeaders, unhoistableHeaders, signableHeaders, hoistableHeaders, signingRegion, signingService, } = options;
-        const credentials = await this.credentialProvider();
-        this.validateResolvedCredentials(credentials);
-        const region = signingRegion ?? (await this.regionProvider());
-        const { longDate, shortDate } = this.formatDate(signingDate);
-        if (expiresIn > MAX_PRESIGNED_TTL) {
-            return Promise.reject("Signature version 4 presigned URLs" + " must have an expiration date less than one week in" + " the future");
-        }
-        const scope = createScope(shortDate, region, signingService ?? this.service);
-        const request = moveHeadersToQuery(prepareRequest(originalRequest), { unhoistableHeaders, hoistableHeaders });
-        if (credentials.sessionToken) {
-            request.query[TOKEN_QUERY_PARAM] = credentials.sessionToken;
-        }
-        request.query[ALGORITHM_QUERY_PARAM] = ALGORITHM_IDENTIFIER;
-        request.query[CREDENTIAL_QUERY_PARAM] = `${credentials.accessKeyId}/${scope}`;
-        request.query[AMZ_DATE_QUERY_PARAM] = longDate;
-        request.query[EXPIRES_QUERY_PARAM] = expiresIn.toString(10);
-        const canonicalHeaders = getCanonicalHeaders(request, unsignableHeaders, signableHeaders);
-        request.query[SIGNED_HEADERS_QUERY_PARAM] = this.getCanonicalHeaderList(canonicalHeaders);
-        request.query[SIGNATURE_QUERY_PARAM] = await this.getSignature(longDate, scope, this.getSigningKey(credentials, region, shortDate, signingService), this.createCanonicalRequest(request, canonicalHeaders, await getPayloadHash(originalRequest, this.sha256)));
-        return request;
-    }
-    async sign(toSign, options) {
-        if (typeof toSign === "string") {
-            return this.signString(toSign, options);
-        }
-        else if (toSign.headers && toSign.payload) {
-            return this.signEvent(toSign, options);
-        }
-        else if (toSign.message) {
-            return this.signMessage(toSign, options);
-        }
-        else {
-            return this.signRequest(toSign, options);
-        }
-    }
-    async signEvent({ headers, payload }, { signingDate = new Date(), priorSignature, signingRegion, signingService }) {
-        const region = signingRegion ?? (await this.regionProvider());
-        const { shortDate, longDate } = this.formatDate(signingDate);
-        const scope = createScope(shortDate, region, signingService ?? this.service);
-        const hashedPayload = await getPayloadHash({ headers: {}, body: payload }, this.sha256);
-        const hash = new this.sha256();
-        hash.update(headers);
-        const hashedHeaders = toHex(await hash.digest());
-        const stringToSign = [
-            EVENT_ALGORITHM_IDENTIFIER,
-            longDate,
-            scope,
-            priorSignature,
-            hashedHeaders,
-            hashedPayload,
-        ].join("\n");
-        return this.signString(stringToSign, { signingDate, signingRegion: region, signingService });
-    }
-    async signMessage(signableMessage, { signingDate = new Date(), signingRegion, signingService }) {
-        const promise = this.signEvent({
-            headers: this.headerFormatter.format(signableMessage.message.headers),
-            payload: signableMessage.message.body,
-        }, {
-            signingDate,
-            signingRegion,
-            signingService,
-            priorSignature: signableMessage.priorSignature,
-        });
-        return promise.then((signature) => {
-            return { message: signableMessage.message, signature };
-        });
-    }
-    async signString(stringToSign, { signingDate = new Date(), signingRegion, signingService } = {}) {
-        const credentials = await this.credentialProvider();
-        this.validateResolvedCredentials(credentials);
-        const region = signingRegion ?? (await this.regionProvider());
-        const { shortDate } = this.formatDate(signingDate);
-        const hash = new this.sha256(await this.getSigningKey(credentials, region, shortDate, signingService));
-        hash.update(toUint8Array(stringToSign));
-        return toHex(await hash.digest());
-    }
-    async signRequest(requestToSign, { signingDate = new Date(), signableHeaders, unsignableHeaders, signingRegion, signingService, } = {}) {
-        const credentials = await this.credentialProvider();
-        this.validateResolvedCredentials(credentials);
-        const region = signingRegion ?? (await this.regionProvider());
-        const request = prepareRequest(requestToSign);
-        const { longDate, shortDate } = this.formatDate(signingDate);
-        const scope = createScope(shortDate, region, signingService ?? this.service);
-        request.headers[AMZ_DATE_HEADER] = longDate;
-        if (credentials.sessionToken) {
-            request.headers[TOKEN_HEADER] = credentials.sessionToken;
-        }
-        const payloadHash = await getPayloadHash(request, this.sha256);
-        if (!hasHeader$1(SHA256_HEADER, request.headers) && this.applyChecksum) {
-            request.headers[SHA256_HEADER] = payloadHash;
-        }
-        const canonicalHeaders = getCanonicalHeaders(request, unsignableHeaders, signableHeaders);
-        const signature = await this.getSignature(longDate, scope, this.getSigningKey(credentials, region, shortDate, signingService), this.createCanonicalRequest(request, canonicalHeaders, payloadHash));
-        request.headers[AUTH_HEADER] =
-            `${ALGORITHM_IDENTIFIER} ` +
-                `Credential=${credentials.accessKeyId}/${scope}, ` +
-                `SignedHeaders=${this.getCanonicalHeaderList(canonicalHeaders)}, ` +
-                `Signature=${signature}`;
-        return request;
-    }
-    async getSignature(longDate, credentialScope, keyPromise, canonicalRequest) {
-        const stringToSign = await this.createStringToSign(longDate, credentialScope, canonicalRequest, ALGORITHM_IDENTIFIER);
-        const hash = new this.sha256(await keyPromise);
-        hash.update(toUint8Array(stringToSign));
-        return toHex(await hash.digest());
-    }
-    getSigningKey(credentials, region, shortDate, service) {
-        return getSigningKey(this.sha256, credentials, shortDate, region, service || this.service);
-    }
-}
-
-const resolveAwsSdkSigV4Config = (config) => {
-    let inputCredentials = config.credentials;
-    let isUserSupplied = !!config.credentials;
-    let resolvedCredentials = undefined;
-    Object.defineProperty(config, "credentials", {
-        set(credentials) {
-            if (credentials && credentials !== inputCredentials && credentials !== resolvedCredentials) {
-                isUserSupplied = true;
-            }
-            inputCredentials = credentials;
-            const memoizedProvider = normalizeCredentialProvider(config, {
-                credentials: inputCredentials,
-                credentialDefaultProvider: config.credentialDefaultProvider,
-            });
-            const boundProvider = bindCallerConfig(config, memoizedProvider);
-            if (isUserSupplied && !boundProvider.attributed) {
-                const isCredentialObject = typeof inputCredentials === "object" && inputCredentials !== null;
-                resolvedCredentials = async (options) => {
-                    const creds = await boundProvider(options);
-                    const attributedCreds = creds;
-                    if (isCredentialObject && (!attributedCreds.$source || Object.keys(attributedCreds.$source).length === 0)) {
-                        return setCredentialFeature(attributedCreds, "CREDENTIALS_CODE", "e");
-                    }
-                    return attributedCreds;
-                };
-                resolvedCredentials.memoized = boundProvider.memoized;
-                resolvedCredentials.configBound = boundProvider.configBound;
-                resolvedCredentials.attributed = true;
-            }
-            else {
-                resolvedCredentials = boundProvider;
-            }
-        },
-        get() {
-            return resolvedCredentials;
-        },
-        enumerable: true,
-        configurable: true,
-    });
-    config.credentials = inputCredentials;
-    const { signingEscapePath = true, systemClockOffset = config.systemClockOffset || 0, sha256, } = config;
-    let signer;
-    if (config.signer) {
-        signer = normalizeProvider(config.signer);
-    }
-    else if (config.regionInfoProvider) {
-        signer = () => normalizeProvider(config.region)()
-            .then(async (region) => [
-            (await config.regionInfoProvider(region, {
-                useFipsEndpoint: await config.useFipsEndpoint(),
-                useDualstackEndpoint: await config.useDualstackEndpoint(),
-            })) || {},
-            region,
-        ])
-            .then(([regionInfo, region]) => {
-            const { signingRegion, signingService } = regionInfo;
-            config.signingRegion = config.signingRegion || signingRegion || region;
-            config.signingName = config.signingName || signingService || config.serviceId;
-            const params = {
-                ...config,
-                credentials: config.credentials,
-                region: config.signingRegion,
-                service: config.signingName,
-                sha256,
-                uriEscapePath: signingEscapePath,
-            };
-            const SignerCtor = config.signerConstructor || SignatureV4;
-            return new SignerCtor(params);
-        });
-    }
-    else {
-        signer = async (authScheme) => {
-            authScheme = Object.assign({}, {
-                name: "sigv4",
-                signingName: config.signingName || config.defaultSigningName,
-                signingRegion: await normalizeProvider(config.region)(),
-                properties: {},
-            }, authScheme);
-            const signingRegion = authScheme.signingRegion;
-            const signingService = authScheme.signingName;
-            config.signingRegion = config.signingRegion || signingRegion;
-            config.signingName = config.signingName || signingService || config.serviceId;
-            const params = {
-                ...config,
-                credentials: config.credentials,
-                region: config.signingRegion,
-                service: config.signingName,
-                sha256,
-                uriEscapePath: signingEscapePath,
-            };
-            const SignerCtor = config.signerConstructor || SignatureV4;
-            return new SignerCtor(params);
-        };
-    }
-    const resolvedConfig = Object.assign(config, {
-        systemClockOffset,
-        signingEscapePath,
-        signer,
-    });
-    return resolvedConfig;
+    return tables;
 };
-function normalizeCredentialProvider(config, { credentials, credentialDefaultProvider, }) {
-    let credentialsProvider;
-    if (credentials) {
-        if (!credentials?.memoized) {
-            credentialsProvider = memoizeIdentityProvider(credentials, isIdentityExpired, doesIdentityRequireRefresh);
+let CRC64_NVME_REVERSED_TABLE;
+let t0, t1, t2, t3;
+let t4, t5, t6, t7;
+const ensureTablesInitialized = () => {
+    if (!CRC64_NVME_REVERSED_TABLE) {
+        CRC64_NVME_REVERSED_TABLE = generateCRC64NVMETable();
+        [t0, t1, t2, t3, t4, t5, t6, t7] = CRC64_NVME_REVERSED_TABLE;
+    }
+};
+class Crc64Nvme {
+    c1 = 0;
+    c2 = 0;
+    constructor() {
+        ensureTablesInitialized();
+        this.reset();
+    }
+    update(data) {
+        const len = data.length;
+        let i = 0;
+        let crc1 = this.c1;
+        let crc2 = this.c2;
+        while (i + 8 <= len) {
+            const idx0 = ((crc2 ^ data[i++]) & 255) << 1;
+            const idx1 = (((crc2 >>> 8) ^ data[i++]) & 255) << 1;
+            const idx2 = (((crc2 >>> 16) ^ data[i++]) & 255) << 1;
+            const idx3 = (((crc2 >>> 24) ^ data[i++]) & 255) << 1;
+            const idx4 = ((crc1 ^ data[i++]) & 255) << 1;
+            const idx5 = (((crc1 >>> 8) ^ data[i++]) & 255) << 1;
+            const idx6 = (((crc1 >>> 16) ^ data[i++]) & 255) << 1;
+            const idx7 = (((crc1 >>> 24) ^ data[i++]) & 255) << 1;
+            crc1 = t7[idx0] ^ t6[idx1] ^ t5[idx2] ^ t4[idx3] ^ t3[idx4] ^ t2[idx5] ^ t1[idx6] ^ t0[idx7];
+            crc2 =
+                t7[idx0 + 1] ^
+                    t6[idx1 + 1] ^
+                    t5[idx2 + 1] ^
+                    t4[idx3 + 1] ^
+                    t3[idx4 + 1] ^
+                    t2[idx5 + 1] ^
+                    t1[idx6 + 1] ^
+                    t0[idx7 + 1];
         }
-        else {
-            credentialsProvider = credentials;
+        while (i < len) {
+            const idx = ((crc2 ^ data[i]) & 255) << 1;
+            crc2 = ((crc2 >>> 8) | ((crc1 & 255) << 24)) >>> 0;
+            crc1 = (crc1 >>> 8) ^ t0[idx];
+            crc2 ^= t0[idx + 1];
+            i++;
+        }
+        this.c1 = crc1;
+        this.c2 = crc2;
+    }
+    async digest() {
+        const c1 = this.c1 ^ 4294967295;
+        const c2 = this.c2 ^ 4294967295;
+        return new Uint8Array([
+            c1 >>> 24,
+            (c1 >>> 16) & 255,
+            (c1 >>> 8) & 255,
+            c1 & 255,
+            c2 >>> 24,
+            (c2 >>> 16) & 255,
+            (c2 >>> 8) & 255,
+            c2 & 255,
+        ]);
+    }
+    reset() {
+        this.c1 = 4294967295;
+        this.c2 = 4294967295;
+    }
+}
+
+// Copyright Amazon.com Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+var AwsCrc32 = /** @class */ (function () {
+    function AwsCrc32() {
+        this.crc32 = new Crc32();
+    }
+    AwsCrc32.prototype.update = function (toHash) {
+        if (isEmptyData(toHash))
+            return;
+        this.crc32.update(convertToBuffer(toHash));
+    };
+    AwsCrc32.prototype.digest = function () {
+        return __awaiter(this, void 0, void 0, function () {
+            return __generator(this, function (_a) {
+                return [2 /*return*/, numToUint8(this.crc32.digest())];
+            });
+        });
+    };
+    AwsCrc32.prototype.reset = function () {
+        this.crc32 = new Crc32();
+    };
+    return AwsCrc32;
+}());
+
+var Crc32 = /** @class */ (function () {
+    function Crc32() {
+        this.checksum = 0xffffffff;
+    }
+    Crc32.prototype.update = function (data) {
+        var e_1, _a;
+        try {
+            for (var data_1 = __values(data), data_1_1 = data_1.next(); !data_1_1.done; data_1_1 = data_1.next()) {
+                var byte = data_1_1.value;
+                this.checksum =
+                    (this.checksum >>> 8) ^ lookupTable[(this.checksum ^ byte) & 0xff];
+            }
+        }
+        catch (e_1_1) { e_1 = { error: e_1_1 }; }
+        finally {
+            try {
+                if (data_1_1 && !data_1_1.done && (_a = data_1.return)) _a.call(data_1);
+            }
+            finally { if (e_1) throw e_1.error; }
+        }
+        return this;
+    };
+    Crc32.prototype.digest = function () {
+        return (this.checksum ^ 0xffffffff) >>> 0;
+    };
+    return Crc32;
+}());
+// prettier-ignore
+var a_lookUpTable = [
+    0x00000000, 0x77073096, 0xEE0E612C, 0x990951BA,
+    0x076DC419, 0x706AF48F, 0xE963A535, 0x9E6495A3,
+    0x0EDB8832, 0x79DCB8A4, 0xE0D5E91E, 0x97D2D988,
+    0x09B64C2B, 0x7EB17CBD, 0xE7B82D07, 0x90BF1D91,
+    0x1DB71064, 0x6AB020F2, 0xF3B97148, 0x84BE41DE,
+    0x1ADAD47D, 0x6DDDE4EB, 0xF4D4B551, 0x83D385C7,
+    0x136C9856, 0x646BA8C0, 0xFD62F97A, 0x8A65C9EC,
+    0x14015C4F, 0x63066CD9, 0xFA0F3D63, 0x8D080DF5,
+    0x3B6E20C8, 0x4C69105E, 0xD56041E4, 0xA2677172,
+    0x3C03E4D1, 0x4B04D447, 0xD20D85FD, 0xA50AB56B,
+    0x35B5A8FA, 0x42B2986C, 0xDBBBC9D6, 0xACBCF940,
+    0x32D86CE3, 0x45DF5C75, 0xDCD60DCF, 0xABD13D59,
+    0x26D930AC, 0x51DE003A, 0xC8D75180, 0xBFD06116,
+    0x21B4F4B5, 0x56B3C423, 0xCFBA9599, 0xB8BDA50F,
+    0x2802B89E, 0x5F058808, 0xC60CD9B2, 0xB10BE924,
+    0x2F6F7C87, 0x58684C11, 0xC1611DAB, 0xB6662D3D,
+    0x76DC4190, 0x01DB7106, 0x98D220BC, 0xEFD5102A,
+    0x71B18589, 0x06B6B51F, 0x9FBFE4A5, 0xE8B8D433,
+    0x7807C9A2, 0x0F00F934, 0x9609A88E, 0xE10E9818,
+    0x7F6A0DBB, 0x086D3D2D, 0x91646C97, 0xE6635C01,
+    0x6B6B51F4, 0x1C6C6162, 0x856530D8, 0xF262004E,
+    0x6C0695ED, 0x1B01A57B, 0x8208F4C1, 0xF50FC457,
+    0x65B0D9C6, 0x12B7E950, 0x8BBEB8EA, 0xFCB9887C,
+    0x62DD1DDF, 0x15DA2D49, 0x8CD37CF3, 0xFBD44C65,
+    0x4DB26158, 0x3AB551CE, 0xA3BC0074, 0xD4BB30E2,
+    0x4ADFA541, 0x3DD895D7, 0xA4D1C46D, 0xD3D6F4FB,
+    0x4369E96A, 0x346ED9FC, 0xAD678846, 0xDA60B8D0,
+    0x44042D73, 0x33031DE5, 0xAA0A4C5F, 0xDD0D7CC9,
+    0x5005713C, 0x270241AA, 0xBE0B1010, 0xC90C2086,
+    0x5768B525, 0x206F85B3, 0xB966D409, 0xCE61E49F,
+    0x5EDEF90E, 0x29D9C998, 0xB0D09822, 0xC7D7A8B4,
+    0x59B33D17, 0x2EB40D81, 0xB7BD5C3B, 0xC0BA6CAD,
+    0xEDB88320, 0x9ABFB3B6, 0x03B6E20C, 0x74B1D29A,
+    0xEAD54739, 0x9DD277AF, 0x04DB2615, 0x73DC1683,
+    0xE3630B12, 0x94643B84, 0x0D6D6A3E, 0x7A6A5AA8,
+    0xE40ECF0B, 0x9309FF9D, 0x0A00AE27, 0x7D079EB1,
+    0xF00F9344, 0x8708A3D2, 0x1E01F268, 0x6906C2FE,
+    0xF762575D, 0x806567CB, 0x196C3671, 0x6E6B06E7,
+    0xFED41B76, 0x89D32BE0, 0x10DA7A5A, 0x67DD4ACC,
+    0xF9B9DF6F, 0x8EBEEFF9, 0x17B7BE43, 0x60B08ED5,
+    0xD6D6A3E8, 0xA1D1937E, 0x38D8C2C4, 0x4FDFF252,
+    0xD1BB67F1, 0xA6BC5767, 0x3FB506DD, 0x48B2364B,
+    0xD80D2BDA, 0xAF0A1B4C, 0x36034AF6, 0x41047A60,
+    0xDF60EFC3, 0xA867DF55, 0x316E8EEF, 0x4669BE79,
+    0xCB61B38C, 0xBC66831A, 0x256FD2A0, 0x5268E236,
+    0xCC0C7795, 0xBB0B4703, 0x220216B9, 0x5505262F,
+    0xC5BA3BBE, 0xB2BD0B28, 0x2BB45A92, 0x5CB36A04,
+    0xC2D7FFA7, 0xB5D0CF31, 0x2CD99E8B, 0x5BDEAE1D,
+    0x9B64C2B0, 0xEC63F226, 0x756AA39C, 0x026D930A,
+    0x9C0906A9, 0xEB0E363F, 0x72076785, 0x05005713,
+    0x95BF4A82, 0xE2B87A14, 0x7BB12BAE, 0x0CB61B38,
+    0x92D28E9B, 0xE5D5BE0D, 0x7CDCEFB7, 0x0BDBDF21,
+    0x86D3D2D4, 0xF1D4E242, 0x68DDB3F8, 0x1FDA836E,
+    0x81BE16CD, 0xF6B9265B, 0x6FB077E1, 0x18B74777,
+    0x88085AE6, 0xFF0F6A70, 0x66063BCA, 0x11010B5C,
+    0x8F659EFF, 0xF862AE69, 0x616BFFD3, 0x166CCF45,
+    0xA00AE278, 0xD70DD2EE, 0x4E048354, 0x3903B3C2,
+    0xA7672661, 0xD06016F7, 0x4969474D, 0x3E6E77DB,
+    0xAED16A4A, 0xD9D65ADC, 0x40DF0B66, 0x37D83BF0,
+    0xA9BCAE53, 0xDEBB9EC5, 0x47B2CF7F, 0x30B5FFE9,
+    0xBDBDF21C, 0xCABAC28A, 0x53B39330, 0x24B4A3A6,
+    0xBAD03605, 0xCDD70693, 0x54DE5729, 0x23D967BF,
+    0xB3667A2E, 0xC4614AB8, 0x5D681B02, 0x2A6F2B94,
+    0xB40BBE37, 0xC30C8EA1, 0x5A05DF1B, 0x2D02EF8D,
+];
+var lookupTable = uint32ArrayFrom(a_lookUpTable);
+
+class NodeCrc32 {
+    checksum = 0;
+    update(data) {
+        this.checksum = zlib.crc32(data, this.checksum);
+    }
+    async digest() {
+        return numToUint8(this.checksum);
+    }
+    reset() {
+        this.checksum = 0;
+    }
+}
+const getCrc32ChecksumAlgorithmFunction = () => {
+    if (typeof zlib.crc32 === "undefined") {
+        return AwsCrc32;
+    }
+    return NodeCrc32;
+};
+
+const selectChecksumAlgorithmFunction = (checksumAlgorithm, config) => {
+    switch (checksumAlgorithm) {
+        case ChecksumAlgorithm.MD5:
+            return config.md5;
+        case ChecksumAlgorithm.CRC32:
+            return getCrc32ChecksumAlgorithmFunction();
+        case ChecksumAlgorithm.CRC32C:
+            return AwsCrc32c;
+        case ChecksumAlgorithm.CRC64NVME:
+            {
+                return Crc64Nvme;
+            }
+        case ChecksumAlgorithm.SHA1:
+            return config.sha1;
+        case ChecksumAlgorithm.SHA256:
+            return config.sha256;
+        default:
+            throw new Error(`Unsupported checksum algorithm: ${checksumAlgorithm}`);
+    }
+};
+
+const stringHasher = (checksumAlgorithmFn, body) => {
+    const hash = new checksumAlgorithmFn();
+    hash.update(toUint8Array(body || ""));
+    return hash.digest();
+};
+
+const flexibleChecksumsMiddlewareOptions = {
+    name: "flexibleChecksumsMiddleware",
+    step: "build",
+    tags: ["BODY_CHECKSUM"],
+    override: true,
+};
+const flexibleChecksumsMiddleware = (config, middlewareConfig) => (next, context) => async (args) => {
+    if (!HttpRequest$1.isInstance(args.request)) {
+        return next(args);
+    }
+    if (hasHeaderWithPrefix("x-amz-checksum-", args.request.headers)) {
+        return next(args);
+    }
+    const { request, input } = args;
+    const { body: requestBody, headers } = request;
+    const { base64Encoder, streamHasher } = config;
+    const { requestChecksumRequired, requestAlgorithmMember } = middlewareConfig;
+    const requestChecksumCalculation = await config.requestChecksumCalculation();
+    const requestAlgorithmMemberName = requestAlgorithmMember?.name;
+    const requestAlgorithmMemberHttpHeader = requestAlgorithmMember?.httpHeader;
+    if (requestAlgorithmMemberName && !input[requestAlgorithmMemberName]) {
+        if (requestChecksumCalculation === RequestChecksumCalculation.WHEN_SUPPORTED || requestChecksumRequired) {
+            input[requestAlgorithmMemberName] = DEFAULT_CHECKSUM_ALGORITHM;
+            if (requestAlgorithmMemberHttpHeader) {
+                headers[requestAlgorithmMemberHttpHeader] = DEFAULT_CHECKSUM_ALGORITHM;
+            }
         }
     }
-    else {
-        if (credentialDefaultProvider) {
-            credentialsProvider = normalizeProvider(credentialDefaultProvider(Object.assign({}, config, {
-                parentClientConfig: config,
-            })));
+    const checksumAlgorithm = getChecksumAlgorithmForRequest(input, {
+        requestChecksumRequired,
+        requestAlgorithmMember: requestAlgorithmMember?.name,
+        requestChecksumCalculation,
+    });
+    let updatedBody = requestBody;
+    let updatedHeaders = headers;
+    if (checksumAlgorithm) {
+        switch (checksumAlgorithm) {
+            case ChecksumAlgorithm.CRC32:
+                setFeature$1(context, "FLEXIBLE_CHECKSUMS_REQ_CRC32", "U");
+                break;
+            case ChecksumAlgorithm.CRC32C:
+                setFeature$1(context, "FLEXIBLE_CHECKSUMS_REQ_CRC32C", "V");
+                break;
+            case ChecksumAlgorithm.CRC64NVME:
+                setFeature$1(context, "FLEXIBLE_CHECKSUMS_REQ_CRC64", "W");
+                break;
+            case ChecksumAlgorithm.SHA1:
+                setFeature$1(context, "FLEXIBLE_CHECKSUMS_REQ_SHA1", "X");
+                break;
+            case ChecksumAlgorithm.SHA256:
+                setFeature$1(context, "FLEXIBLE_CHECKSUMS_REQ_SHA256", "Y");
+                break;
         }
-        else {
-            credentialsProvider = async () => {
-                throw new Error("@aws-sdk/core::resolveAwsSdkSigV4Config - `credentials` not provided and no credentialDefaultProvider was configured.");
+        const checksumLocationName = getChecksumLocationName(checksumAlgorithm);
+        const checksumAlgorithmFn = selectChecksumAlgorithmFunction(checksumAlgorithm, config);
+        if (isStreaming(requestBody)) {
+            const { getAwsChunkedEncodingStream, bodyLengthChecker } = config;
+            updatedBody = getAwsChunkedEncodingStream(typeof config.requestStreamBufferSize === "number" && config.requestStreamBufferSize >= 8 * 1024
+                ? createBufferedReadable(requestBody, config.requestStreamBufferSize, context.logger)
+                : requestBody, {
+                base64Encoder,
+                bodyLengthChecker,
+                checksumLocationName,
+                checksumAlgorithmFn,
+                streamHasher,
+            });
+            updatedHeaders = {
+                ...headers,
+                "content-encoding": headers["content-encoding"]
+                    ? `${headers["content-encoding"]},aws-chunked`
+                    : "aws-chunked",
+                "transfer-encoding": "chunked",
+                "x-amz-decoded-content-length": headers["content-length"],
+                "x-amz-content-sha256": "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+                "x-amz-trailer": checksumLocationName,
+            };
+            delete updatedHeaders["content-length"];
+        }
+        else if (!hasHeader(checksumLocationName, headers)) {
+            const rawChecksum = await stringHasher(checksumAlgorithmFn, requestBody);
+            updatedHeaders = {
+                ...headers,
+                [checksumLocationName]: base64Encoder(rawChecksum),
             };
         }
     }
-    credentialsProvider.memoized = true;
-    return credentialsProvider;
-}
-function bindCallerConfig(config, credentialsProvider) {
-    if (credentialsProvider.configBound) {
-        return credentialsProvider;
+    try {
+        const result = await next({
+            ...args,
+            request: {
+                ...request,
+                headers: updatedHeaders,
+                body: updatedBody,
+            },
+        });
+        return result;
     }
-    const fn = async (options) => credentialsProvider({ ...options, callerClientConfig: config });
-    fn.memoized = credentialsProvider.memoized;
-    fn.configBound = true;
-    return fn;
+    catch (e) {
+        if (e instanceof Error && e.name === "InvalidChunkSizeError") {
+            try {
+                if (!e.message.endsWith(".")) {
+                    e.message += ".";
+                }
+                e.message +=
+                    " Set [requestStreamBufferSize=number e.g. 65_536] in client constructor to instruct AWS SDK to buffer your input stream.";
+            }
+            catch (ignored) {
+            }
+        }
+        throw e;
+    }
+};
+
+const flexibleChecksumsInputMiddlewareOptions = {
+    name: "flexibleChecksumsInputMiddleware",
+    toMiddleware: "serializerMiddleware",
+    relation: "before",
+    tags: ["BODY_CHECKSUM"],
+    override: true,
+};
+const flexibleChecksumsInputMiddleware = (config, middlewareConfig) => (next, context) => async (args) => {
+    const input = args.input;
+    const { requestValidationModeMember } = middlewareConfig;
+    const requestChecksumCalculation = await config.requestChecksumCalculation();
+    const responseChecksumValidation = await config.responseChecksumValidation();
+    switch (requestChecksumCalculation) {
+        case RequestChecksumCalculation.WHEN_REQUIRED:
+            setFeature$1(context, "FLEXIBLE_CHECKSUMS_REQ_WHEN_REQUIRED", "a");
+            break;
+        case RequestChecksumCalculation.WHEN_SUPPORTED:
+            setFeature$1(context, "FLEXIBLE_CHECKSUMS_REQ_WHEN_SUPPORTED", "Z");
+            break;
+    }
+    switch (responseChecksumValidation) {
+        case ResponseChecksumValidation.WHEN_REQUIRED:
+            setFeature$1(context, "FLEXIBLE_CHECKSUMS_RES_WHEN_REQUIRED", "c");
+            break;
+        case ResponseChecksumValidation.WHEN_SUPPORTED:
+            setFeature$1(context, "FLEXIBLE_CHECKSUMS_RES_WHEN_SUPPORTED", "b");
+            break;
+    }
+    if (requestValidationModeMember && !input[requestValidationModeMember]) {
+        if (responseChecksumValidation === ResponseChecksumValidation.WHEN_SUPPORTED) {
+            input[requestValidationModeMember] = "ENABLED";
+        }
+    }
+    return next(args);
+};
+
+const getChecksumAlgorithmListForResponse = (responseAlgorithms = []) => {
+    const validChecksumAlgorithms = [];
+    for (const algorithm of PRIORITY_ORDER_ALGORITHMS) {
+        if (!responseAlgorithms.includes(algorithm) || !CLIENT_SUPPORTED_ALGORITHMS.includes(algorithm)) {
+            continue;
+        }
+        validChecksumAlgorithms.push(algorithm);
+    }
+    return validChecksumAlgorithms;
+};
+
+const isChecksumWithPartNumber = (checksum) => {
+    const lastHyphenIndex = checksum.lastIndexOf("-");
+    if (lastHyphenIndex !== -1) {
+        const numberPart = checksum.slice(lastHyphenIndex + 1);
+        if (!numberPart.startsWith("0")) {
+            const number = parseInt(numberPart, 10);
+            if (!isNaN(number) && number >= 1 && number <= 10000) {
+                return true;
+            }
+        }
+    }
+    return false;
+};
+
+const getChecksum = async (body, { checksumAlgorithmFn, base64Encoder }) => base64Encoder(await stringHasher(checksumAlgorithmFn, body));
+
+const validateChecksumFromResponse = async (response, { config, responseAlgorithms, logger }) => {
+    const checksumAlgorithms = getChecksumAlgorithmListForResponse(responseAlgorithms);
+    const { body: responseBody, headers: responseHeaders } = response;
+    for (const algorithm of checksumAlgorithms) {
+        const responseHeader = getChecksumLocationName(algorithm);
+        const checksumFromResponse = responseHeaders[responseHeader];
+        if (checksumFromResponse) {
+            let checksumAlgorithmFn;
+            try {
+                checksumAlgorithmFn = selectChecksumAlgorithmFunction(algorithm, config);
+            }
+            catch (error) {
+                if (algorithm === ChecksumAlgorithm.CRC64NVME) {
+                    logger?.warn(`Skipping ${ChecksumAlgorithm.CRC64NVME} checksum validation: ${error.message}`);
+                    continue;
+                }
+                throw error;
+            }
+            const { base64Encoder } = config;
+            if (isStreaming(responseBody)) {
+                response.body = createChecksumStream({
+                    expectedChecksum: checksumFromResponse,
+                    checksumSourceLocation: responseHeader,
+                    checksum: new checksumAlgorithmFn(),
+                    source: responseBody,
+                    base64Encoder,
+                });
+                return;
+            }
+            const checksum = await getChecksum(responseBody, { checksumAlgorithmFn, base64Encoder });
+            if (checksum === checksumFromResponse) {
+                break;
+            }
+            throw new Error(`Checksum mismatch: expected "${checksum}" but received "${checksumFromResponse}"` +
+                ` in response header "${responseHeader}".`);
+        }
+    }
+};
+
+const flexibleChecksumsResponseMiddlewareOptions = {
+    name: "flexibleChecksumsResponseMiddleware",
+    toMiddleware: "deserializerMiddleware",
+    relation: "after",
+    tags: ["BODY_CHECKSUM"],
+    override: true,
+};
+const flexibleChecksumsResponseMiddleware = (config, middlewareConfig) => (next, context) => async (args) => {
+    if (!HttpRequest$1.isInstance(args.request)) {
+        return next(args);
+    }
+    const input = args.input;
+    const result = await next(args);
+    const response = result.response;
+    const { requestValidationModeMember, responseAlgorithms } = middlewareConfig;
+    if (requestValidationModeMember && input[requestValidationModeMember] === "ENABLED") {
+        const { clientName, commandName } = context;
+        const isS3WholeObjectMultipartGetResponseChecksum = clientName === "S3Client" &&
+            commandName === "GetObjectCommand" &&
+            getChecksumAlgorithmListForResponse(responseAlgorithms).every((algorithm) => {
+                const responseHeader = getChecksumLocationName(algorithm);
+                const checksumFromResponse = response.headers[responseHeader];
+                return !checksumFromResponse || isChecksumWithPartNumber(checksumFromResponse);
+            });
+        if (isS3WholeObjectMultipartGetResponseChecksum) {
+            return result;
+        }
+        await validateChecksumFromResponse(response, {
+            config,
+            responseAlgorithms,
+            logger: context.logger,
+        });
+    }
+    return result;
+};
+
+const getFlexibleChecksumsPlugin = (config, middlewareConfig) => ({
+    applyToStack: (clientStack) => {
+        clientStack.add(flexibleChecksumsMiddleware(config, middlewareConfig), flexibleChecksumsMiddlewareOptions);
+        clientStack.addRelativeTo(flexibleChecksumsInputMiddleware(config, middlewareConfig), flexibleChecksumsInputMiddlewareOptions);
+        clientStack.addRelativeTo(flexibleChecksumsResponseMiddleware(config, middlewareConfig), flexibleChecksumsResponseMiddlewareOptions);
+    },
+});
+
+const getSmithyContext = (context) => context[SMITHY_CONTEXT_KEY] || (context[SMITHY_CONTEXT_KEY] = {});
+
+const normalizeProvider = (input) => {
+    if (typeof input === "function")
+        return input;
+    const promisified = Promise.resolve(input);
+    return () => promisified;
+};
+
+const resolveFlexibleChecksumsConfig = (input) => {
+    const { requestChecksumCalculation, responseChecksumValidation, requestStreamBufferSize } = input;
+    return Object.assign(input, {
+        requestChecksumCalculation: normalizeProvider(requestChecksumCalculation ?? DEFAULT_REQUEST_CHECKSUM_CALCULATION),
+        responseChecksumValidation: normalizeProvider(responseChecksumValidation ?? DEFAULT_RESPONSE_CHECKSUM_VALIDATION),
+        requestStreamBufferSize: Number(requestStreamBufferSize ?? 0),
+    });
+};
+
+function resolveHostHeaderConfig(input) {
+    return input;
 }
+const hostHeaderMiddleware = (options) => (next) => async (args) => {
+    if (!HttpRequest$1.isInstance(args.request))
+        return next(args);
+    const { request } = args;
+    const { handlerProtocol = "" } = options.requestHandler.metadata || {};
+    if (handlerProtocol.indexOf("h2") >= 0 && !request.headers[":authority"]) {
+        delete request.headers["host"];
+        request.headers[":authority"] = request.hostname + (request.port ? ":" + request.port : "");
+    }
+    else if (!request.headers["host"]) {
+        let host = request.hostname;
+        if (request.port != null)
+            host += `:${request.port}`;
+        request.headers["host"] = host;
+    }
+    return next(args);
+};
+const hostHeaderMiddlewareOptions = {
+    name: "hostHeaderMiddleware",
+    step: "build",
+    priority: "low",
+    tags: ["HOST"],
+    override: true,
+};
+const getHostHeaderPlugin = (options) => ({
+    applyToStack: (clientStack) => {
+        clientStack.add(hostHeaderMiddleware(options), hostHeaderMiddlewareOptions);
+    },
+});
+
+const loggerMiddleware = () => (next, context) => async (args) => {
+    try {
+        const response = await next(args);
+        const { clientName, commandName, logger, dynamoDbDocumentClientOptions = {} } = context;
+        const { overrideInputFilterSensitiveLog, overrideOutputFilterSensitiveLog } = dynamoDbDocumentClientOptions;
+        const inputFilterSensitiveLog = overrideInputFilterSensitiveLog ?? context.inputFilterSensitiveLog;
+        const outputFilterSensitiveLog = overrideOutputFilterSensitiveLog ?? context.outputFilterSensitiveLog;
+        const { $metadata, ...outputWithoutMetadata } = response.output;
+        logger?.info?.({
+            clientName,
+            commandName,
+            input: inputFilterSensitiveLog(args.input),
+            output: outputFilterSensitiveLog(outputWithoutMetadata),
+            metadata: $metadata,
+        });
+        return response;
+    }
+    catch (error) {
+        const { clientName, commandName, logger, dynamoDbDocumentClientOptions = {} } = context;
+        const { overrideInputFilterSensitiveLog } = dynamoDbDocumentClientOptions;
+        const inputFilterSensitiveLog = overrideInputFilterSensitiveLog ?? context.inputFilterSensitiveLog;
+        logger?.error?.({
+            clientName,
+            commandName,
+            input: inputFilterSensitiveLog(args.input),
+            error,
+            metadata: error.$metadata,
+        });
+        throw error;
+    }
+};
+const loggerMiddlewareOptions = {
+    name: "loggerMiddleware",
+    tags: ["LOGGER"],
+    step: "initialize",
+    override: true,
+};
+const getLoggerPlugin = (options) => ({
+    applyToStack: (clientStack) => {
+        clientStack.add(loggerMiddleware(), loggerMiddlewareOptions);
+    },
+});
+
+const recursionDetectionMiddlewareOptions = {
+    step: "build",
+    tags: ["RECURSION_DETECTION"],
+    name: "recursionDetectionMiddleware",
+    override: true,
+    priority: "low",
+};
+
+const PROTECTED_KEYS = {
+    REQUEST_ID: Symbol.for("_AWS_LAMBDA_REQUEST_ID"),
+    X_RAY_TRACE_ID: Symbol.for("_AWS_LAMBDA_X_RAY_TRACE_ID"),
+    TENANT_ID: Symbol.for("_AWS_LAMBDA_TENANT_ID"),
+};
+const NO_GLOBAL_AWS_LAMBDA = ["true", "1"].includes(process.env?.AWS_LAMBDA_NODEJS_NO_GLOBAL_AWSLAMBDA ?? "");
+if (!NO_GLOBAL_AWS_LAMBDA) {
+    globalThis.awslambda = globalThis.awslambda || {};
+}
+class InvokeStoreBase {
+    static PROTECTED_KEYS = PROTECTED_KEYS;
+    isProtectedKey(key) {
+        return Object.values(PROTECTED_KEYS).includes(key);
+    }
+    getRequestId() {
+        return this.get(PROTECTED_KEYS.REQUEST_ID) ?? "-";
+    }
+    getXRayTraceId() {
+        return this.get(PROTECTED_KEYS.X_RAY_TRACE_ID);
+    }
+    getTenantId() {
+        return this.get(PROTECTED_KEYS.TENANT_ID);
+    }
+}
+class InvokeStoreSingle extends InvokeStoreBase {
+    currentContext;
+    getContext() {
+        return this.currentContext;
+    }
+    hasContext() {
+        return this.currentContext !== undefined;
+    }
+    get(key) {
+        return this.currentContext?.[key];
+    }
+    set(key, value) {
+        if (this.isProtectedKey(key)) {
+            throw new Error(`Cannot modify protected Lambda context field: ${String(key)}`);
+        }
+        this.currentContext = this.currentContext || {};
+        this.currentContext[key] = value;
+    }
+    run(context, fn) {
+        this.currentContext = context;
+        return fn();
+    }
+}
+class InvokeStoreMulti extends InvokeStoreBase {
+    als;
+    static async create() {
+        const instance = new InvokeStoreMulti();
+        const asyncHooks = await import('node:async_hooks');
+        instance.als = new asyncHooks.AsyncLocalStorage();
+        return instance;
+    }
+    getContext() {
+        return this.als.getStore();
+    }
+    hasContext() {
+        return this.als.getStore() !== undefined;
+    }
+    get(key) {
+        return this.als.getStore()?.[key];
+    }
+    set(key, value) {
+        if (this.isProtectedKey(key)) {
+            throw new Error(`Cannot modify protected Lambda context field: ${String(key)}`);
+        }
+        const store = this.als.getStore();
+        if (!store) {
+            throw new Error("No context available");
+        }
+        store[key] = value;
+    }
+    run(context, fn) {
+        return this.als.run(context, fn);
+    }
+}
+var InvokeStore;
+(function (InvokeStore) {
+    let instance = null;
+    async function getInstanceAsync() {
+        if (!instance) {
+            instance = (async () => {
+                const isMulti = "AWS_LAMBDA_MAX_CONCURRENCY" in process.env;
+                const newInstance = isMulti
+                    ? await InvokeStoreMulti.create()
+                    : new InvokeStoreSingle();
+                if (!NO_GLOBAL_AWS_LAMBDA && globalThis.awslambda?.InvokeStore) {
+                    return globalThis.awslambda.InvokeStore;
+                }
+                else if (!NO_GLOBAL_AWS_LAMBDA && globalThis.awslambda) {
+                    globalThis.awslambda.InvokeStore = newInstance;
+                    return newInstance;
+                }
+                else {
+                    return newInstance;
+                }
+            })();
+        }
+        return instance;
+    }
+    InvokeStore.getInstanceAsync = getInstanceAsync;
+    InvokeStore._testing = process.env.AWS_LAMBDA_BENCHMARK_MODE === "1"
+        ? {
+            reset: () => {
+                instance = null;
+                if (globalThis.awslambda?.InvokeStore) {
+                    delete globalThis.awslambda.InvokeStore;
+                }
+                globalThis.awslambda = { InvokeStore: undefined };
+            },
+        }
+        : undefined;
+})(InvokeStore || (InvokeStore = {}));
+
+const TRACE_ID_HEADER_NAME = "X-Amzn-Trace-Id";
+const ENV_LAMBDA_FUNCTION_NAME = "AWS_LAMBDA_FUNCTION_NAME";
+const ENV_TRACE_ID = "_X_AMZN_TRACE_ID";
+const recursionDetectionMiddleware = () => (next) => async (args) => {
+    const { request } = args;
+    if (!HttpRequest$1.isInstance(request)) {
+        return next(args);
+    }
+    const traceIdHeader = Object.keys(request.headers ?? {}).find((h) => h.toLowerCase() === TRACE_ID_HEADER_NAME.toLowerCase()) ??
+        TRACE_ID_HEADER_NAME;
+    if (request.headers.hasOwnProperty(traceIdHeader)) {
+        return next(args);
+    }
+    const functionName = process.env[ENV_LAMBDA_FUNCTION_NAME];
+    const traceIdFromEnv = process.env[ENV_TRACE_ID];
+    const invokeStore = await InvokeStore.getInstanceAsync();
+    const traceIdFromInvokeStore = invokeStore?.getXRayTraceId();
+    const traceId = traceIdFromInvokeStore ?? traceIdFromEnv;
+    const nonEmptyString = (str) => typeof str === "string" && str.length > 0;
+    if (nonEmptyString(functionName) && nonEmptyString(traceId)) {
+        request.headers[TRACE_ID_HEADER_NAME] = traceId;
+    }
+    return next({
+        ...args,
+        request,
+    });
+};
+
+const getRecursionDetectionPlugin = (options) => ({
+    applyToStack: (clientStack) => {
+        clientStack.add(recursionDetectionMiddleware(), recursionDetectionMiddlewareOptions);
+    },
+});
 
 const getAllAliases = (name, aliases) => {
     const _aliases = [];
@@ -9344,19 +14173,6 @@ class ServiceException extends Error {
         return false;
     }
 }
-const decorateServiceException = (exception, additions = {}) => {
-    Object.entries(additions)
-        .filter(([, v]) => v !== undefined)
-        .forEach(([k, v]) => {
-        if (exception[k] == undefined || exception[k] === "") {
-            exception[k] = v;
-        }
-    });
-    const message = exception.message || exception.Message || "UnknownError";
-    exception.message = message;
-    delete exception.Message;
-    return exception;
-};
 
 const loadConfigsForDefaultMode = (mode) => {
     switch (mode) {
@@ -9444,19 +14260,6 @@ const resolveDefaultRuntimeConfig = (config) => {
     return Object.assign(resolveChecksumRuntimeConfig(config), resolveRetryRuntimeConfig(config));
 };
 
-const getValueFromTextNode = (obj) => {
-    const textNodeName = "#text";
-    for (const key in obj) {
-        if (obj.hasOwnProperty(key) && obj[key][textNodeName] !== undefined) {
-            obj[key] = obj[key][textNodeName];
-        }
-        else if (typeof obj[key] === "object" && obj[key] !== null) {
-            obj[key] = getValueFromTextNode(obj[key]);
-        }
-    }
-    return obj;
-};
-
 class NoOpLogger {
     trace() { }
     debug() { }
@@ -9465,4474 +14268,12 @@ class NoOpLogger {
     error() { }
 }
 
-class ProtocolLib {
-    queryCompat;
-    constructor(queryCompat = false) {
-        this.queryCompat = queryCompat;
-    }
-    resolveRestContentType(defaultContentType, inputSchema) {
-        const members = inputSchema.getMemberSchemas();
-        const httpPayloadMember = Object.values(members).find((m) => {
-            return !!m.getMergedTraits().httpPayload;
-        });
-        if (httpPayloadMember) {
-            const mediaType = httpPayloadMember.getMergedTraits().mediaType;
-            if (mediaType) {
-                return mediaType;
-            }
-            else if (httpPayloadMember.isStringSchema()) {
-                return "text/plain";
-            }
-            else if (httpPayloadMember.isBlobSchema()) {
-                return "application/octet-stream";
-            }
-            else {
-                return defaultContentType;
-            }
-        }
-        else if (!inputSchema.isUnitSchema()) {
-            const hasBody = Object.values(members).find((m) => {
-                const { httpQuery, httpQueryParams, httpHeader, httpLabel, httpPrefixHeaders } = m.getMergedTraits();
-                const noPrefixHeaders = httpPrefixHeaders === void 0;
-                return !httpQuery && !httpQueryParams && !httpHeader && !httpLabel && noPrefixHeaders;
-            });
-            if (hasBody) {
-                return defaultContentType;
-            }
-        }
-    }
-    async getErrorSchemaOrThrowBaseException(errorIdentifier, defaultNamespace, response, dataObject, metadata, getErrorSchema) {
-        let namespace = defaultNamespace;
-        let errorName = errorIdentifier;
-        if (errorIdentifier.includes("#")) {
-            [namespace, errorName] = errorIdentifier.split("#");
-        }
-        const errorMetadata = {
-            $metadata: metadata,
-            $fault: response.statusCode < 500 ? "client" : "server",
-        };
-        const registry = TypeRegistry.for(namespace);
-        try {
-            const errorSchema = getErrorSchema?.(registry, errorName) ?? registry.getSchema(errorIdentifier);
-            return { errorSchema, errorMetadata };
-        }
-        catch (e) {
-            dataObject.message = dataObject.message ?? dataObject.Message ?? "UnknownError";
-            const synthetic = TypeRegistry.for("smithy.ts.sdk.synthetic." + namespace);
-            const baseExceptionSchema = synthetic.getBaseException();
-            if (baseExceptionSchema) {
-                const ErrorCtor = synthetic.getErrorCtor(baseExceptionSchema) ?? Error;
-                throw this.decorateServiceException(Object.assign(new ErrorCtor({ name: errorName }), errorMetadata), dataObject);
-            }
-            throw this.decorateServiceException(Object.assign(new Error(errorName), errorMetadata), dataObject);
-        }
-    }
-    decorateServiceException(exception, additions = {}) {
-        if (this.queryCompat) {
-            const msg = exception.Message ?? additions.Message;
-            const error = decorateServiceException(exception, additions);
-            if (msg) {
-                error.message = msg;
-            }
-            error.Error = {
-                ...error.Error,
-                Type: error.Error.Type,
-                Code: error.Error.Code,
-                Message: error.Error.message ?? error.Error.Message ?? msg,
-            };
-            const reqId = error.$metadata.requestId;
-            if (reqId) {
-                error.RequestId = reqId;
-            }
-            return error;
-        }
-        return decorateServiceException(exception, additions);
-    }
-    setQueryCompatError(output, response) {
-        const queryErrorHeader = response.headers?.["x-amzn-query-error"];
-        if (output !== undefined && queryErrorHeader != null) {
-            const [Code, Type] = queryErrorHeader.split(";");
-            const entries = Object.entries(output);
-            const Error = {
-                Code,
-                Type,
-            };
-            Object.assign(output, Error);
-            for (const [k, v] of entries) {
-                Error[k === "message" ? "Message" : k] = v;
-            }
-            delete Error.__type;
-            output.Error = Error;
-        }
-    }
-    queryCompatOutput(queryCompatErrorData, errorData) {
-        if (queryCompatErrorData.Error) {
-            errorData.Error = queryCompatErrorData.Error;
-        }
-        if (queryCompatErrorData.Type) {
-            errorData.Type = queryCompatErrorData.Type;
-        }
-        if (queryCompatErrorData.Code) {
-            errorData.Code = queryCompatErrorData.Code;
-        }
-    }
-    findQueryCompatibleError(registry, errorName) {
-        try {
-            return registry.getSchema(errorName);
-        }
-        catch (e) {
-            return registry.find((schema) => NormalizedSchema.of(schema).getMergedTraits().awsQueryError?.[0] === errorName);
-        }
-    }
-}
-
-class SerdeContextConfig {
-    serdeContext;
-    setSerdeContext(serdeContext) {
-        this.serdeContext = serdeContext;
-    }
-}
-
-function* serializingStructIterator(ns, sourceObject) {
-    if (ns.isUnitSchema()) {
-        return;
-    }
-    const struct = ns.getSchema();
-    for (let i = 0; i < struct[4].length; ++i) {
-        const key = struct[4][i];
-        const memberSchema = struct[5][i];
-        const memberNs = new NormalizedSchema([memberSchema, 0], key);
-        if (!(key in sourceObject) && !memberNs.isIdempotencyToken()) {
-            continue;
-        }
-        yield [key, memberNs];
-    }
-}
-function* deserializingStructIterator(ns, sourceObject, nameTrait) {
-    if (ns.isUnitSchema()) {
-        return;
-    }
-    const struct = ns.getSchema();
-    let keysRemaining = Object.keys(sourceObject).filter((k) => k !== "__type").length;
-    for (let i = 0; i < struct[4].length; ++i) {
-        if (keysRemaining === 0) {
-            break;
-        }
-        const key = struct[4][i];
-        const memberSchema = struct[5][i];
-        const memberNs = new NormalizedSchema([memberSchema, 0], key);
-        let serializationKey = key;
-        if (nameTrait) {
-            serializationKey = memberNs.getMergedTraits()[nameTrait] ?? key;
-        }
-        if (!(serializationKey in sourceObject)) {
-            continue;
-        }
-        yield [key, memberNs];
-        keysRemaining -= 1;
-    }
-}
-
-class UnionSerde {
-    from;
-    to;
-    keys;
-    constructor(from, to) {
-        this.from = from;
-        this.to = to;
-        this.keys = new Set(Object.keys(this.from).filter((k) => k !== "__type"));
-    }
-    mark(key) {
-        this.keys.delete(key);
-    }
-    hasUnknown() {
-        return this.keys.size === 1 && Object.keys(this.to).length === 0;
-    }
-    writeUnknown() {
-        if (this.hasUnknown()) {
-            const k = this.keys.values().next().value;
-            const v = this.from[k];
-            this.to.$unknown = [k, v];
-        }
-    }
-}
-
-function jsonReviver(key, value, context) {
-    if (context?.source) {
-        const numericString = context.source;
-        if (typeof value === "number") {
-            if (value > Number.MAX_SAFE_INTEGER || value < Number.MIN_SAFE_INTEGER || numericString !== String(value)) {
-                const isFractional = numericString.includes(".");
-                if (isFractional) {
-                    return new NumericValue(numericString, "bigDecimal");
-                }
-                else {
-                    return BigInt(numericString);
-                }
-            }
-        }
-    }
-    return value;
-}
-
-const collectBodyString = (streamBody, context) => collectBody$1(streamBody, context).then((body) => (context?.utf8Encoder ?? toUtf8)(body));
-
-const parseJsonBody = (streamBody, context) => collectBodyString(streamBody, context).then((encoded) => {
-    if (encoded.length) {
-        try {
-            return JSON.parse(encoded);
-        }
-        catch (e) {
-            if (e?.name === "SyntaxError") {
-                Object.defineProperty(e, "$responseBodyText", {
-                    value: encoded,
-                });
-            }
-            throw e;
-        }
-    }
-    return {};
-});
-const loadRestJsonErrorCode = (output, data) => {
-    const findKey = (object, key) => Object.keys(object).find((k) => k.toLowerCase() === key.toLowerCase());
-    const sanitizeErrorCode = (rawValue) => {
-        let cleanValue = rawValue;
-        if (typeof cleanValue === "number") {
-            cleanValue = cleanValue.toString();
-        }
-        if (cleanValue.indexOf(",") >= 0) {
-            cleanValue = cleanValue.split(",")[0];
-        }
-        if (cleanValue.indexOf(":") >= 0) {
-            cleanValue = cleanValue.split(":")[0];
-        }
-        if (cleanValue.indexOf("#") >= 0) {
-            cleanValue = cleanValue.split("#")[1];
-        }
-        return cleanValue;
-    };
-    const headerKey = findKey(output.headers, "x-amzn-errortype");
-    if (headerKey !== undefined) {
-        return sanitizeErrorCode(output.headers[headerKey]);
-    }
-    if (data && typeof data === "object") {
-        const codeKey = findKey(data, "code");
-        if (codeKey && data[codeKey] !== undefined) {
-            return sanitizeErrorCode(data[codeKey]);
-        }
-        if (data["__type"] !== undefined) {
-            return sanitizeErrorCode(data["__type"]);
-        }
-    }
-};
-
-class JsonShapeDeserializer extends SerdeContextConfig {
-    settings;
-    constructor(settings) {
-        super();
-        this.settings = settings;
-    }
-    async read(schema, data) {
-        return this._read(schema, typeof data === "string" ? JSON.parse(data, jsonReviver) : await parseJsonBody(data, this.serdeContext));
-    }
-    readObject(schema, data) {
-        return this._read(schema, data);
-    }
-    _read(schema, value) {
-        const isObject = value !== null && typeof value === "object";
-        const ns = NormalizedSchema.of(schema);
-        if (isObject) {
-            if (ns.isStructSchema()) {
-                const record = value;
-                const union = ns.isUnionSchema();
-                const out = {};
-                let nameMap = void 0;
-                const { jsonName } = this.settings;
-                if (jsonName) {
-                    nameMap = {};
-                }
-                let unionSerde;
-                if (union) {
-                    unionSerde = new UnionSerde(record, out);
-                }
-                for (const [memberName, memberSchema] of deserializingStructIterator(ns, record, jsonName ? "jsonName" : false)) {
-                    let fromKey = memberName;
-                    if (jsonName) {
-                        fromKey = memberSchema.getMergedTraits().jsonName ?? fromKey;
-                        nameMap[fromKey] = memberName;
-                    }
-                    if (union) {
-                        unionSerde.mark(fromKey);
-                    }
-                    if (record[fromKey] != null) {
-                        out[memberName] = this._read(memberSchema, record[fromKey]);
-                    }
-                }
-                if (union) {
-                    unionSerde.writeUnknown();
-                }
-                else if (typeof record.__type === "string") {
-                    for (const [k, v] of Object.entries(record)) {
-                        const t = jsonName ? nameMap[k] ?? k : k;
-                        if (!(t in out)) {
-                            out[t] = v;
-                        }
-                    }
-                }
-                return out;
-            }
-            if (Array.isArray(value) && ns.isListSchema()) {
-                const listMember = ns.getValueSchema();
-                const out = [];
-                const sparse = !!ns.getMergedTraits().sparse;
-                for (const item of value) {
-                    if (sparse || item != null) {
-                        out.push(this._read(listMember, item));
-                    }
-                }
-                return out;
-            }
-            if (ns.isMapSchema()) {
-                const mapMember = ns.getValueSchema();
-                const out = {};
-                const sparse = !!ns.getMergedTraits().sparse;
-                for (const [_k, _v] of Object.entries(value)) {
-                    if (sparse || _v != null) {
-                        out[_k] = this._read(mapMember, _v);
-                    }
-                }
-                return out;
-            }
-        }
-        if (ns.isBlobSchema() && typeof value === "string") {
-            return fromBase64(value);
-        }
-        const mediaType = ns.getMergedTraits().mediaType;
-        if (ns.isStringSchema() && typeof value === "string" && mediaType) {
-            const isJson = mediaType === "application/json" || mediaType.endsWith("+json");
-            if (isJson) {
-                return LazyJsonString.from(value);
-            }
-            return value;
-        }
-        if (ns.isTimestampSchema() && value != null) {
-            const format = determineTimestampFormat(ns, this.settings);
-            switch (format) {
-                case 5:
-                    return parseRfc3339DateTimeWithOffset(value);
-                case 6:
-                    return parseRfc7231DateTime(value);
-                case 7:
-                    return parseEpochTimestamp(value);
-                default:
-                    console.warn("Missing timestamp format, parsing value with Date constructor:", value);
-                    return new Date(value);
-            }
-        }
-        if (ns.isBigIntegerSchema() && (typeof value === "number" || typeof value === "string")) {
-            return BigInt(value);
-        }
-        if (ns.isBigDecimalSchema() && value != undefined) {
-            if (value instanceof NumericValue) {
-                return value;
-            }
-            const untyped = value;
-            if (untyped.type === "bigDecimal" && "string" in untyped) {
-                return new NumericValue(untyped.string, untyped.type);
-            }
-            return new NumericValue(String(value), "bigDecimal");
-        }
-        if (ns.isNumericSchema() && typeof value === "string") {
-            switch (value) {
-                case "Infinity":
-                    return Infinity;
-                case "-Infinity":
-                    return -Infinity;
-                case "NaN":
-                    return NaN;
-            }
-            return value;
-        }
-        if (ns.isDocumentSchema()) {
-            if (isObject) {
-                const out = Array.isArray(value) ? [] : {};
-                for (const [k, v] of Object.entries(value)) {
-                    if (v instanceof NumericValue) {
-                        out[k] = v;
-                    }
-                    else {
-                        out[k] = this._read(ns, v);
-                    }
-                }
-                return out;
-            }
-            else {
-                return structuredClone(value);
-            }
-        }
-        return value;
-    }
-}
-
-const NUMERIC_CONTROL_CHAR = String.fromCharCode(925);
-class JsonReplacer {
-    values = new Map();
-    counter = 0;
-    stage = 0;
-    createReplacer() {
-        if (this.stage === 1) {
-            throw new Error("@aws-sdk/core/protocols - JsonReplacer already created.");
-        }
-        if (this.stage === 2) {
-            throw new Error("@aws-sdk/core/protocols - JsonReplacer exhausted.");
-        }
-        this.stage = 1;
-        return (key, value) => {
-            if (value instanceof NumericValue) {
-                const v = `${NUMERIC_CONTROL_CHAR + "nv" + this.counter++}_` + value.string;
-                this.values.set(`"${v}"`, value.string);
-                return v;
-            }
-            if (typeof value === "bigint") {
-                const s = value.toString();
-                const v = `${NUMERIC_CONTROL_CHAR + "b" + this.counter++}_` + s;
-                this.values.set(`"${v}"`, s);
-                return v;
-            }
-            return value;
-        };
-    }
-    replaceInJson(json) {
-        if (this.stage === 0) {
-            throw new Error("@aws-sdk/core/protocols - JsonReplacer not created yet.");
-        }
-        if (this.stage === 2) {
-            throw new Error("@aws-sdk/core/protocols - JsonReplacer exhausted.");
-        }
-        this.stage = 2;
-        if (this.counter === 0) {
-            return json;
-        }
-        for (const [key, value] of this.values) {
-            json = json.replace(key, value);
-        }
-        return json;
-    }
-}
-
-class JsonShapeSerializer extends SerdeContextConfig {
-    settings;
-    buffer;
-    useReplacer = false;
-    rootSchema;
-    constructor(settings) {
-        super();
-        this.settings = settings;
-    }
-    write(schema, value) {
-        this.rootSchema = NormalizedSchema.of(schema);
-        this.buffer = this._write(this.rootSchema, value);
-    }
-    writeDiscriminatedDocument(schema, value) {
-        this.write(schema, value);
-        if (typeof this.buffer === "object") {
-            this.buffer.__type = NormalizedSchema.of(schema).getName(true);
-        }
-    }
-    flush() {
-        const { rootSchema, useReplacer } = this;
-        this.rootSchema = undefined;
-        this.useReplacer = false;
-        if (rootSchema?.isStructSchema() || rootSchema?.isDocumentSchema()) {
-            if (!useReplacer) {
-                return JSON.stringify(this.buffer);
-            }
-            const replacer = new JsonReplacer();
-            return replacer.replaceInJson(JSON.stringify(this.buffer, replacer.createReplacer(), 0));
-        }
-        return this.buffer;
-    }
-    _write(schema, value, container) {
-        const isObject = value !== null && typeof value === "object";
-        const ns = NormalizedSchema.of(schema);
-        if (isObject) {
-            if (ns.isStructSchema()) {
-                const record = value;
-                const out = {};
-                const { jsonName } = this.settings;
-                let nameMap = void 0;
-                if (jsonName) {
-                    nameMap = {};
-                }
-                for (const [memberName, memberSchema] of serializingStructIterator(ns, record)) {
-                    const serializableValue = this._write(memberSchema, record[memberName], ns);
-                    if (serializableValue !== undefined) {
-                        let targetKey = memberName;
-                        if (jsonName) {
-                            targetKey = memberSchema.getMergedTraits().jsonName ?? memberName;
-                            nameMap[memberName] = targetKey;
-                        }
-                        out[targetKey] = serializableValue;
-                    }
-                }
-                if (ns.isUnionSchema() && Object.keys(out).length === 0) {
-                    const { $unknown } = record;
-                    if (Array.isArray($unknown)) {
-                        const [k, v] = $unknown;
-                        out[k] = this._write(15, v);
-                    }
-                }
-                else if (typeof record.__type === "string") {
-                    for (const [k, v] of Object.entries(record)) {
-                        const targetKey = jsonName ? nameMap[k] ?? k : k;
-                        if (!(targetKey in out)) {
-                            out[targetKey] = this._write(15, v);
-                        }
-                    }
-                }
-                return out;
-            }
-            if (Array.isArray(value) && ns.isListSchema()) {
-                const listMember = ns.getValueSchema();
-                const out = [];
-                const sparse = !!ns.getMergedTraits().sparse;
-                for (const item of value) {
-                    if (sparse || item != null) {
-                        out.push(this._write(listMember, item));
-                    }
-                }
-                return out;
-            }
-            if (ns.isMapSchema()) {
-                const mapMember = ns.getValueSchema();
-                const out = {};
-                const sparse = !!ns.getMergedTraits().sparse;
-                for (const [_k, _v] of Object.entries(value)) {
-                    if (sparse || _v != null) {
-                        out[_k] = this._write(mapMember, _v);
-                    }
-                }
-                return out;
-            }
-            if (value instanceof Uint8Array && (ns.isBlobSchema() || ns.isDocumentSchema())) {
-                if (ns === this.rootSchema) {
-                    return value;
-                }
-                return (this.serdeContext?.base64Encoder ?? toBase64)(value);
-            }
-            if (value instanceof Date && (ns.isTimestampSchema() || ns.isDocumentSchema())) {
-                const format = determineTimestampFormat(ns, this.settings);
-                switch (format) {
-                    case 5:
-                        return value.toISOString().replace(".000Z", "Z");
-                    case 6:
-                        return dateToUtcString(value);
-                    case 7:
-                        return value.getTime() / 1000;
-                    default:
-                        console.warn("Missing timestamp format, using epoch seconds", value);
-                        return value.getTime() / 1000;
-                }
-            }
-            if (value instanceof NumericValue) {
-                this.useReplacer = true;
-            }
-        }
-        if (value === null && container?.isStructSchema()) {
-            return void 0;
-        }
-        if (ns.isStringSchema()) {
-            if (typeof value === "undefined" && ns.isIdempotencyToken()) {
-                return v4();
-            }
-            const mediaType = ns.getMergedTraits().mediaType;
-            if (value != null && mediaType) {
-                const isJson = mediaType === "application/json" || mediaType.endsWith("+json");
-                if (isJson) {
-                    return LazyJsonString.from(value);
-                }
-            }
-            return value;
-        }
-        if (typeof value === "number" && ns.isNumericSchema()) {
-            if (Math.abs(value) === Infinity || isNaN(value)) {
-                return String(value);
-            }
-            return value;
-        }
-        if (typeof value === "string" && ns.isBlobSchema()) {
-            if (ns === this.rootSchema) {
-                return value;
-            }
-            return (this.serdeContext?.base64Encoder ?? toBase64)(value);
-        }
-        if (typeof value === "bigint") {
-            this.useReplacer = true;
-        }
-        if (ns.isDocumentSchema()) {
-            if (isObject) {
-                const out = Array.isArray(value) ? [] : {};
-                for (const [k, v] of Object.entries(value)) {
-                    if (v instanceof NumericValue) {
-                        this.useReplacer = true;
-                        out[k] = v;
-                    }
-                    else {
-                        out[k] = this._write(ns, v);
-                    }
-                }
-                return out;
-            }
-            else {
-                return structuredClone(value);
-            }
-        }
-        return value;
-    }
-}
-
-class JsonCodec extends SerdeContextConfig {
-    settings;
-    constructor(settings) {
-        super();
-        this.settings = settings;
-    }
-    createSerializer() {
-        const serializer = new JsonShapeSerializer(this.settings);
-        serializer.setSerdeContext(this.serdeContext);
-        return serializer;
-    }
-    createDeserializer() {
-        const deserializer = new JsonShapeDeserializer(this.settings);
-        deserializer.setSerdeContext(this.serdeContext);
-        return deserializer;
-    }
-}
-
-class AwsRestJsonProtocol extends HttpBindingProtocol {
-    serializer;
-    deserializer;
-    codec;
-    mixin = new ProtocolLib();
-    constructor({ defaultNamespace }) {
-        super({
-            defaultNamespace,
-        });
-        const settings = {
-            timestampFormat: {
-                useTrait: true,
-                default: 7,
-            },
-            httpBindings: true,
-            jsonName: true,
-        };
-        this.codec = new JsonCodec(settings);
-        this.serializer = new HttpInterceptingShapeSerializer(this.codec.createSerializer(), settings);
-        this.deserializer = new HttpInterceptingShapeDeserializer(this.codec.createDeserializer(), settings);
-    }
-    getShapeId() {
-        return "aws.protocols#restJson1";
-    }
-    getPayloadCodec() {
-        return this.codec;
-    }
-    setSerdeContext(serdeContext) {
-        this.codec.setSerdeContext(serdeContext);
-        super.setSerdeContext(serdeContext);
-    }
-    async serializeRequest(operationSchema, input, context) {
-        const request = await super.serializeRequest(operationSchema, input, context);
-        const inputSchema = NormalizedSchema.of(operationSchema.input);
-        if (!request.headers["content-type"]) {
-            const contentType = this.mixin.resolveRestContentType(this.getDefaultContentType(), inputSchema);
-            if (contentType) {
-                request.headers["content-type"] = contentType;
-            }
-        }
-        if (request.body == null && request.headers["content-type"] === this.getDefaultContentType()) {
-            request.body = "{}";
-        }
-        return request;
-    }
-    async deserializeResponse(operationSchema, context, response) {
-        const output = await super.deserializeResponse(operationSchema, context, response);
-        const outputSchema = NormalizedSchema.of(operationSchema.output);
-        for (const [name, member] of outputSchema.structIterator()) {
-            if (member.getMemberTraits().httpPayload && !(name in output)) {
-                output[name] = null;
-            }
-        }
-        return output;
-    }
-    async handleError(operationSchema, context, response, dataObject, metadata) {
-        const errorIdentifier = loadRestJsonErrorCode(response, dataObject) ?? "Unknown";
-        const { errorSchema, errorMetadata } = await this.mixin.getErrorSchemaOrThrowBaseException(errorIdentifier, this.options.defaultNamespace, response, dataObject, metadata);
-        const ns = NormalizedSchema.of(errorSchema);
-        const message = dataObject.message ?? dataObject.Message ?? "Unknown";
-        const ErrorCtor = TypeRegistry.for(errorSchema[1]).getErrorCtor(errorSchema) ?? Error;
-        const exception = new ErrorCtor(message);
-        await this.deserializeHttpMessage(errorSchema, context, response, dataObject);
-        const output = {};
-        for (const [name, member] of ns.structIterator()) {
-            const target = member.getMergedTraits().jsonName ?? name;
-            output[name] = this.codec.createDeserializer().readObject(member, dataObject[target]);
-        }
-        throw this.mixin.decorateServiceException(Object.assign(exception, errorMetadata, {
-            $fault: ns.getMergedTraits().error,
-            message,
-        }, output), dataObject);
-    }
-    getDefaultContentType() {
-        return "application/json";
-    }
-}
-
-function escapeAttribute(value) {
-    return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-}
-
-function escapeElement(value) {
-    return value
-        .replace(/&/g, "&amp;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&apos;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/\r/g, "&#x0D;")
-        .replace(/\n/g, "&#x0A;")
-        .replace(/\u0085/g, "&#x85;")
-        .replace(/\u2028/, "&#x2028;");
-}
-
-class XmlText {
-    value;
-    constructor(value) {
-        this.value = value;
-    }
-    toString() {
-        return escapeElement("" + this.value);
-    }
-}
-
-let XmlNode$1 = class XmlNode {
-    name;
-    children;
-    attributes = {};
-    static of(name, childText, withName) {
-        const node = new XmlNode(name);
-        if (childText !== undefined) {
-            node.addChildNode(new XmlText(childText));
-        }
-        if (withName !== undefined) {
-            node.withName(withName);
-        }
-        return node;
-    }
-    constructor(name, children = []) {
-        this.name = name;
-        this.children = children;
-    }
-    withName(name) {
-        this.name = name;
-        return this;
-    }
-    addAttribute(name, value) {
-        this.attributes[name] = value;
-        return this;
-    }
-    addChildNode(child) {
-        this.children.push(child);
-        return this;
-    }
-    removeAttribute(name) {
-        delete this.attributes[name];
-        return this;
-    }
-    n(name) {
-        this.name = name;
-        return this;
-    }
-    c(child) {
-        this.children.push(child);
-        return this;
-    }
-    a(name, value) {
-        if (value != null) {
-            this.attributes[name] = value;
-        }
-        return this;
-    }
-    cc(input, field, withName = field) {
-        if (input[field] != null) {
-            const node = XmlNode.of(field, input[field]).withName(withName);
-            this.c(node);
-        }
-    }
-    l(input, listName, memberName, valueProvider) {
-        if (input[listName] != null) {
-            const nodes = valueProvider();
-            nodes.map((node) => {
-                node.withName(memberName);
-                this.c(node);
-            });
-        }
-    }
-    lc(input, listName, memberName, valueProvider) {
-        if (input[listName] != null) {
-            const nodes = valueProvider();
-            const containerNode = new XmlNode(memberName);
-            nodes.map((node) => {
-                containerNode.c(node);
-            });
-            this.c(containerNode);
-        }
-    }
-    toString() {
-        const hasChildren = Boolean(this.children.length);
-        let xmlText = `<${this.name}`;
-        const attributes = this.attributes;
-        for (const attributeName of Object.keys(attributes)) {
-            const attribute = attributes[attributeName];
-            if (attribute != null) {
-                xmlText += ` ${attributeName}="${escapeAttribute("" + attribute)}"`;
-            }
-        }
-        return (xmlText += !hasChildren ? "/>" : `>${this.children.map((c) => c.toString()).join("")}</${this.name}>`);
-    }
-};
-
-const nameStartChar = ':A-Za-z_\\u00C0-\\u00D6\\u00D8-\\u00F6\\u00F8-\\u02FF\\u0370-\\u037D\\u037F-\\u1FFF\\u200C-\\u200D\\u2070-\\u218F\\u2C00-\\u2FEF\\u3001-\\uD7FF\\uF900-\\uFDCF\\uFDF0-\\uFFFD';
-const nameChar = nameStartChar + '\\-.\\d\\u00B7\\u0300-\\u036F\\u203F-\\u2040';
-const nameRegexp = '[' + nameStartChar + '][' + nameChar + ']*';
-const regexName = new RegExp('^' + nameRegexp + '$');
-
-function getAllMatches(string, regex) {
-  const matches = [];
-  let match = regex.exec(string);
-  while (match) {
-    const allmatches = [];
-    allmatches.startIndex = regex.lastIndex - match[0].length;
-    const len = match.length;
-    for (let index = 0; index < len; index++) {
-      allmatches.push(match[index]);
-    }
-    matches.push(allmatches);
-    match = regex.exec(string);
-  }
-  return matches;
-}
-
-const isName = function(string) {
-  const match = regexName.exec(string);
-  return !(match === null || typeof match === 'undefined');
-};
-
-function isExist(v) {
-  return typeof v !== 'undefined';
-}
-
-// const fakeCall = function(a) {return a;};
-// const fakeCallNoReturn = function() {};
-
-const defaultOptions$1 = {
-  allowBooleanAttributes: false, //A tag can have attributes without any value
-  unpairedTags: []
-};
-
-//const tagsPattern = new RegExp("<\\/?([\\w:\\-_\.]+)\\s*\/?>","g");
-function validate$1(xmlData, options) {
-  options = Object.assign({}, defaultOptions$1, options);
-
-  //xmlData = xmlData.replace(/(\r\n|\n|\r)/gm,"");//make it single line
-  //xmlData = xmlData.replace(/(^\s*<\?xml.*?\?>)/g,"");//Remove XML starting tag
-  //xmlData = xmlData.replace(/(<!DOCTYPE[\s\w\"\.\/\-\:]+(\[.*\])*\s*>)/g,"");//Remove DOCTYPE
-  const tags = [];
-  let tagFound = false;
-
-  //indicates that the root tag has been closed (aka. depth 0 has been reached)
-  let reachedRoot = false;
-
-  if (xmlData[0] === '\ufeff') {
-    // check for byte order mark (BOM)
-    xmlData = xmlData.substr(1);
-  }
-  
-  for (let i = 0; i < xmlData.length; i++) {
-
-    if (xmlData[i] === '<' && xmlData[i+1] === '?') {
-      i+=2;
-      i = readPI(xmlData,i);
-      if (i.err) return i;
-    }else if (xmlData[i] === '<') {
-      //starting of tag
-      //read until you reach to '>' avoiding any '>' in attribute value
-      let tagStartPos = i;
-      i++;
-      
-      if (xmlData[i] === '!') {
-        i = readCommentAndCDATA(xmlData, i);
-        continue;
-      } else {
-        let closingTag = false;
-        if (xmlData[i] === '/') {
-          //closing tag
-          closingTag = true;
-          i++;
-        }
-        //read tagname
-        let tagName = '';
-        for (; i < xmlData.length &&
-          xmlData[i] !== '>' &&
-          xmlData[i] !== ' ' &&
-          xmlData[i] !== '\t' &&
-          xmlData[i] !== '\n' &&
-          xmlData[i] !== '\r'; i++
-        ) {
-          tagName += xmlData[i];
-        }
-        tagName = tagName.trim();
-        //console.log(tagName);
-
-        if (tagName[tagName.length - 1] === '/') {
-          //self closing tag without attributes
-          tagName = tagName.substring(0, tagName.length - 1);
-          //continue;
-          i--;
-        }
-        if (!validateTagName(tagName)) {
-          let msg;
-          if (tagName.trim().length === 0) {
-            msg = "Invalid space after '<'.";
-          } else {
-            msg = "Tag '"+tagName+"' is an invalid name.";
-          }
-          return getErrorObject('InvalidTag', msg, getLineNumberForPosition(xmlData, i));
-        }
-
-        const result = readAttributeStr(xmlData, i);
-        if (result === false) {
-          return getErrorObject('InvalidAttr', "Attributes for '"+tagName+"' have open quote.", getLineNumberForPosition(xmlData, i));
-        }
-        let attrStr = result.value;
-        i = result.index;
-
-        if (attrStr[attrStr.length - 1] === '/') {
-          //self closing tag
-          const attrStrStart = i - attrStr.length;
-          attrStr = attrStr.substring(0, attrStr.length - 1);
-          const isValid = validateAttributeString(attrStr, options);
-          if (isValid === true) {
-            tagFound = true;
-            //continue; //text may presents after self closing tag
-          } else {
-            //the result from the nested function returns the position of the error within the attribute
-            //in order to get the 'true' error line, we need to calculate the position where the attribute begins (i - attrStr.length) and then add the position within the attribute
-            //this gives us the absolute index in the entire xml, which we can use to find the line at last
-            return getErrorObject(isValid.err.code, isValid.err.msg, getLineNumberForPosition(xmlData, attrStrStart + isValid.err.line));
-          }
-        } else if (closingTag) {
-          if (!result.tagClosed) {
-            return getErrorObject('InvalidTag', "Closing tag '"+tagName+"' doesn't have proper closing.", getLineNumberForPosition(xmlData, i));
-          } else if (attrStr.trim().length > 0) {
-            return getErrorObject('InvalidTag', "Closing tag '"+tagName+"' can't have attributes or invalid starting.", getLineNumberForPosition(xmlData, tagStartPos));
-          } else if (tags.length === 0) {
-            return getErrorObject('InvalidTag', "Closing tag '"+tagName+"' has not been opened.", getLineNumberForPosition(xmlData, tagStartPos));
-          } else {
-            const otg = tags.pop();
-            if (tagName !== otg.tagName) {
-              let openPos = getLineNumberForPosition(xmlData, otg.tagStartPos);
-              return getErrorObject('InvalidTag',
-                "Expected closing tag '"+otg.tagName+"' (opened in line "+openPos.line+", col "+openPos.col+") instead of closing tag '"+tagName+"'.",
-                getLineNumberForPosition(xmlData, tagStartPos));
-            }
-
-            //when there are no more tags, we reached the root level.
-            if (tags.length == 0) {
-              reachedRoot = true;
-            }
-          }
-        } else {
-          const isValid = validateAttributeString(attrStr, options);
-          if (isValid !== true) {
-            //the result from the nested function returns the position of the error within the attribute
-            //in order to get the 'true' error line, we need to calculate the position where the attribute begins (i - attrStr.length) and then add the position within the attribute
-            //this gives us the absolute index in the entire xml, which we can use to find the line at last
-            return getErrorObject(isValid.err.code, isValid.err.msg, getLineNumberForPosition(xmlData, i - attrStr.length + isValid.err.line));
-          }
-
-          //if the root level has been reached before ...
-          if (reachedRoot === true) {
-            return getErrorObject('InvalidXml', 'Multiple possible root nodes found.', getLineNumberForPosition(xmlData, i));
-          } else if(options.unpairedTags.indexOf(tagName) !== -1); else {
-            tags.push({tagName, tagStartPos});
-          }
-          tagFound = true;
-        }
-
-        //skip tag text value
-        //It may include comments and CDATA value
-        for (i++; i < xmlData.length; i++) {
-          if (xmlData[i] === '<') {
-            if (xmlData[i + 1] === '!') {
-              //comment or CADATA
-              i++;
-              i = readCommentAndCDATA(xmlData, i);
-              continue;
-            } else if (xmlData[i+1] === '?') {
-              i = readPI(xmlData, ++i);
-              if (i.err) return i;
-            } else {
-              break;
-            }
-          } else if (xmlData[i] === '&') {
-            const afterAmp = validateAmpersand(xmlData, i);
-            if (afterAmp == -1)
-              return getErrorObject('InvalidChar', "char '&' is not expected.", getLineNumberForPosition(xmlData, i));
-            i = afterAmp;
-          }else {
-            if (reachedRoot === true && !isWhiteSpace(xmlData[i])) {
-              return getErrorObject('InvalidXml', "Extra text at the end", getLineNumberForPosition(xmlData, i));
-            }
-          }
-        } //end of reading tag text value
-        if (xmlData[i] === '<') {
-          i--;
-        }
-      }
-    } else {
-      if ( isWhiteSpace(xmlData[i])) {
-        continue;
-      }
-      return getErrorObject('InvalidChar', "char '"+xmlData[i]+"' is not expected.", getLineNumberForPosition(xmlData, i));
-    }
-  }
-
-  if (!tagFound) {
-    return getErrorObject('InvalidXml', 'Start tag expected.', 1);
-  }else if (tags.length == 1) {
-      return getErrorObject('InvalidTag', "Unclosed tag '"+tags[0].tagName+"'.", getLineNumberForPosition(xmlData, tags[0].tagStartPos));
-  }else if (tags.length > 0) {
-      return getErrorObject('InvalidXml', "Invalid '"+
-          JSON.stringify(tags.map(t => t.tagName), null, 4).replace(/\r?\n/g, '')+
-          "' found.", {line: 1, col: 1});
-  }
-
-  return true;
-}
-function isWhiteSpace(char){
-  return char === ' ' || char === '\t' || char === '\n'  || char === '\r';
-}
-/**
- * Read Processing insstructions and skip
- * @param {*} xmlData
- * @param {*} i
- */
-function readPI(xmlData, i) {
-  const start = i;
-  for (; i < xmlData.length; i++) {
-    if (xmlData[i] == '?' || xmlData[i] == ' ') {
-      //tagname
-      const tagname = xmlData.substr(start, i - start);
-      if (i > 5 && tagname === 'xml') {
-        return getErrorObject('InvalidXml', 'XML declaration allowed only at the start of the document.', getLineNumberForPosition(xmlData, i));
-      } else if (xmlData[i] == '?' && xmlData[i + 1] == '>') {
-        //check if valid attribut string
-        i++;
-        break;
-      } else {
-        continue;
-      }
-    }
-  }
-  return i;
-}
-
-function readCommentAndCDATA(xmlData, i) {
-  if (xmlData.length > i + 5 && xmlData[i + 1] === '-' && xmlData[i + 2] === '-') {
-    //comment
-    for (i += 3; i < xmlData.length; i++) {
-      if (xmlData[i] === '-' && xmlData[i + 1] === '-' && xmlData[i + 2] === '>') {
-        i += 2;
-        break;
-      }
-    }
-  } else if (
-    xmlData.length > i + 8 &&
-    xmlData[i + 1] === 'D' &&
-    xmlData[i + 2] === 'O' &&
-    xmlData[i + 3] === 'C' &&
-    xmlData[i + 4] === 'T' &&
-    xmlData[i + 5] === 'Y' &&
-    xmlData[i + 6] === 'P' &&
-    xmlData[i + 7] === 'E'
-  ) {
-    let angleBracketsCount = 1;
-    for (i += 8; i < xmlData.length; i++) {
-      if (xmlData[i] === '<') {
-        angleBracketsCount++;
-      } else if (xmlData[i] === '>') {
-        angleBracketsCount--;
-        if (angleBracketsCount === 0) {
-          break;
-        }
-      }
-    }
-  } else if (
-    xmlData.length > i + 9 &&
-    xmlData[i + 1] === '[' &&
-    xmlData[i + 2] === 'C' &&
-    xmlData[i + 3] === 'D' &&
-    xmlData[i + 4] === 'A' &&
-    xmlData[i + 5] === 'T' &&
-    xmlData[i + 6] === 'A' &&
-    xmlData[i + 7] === '['
-  ) {
-    for (i += 8; i < xmlData.length; i++) {
-      if (xmlData[i] === ']' && xmlData[i + 1] === ']' && xmlData[i + 2] === '>') {
-        i += 2;
-        break;
-      }
-    }
-  }
-
-  return i;
-}
-
-const doubleQuote = '"';
-const singleQuote = "'";
-
-/**
- * Keep reading xmlData until '<' is found outside the attribute value.
- * @param {string} xmlData
- * @param {number} i
- */
-function readAttributeStr(xmlData, i) {
-  let attrStr = '';
-  let startChar = '';
-  let tagClosed = false;
-  for (; i < xmlData.length; i++) {
-    if (xmlData[i] === doubleQuote || xmlData[i] === singleQuote) {
-      if (startChar === '') {
-        startChar = xmlData[i];
-      } else if (startChar !== xmlData[i]) ; else {
-        startChar = '';
-      }
-    } else if (xmlData[i] === '>') {
-      if (startChar === '') {
-        tagClosed = true;
-        break;
-      }
-    }
-    attrStr += xmlData[i];
-  }
-  if (startChar !== '') {
-    return false;
-  }
-
-  return {
-    value: attrStr,
-    index: i,
-    tagClosed: tagClosed
-  };
-}
-
-/**
- * Select all the attributes whether valid or invalid.
- */
-const validAttrStrRegxp = new RegExp('(\\s*)([^\\s=]+)(\\s*=)?(\\s*([\'"])(([\\s\\S])*?)\\5)?', 'g');
-
-//attr, ="sd", a="amit's", a="sd"b="saf", ab  cd=""
-
-function validateAttributeString(attrStr, options) {
-  //console.log("start:"+attrStr+":end");
-
-  //if(attrStr.trim().length === 0) return true; //empty string
-
-  const matches = getAllMatches(attrStr, validAttrStrRegxp);
-  const attrNames = {};
-
-  for (let i = 0; i < matches.length; i++) {
-    if (matches[i][1].length === 0) {
-      //nospace before attribute name: a="sd"b="saf"
-      return getErrorObject('InvalidAttr', "Attribute '"+matches[i][2]+"' has no space in starting.", getPositionFromMatch(matches[i]))
-    } else if (matches[i][3] !== undefined && matches[i][4] === undefined) {
-      return getErrorObject('InvalidAttr', "Attribute '"+matches[i][2]+"' is without value.", getPositionFromMatch(matches[i]));
-    } else if (matches[i][3] === undefined && !options.allowBooleanAttributes) {
-      //independent attribute: ab
-      return getErrorObject('InvalidAttr', "boolean attribute '"+matches[i][2]+"' is not allowed.", getPositionFromMatch(matches[i]));
-    }
-    /* else if(matches[i][6] === undefined){//attribute without value: ab=
-                    return { err: { code:"InvalidAttr",msg:"attribute " + matches[i][2] + " has no value assigned."}};
-                } */
-    const attrName = matches[i][2];
-    if (!validateAttrName(attrName)) {
-      return getErrorObject('InvalidAttr', "Attribute '"+attrName+"' is an invalid name.", getPositionFromMatch(matches[i]));
-    }
-    if (!attrNames.hasOwnProperty(attrName)) {
-      //check for duplicate attribute.
-      attrNames[attrName] = 1;
-    } else {
-      return getErrorObject('InvalidAttr', "Attribute '"+attrName+"' is repeated.", getPositionFromMatch(matches[i]));
-    }
-  }
-
-  return true;
-}
-
-function validateNumberAmpersand(xmlData, i) {
-  let re = /\d/;
-  if (xmlData[i] === 'x') {
-    i++;
-    re = /[\da-fA-F]/;
-  }
-  for (; i < xmlData.length; i++) {
-    if (xmlData[i] === ';')
-      return i;
-    if (!xmlData[i].match(re))
-      break;
-  }
-  return -1;
-}
-
-function validateAmpersand(xmlData, i) {
-  // https://www.w3.org/TR/xml/#dt-charref
-  i++;
-  if (xmlData[i] === ';')
-    return -1;
-  if (xmlData[i] === '#') {
-    i++;
-    return validateNumberAmpersand(xmlData, i);
-  }
-  let count = 0;
-  for (; i < xmlData.length; i++, count++) {
-    if (xmlData[i].match(/\w/) && count < 20)
-      continue;
-    if (xmlData[i] === ';')
-      break;
-    return -1;
-  }
-  return i;
-}
-
-function getErrorObject(code, message, lineNumber) {
-  return {
-    err: {
-      code: code,
-      msg: message,
-      line: lineNumber.line || lineNumber,
-      col: lineNumber.col,
-    },
-  };
-}
-
-function validateAttrName(attrName) {
-  return isName(attrName);
-}
-
-// const startsWithXML = /^xml/i;
-
-function validateTagName(tagname) {
-  return isName(tagname) /* && !tagname.match(startsWithXML) */;
-}
-
-//this function returns the line number for the character at the given index
-function getLineNumberForPosition(xmlData, index) {
-  const lines = xmlData.substring(0, index).split(/\r?\n/);
-  return {
-    line: lines.length,
-
-    // column number is last line's length + 1, because column numbering starts at 1:
-    col: lines[lines.length - 1].length + 1
-  };
-}
-
-//this function returns the position of the first character of match within attrStr
-function getPositionFromMatch(match) {
-  return match.startIndex + match[1].length;
-}
-
-const defaultOptions = {
-    preserveOrder: false,
-    attributeNamePrefix: '@_',
-    attributesGroupName: false,
-    textNodeName: '#text',
-    ignoreAttributes: true,
-    removeNSPrefix: false, // remove NS from tag name or attribute name if true
-    allowBooleanAttributes: false, //a tag can have attributes without any value
-    //ignoreRootElement : false,
-    parseTagValue: true,
-    parseAttributeValue: false,
-    trimValues: true, //Trim string values of tag and attributes
-    cdataPropName: false,
-    numberParseOptions: {
-      hex: true,
-      leadingZeros: true,
-      eNotation: true
-    },
-    tagValueProcessor: function(tagName, val) {
-      return val;
-    },
-    attributeValueProcessor: function(attrName, val) {
-      return val;
-    },
-    stopNodes: [], //nested tags will not be parsed even for errors
-    alwaysCreateTextNode: false,
-    isArray: () => false,
-    commentPropName: false,
-    unpairedTags: [],
-    processEntities: true,
-    htmlEntities: false,
-    ignoreDeclaration: false,
-    ignorePiTags: false,
-    transformTagName: false,
-    transformAttributeName: false,
-    updateTag: function(tagName, jPath, attrs){
-      return tagName
-    },
-    // skipEmptyListItem: false
-    captureMetaData: false,
-};
-   
-const buildOptions = function(options) {
-    return Object.assign({}, defaultOptions, options);
-};
-
-let METADATA_SYMBOL$1;
-
-if (typeof Symbol !== "function") {
-  METADATA_SYMBOL$1 = "@@xmlMetadata";
-} else {
-  METADATA_SYMBOL$1 = Symbol("XML Node Metadata");
-}
-
-class XmlNode{
-  constructor(tagname) {
-    this.tagname = tagname;
-    this.child = []; //nested tags, text, cdata, comments in order
-    this[":@"] = {}; //attributes map
-  }
-  add(key,val){
-    // this.child.push( {name : key, val: val, isCdata: isCdata });
-    if(key === "__proto__") key = "#__proto__";
-    this.child.push( {[key]: val });
-  }
-  addChild(node, startIndex) {
-    if(node.tagname === "__proto__") node.tagname = "#__proto__";
-    if(node[":@"] && Object.keys(node[":@"]).length > 0){
-      this.child.push( { [node.tagname]: node.child, [":@"]: node[":@"] });
-    }else {
-      this.child.push( { [node.tagname]: node.child });
-    }
-    // if requested, add the startIndex
-    if (startIndex !== undefined) {
-      // Note: for now we just overwrite the metadata. If we had more complex metadata,
-      // we might need to do an object append here:  metadata = { ...metadata, startIndex }
-      this.child[this.child.length - 1][METADATA_SYMBOL$1] = { startIndex };
-    }
-  }
-  /** symbol used for metadata */
-  static getMetaDataSymbol() {
-    return METADATA_SYMBOL$1;
-  }
-}
-
-//TODO: handle comments
-function readDocType(xmlData, i){
-    
-    const entities = {};
-    if( xmlData[i + 3] === 'O' &&
-         xmlData[i + 4] === 'C' &&
-         xmlData[i + 5] === 'T' &&
-         xmlData[i + 6] === 'Y' &&
-         xmlData[i + 7] === 'P' &&
-         xmlData[i + 8] === 'E')
-    {    
-        i = i+9;
-        let angleBracketsCount = 1;
-        let hasBody = false, comment = false;
-        let exp = "";
-        for(;i<xmlData.length;i++){
-            if (xmlData[i] === '<' && !comment) { //Determine the tag type
-                if( hasBody && hasSeq(xmlData, "!ENTITY",i)){
-                    i += 7; 
-                    let entityName, val;
-                    [entityName, val,i] = readEntityExp(xmlData,i+1);
-                    if(val.indexOf("&") === -1) //Parameter entities are not supported
-                        entities[ entityName ] = {
-                            regx : RegExp( `&${entityName};`,"g"),
-                            val: val
-                        };
-                }
-                else if( hasBody && hasSeq(xmlData, "!ELEMENT",i))  {
-                    i += 8;//Not supported
-                    const {index} = readElementExp(xmlData,i+1);
-                    i = index;
-                }else if( hasBody && hasSeq(xmlData, "!ATTLIST",i)){
-                    i += 8;//Not supported
-                    // const {index} = readAttlistExp(xmlData,i+1);
-                    // i = index;
-                }else if( hasBody && hasSeq(xmlData, "!NOTATION",i)) {
-                    i += 9;//Not supported
-                    const {index} = readNotationExp(xmlData,i+1);
-                    i = index;
-                }else if( hasSeq(xmlData, "!--",i) ) comment = true;
-                else throw new Error(`Invalid DOCTYPE`);
-
-                angleBracketsCount++;
-                exp = "";
-            } else if (xmlData[i] === '>') { //Read tag content
-                if(comment){
-                    if( xmlData[i - 1] === "-" && xmlData[i - 2] === "-"){
-                        comment = false;
-                        angleBracketsCount--;
-                    }
-                }else {
-                    angleBracketsCount--;
-                }
-                if (angleBracketsCount === 0) {
-                  break;
-                }
-            }else if( xmlData[i] === '['){
-                hasBody = true;
-            }else {
-                exp += xmlData[i];
-            }
-        }
-        if(angleBracketsCount !== 0){
-            throw new Error(`Unclosed DOCTYPE`);
-        }
-    }else {
-        throw new Error(`Invalid Tag instead of DOCTYPE`);
-    }
-    return {entities, i};
-}
-
-const skipWhitespace = (data, index) => {
-    while (index < data.length && /\s/.test(data[index])) {
-        index++;
-    }
-    return index;
-};
-
-function readEntityExp(xmlData, i) {    
-    //External entities are not supported
-    //    <!ENTITY ext SYSTEM "http://normal-website.com" >
-
-    //Parameter entities are not supported
-    //    <!ENTITY entityname "&anotherElement;">
-
-    //Internal entities are supported
-    //    <!ENTITY entityname "replacement text">
-
-    // Skip leading whitespace after <!ENTITY
-    i = skipWhitespace(xmlData, i);
-
-    // Read entity name
-    let entityName = "";
-    while (i < xmlData.length && !/\s/.test(xmlData[i]) && xmlData[i] !== '"' && xmlData[i] !== "'") {
-        entityName += xmlData[i];
-        i++;
-    }
-    validateEntityName(entityName);
-
-    // Skip whitespace after entity name
-    i = skipWhitespace(xmlData, i);
-
-    // Check for unsupported constructs (external entities or parameter entities)
-    if (xmlData.substring(i, i + 6).toUpperCase() === "SYSTEM") {
-        throw new Error("External entities are not supported");
-    }else if (xmlData[i] === "%") {
-        throw new Error("Parameter entities are not supported");
-    }
-
-    // Read entity value (internal entity)
-    let entityValue = "";
-    [i, entityValue] = readIdentifierVal(xmlData, i, "entity");
-    i--;
-    return [entityName, entityValue, i ];
-}
-
-function readNotationExp(xmlData, i) {
-    // Skip leading whitespace after <!NOTATION
-    i = skipWhitespace(xmlData, i);
-
-    // Read notation name
-    let notationName = "";
-    while (i < xmlData.length && !/\s/.test(xmlData[i])) {
-        notationName += xmlData[i];
-        i++;
-    }
-    validateEntityName(notationName);
-
-    // Skip whitespace after notation name
-    i = skipWhitespace(xmlData, i);
-
-    // Check identifier type (SYSTEM or PUBLIC)
-    const identifierType = xmlData.substring(i, i + 6).toUpperCase();
-    if (identifierType !== "SYSTEM" && identifierType !== "PUBLIC") {
-        throw new Error(`Expected SYSTEM or PUBLIC, found "${identifierType}"`);
-    }
-    i += identifierType.length;
-
-    // Skip whitespace after identifier type
-    i = skipWhitespace(xmlData, i);
-
-    // Read public identifier (if PUBLIC)
-    let publicIdentifier = null;
-    let systemIdentifier = null;
-
-    if (identifierType === "PUBLIC") {
-        [i, publicIdentifier ] = readIdentifierVal(xmlData, i, "publicIdentifier");
-
-        // Skip whitespace after public identifier
-        i = skipWhitespace(xmlData, i);
-
-        // Optionally read system identifier
-        if (xmlData[i] === '"' || xmlData[i] === "'") {
-            [i, systemIdentifier ] = readIdentifierVal(xmlData, i,"systemIdentifier");
-        }
-    } else if (identifierType === "SYSTEM") {
-        // Read system identifier (mandatory for SYSTEM)
-        [i, systemIdentifier ] = readIdentifierVal(xmlData, i, "systemIdentifier");
-
-        if (!systemIdentifier) {
-            throw new Error("Missing mandatory system identifier for SYSTEM notation");
-        }
-    }
-    
-    return {notationName, publicIdentifier, systemIdentifier, index: --i};
-}
-
-function readIdentifierVal(xmlData, i, type) {
-    let identifierVal = "";
-    const startChar = xmlData[i];
-    if (startChar !== '"' && startChar !== "'") {
-        throw new Error(`Expected quoted string, found "${startChar}"`);
-    }
-    i++;
-
-    while (i < xmlData.length && xmlData[i] !== startChar) {
-        identifierVal += xmlData[i];
-        i++;
-    }
-
-    if (xmlData[i] !== startChar) {
-        throw new Error(`Unterminated ${type} value`);
-    }
-    i++;
-    return [i, identifierVal];
-}
-
-function readElementExp(xmlData, i) {
-    // <!ELEMENT br EMPTY>
-    // <!ELEMENT div ANY>
-    // <!ELEMENT title (#PCDATA)>
-    // <!ELEMENT book (title, author+)>
-    // <!ELEMENT name (content-model)>
-    
-    // Skip leading whitespace after <!ELEMENT
-    i = skipWhitespace(xmlData, i);
-
-    // Read element name
-    let elementName = "";
-    while (i < xmlData.length && !/\s/.test(xmlData[i])) {
-        elementName += xmlData[i];
-        i++;
-    }
-
-    // Validate element name
-    if (!validateEntityName(elementName)) {
-        throw new Error(`Invalid element name: "${elementName}"`);
-    }
-
-    // Skip whitespace after element name
-    i = skipWhitespace(xmlData, i);
-    let contentModel = "";
-    // Expect '(' to start content model
-    if(xmlData[i] === "E" && hasSeq(xmlData, "MPTY",i)) i+=4;
-    else if(xmlData[i] === "A" && hasSeq(xmlData, "NY",i)) i+=2;
-    else if (xmlData[i] === "(") {
-        i++; // Move past '('
-
-        // Read content model
-        while (i < xmlData.length && xmlData[i] !== ")") {
-            contentModel += xmlData[i];
-            i++;
-        }
-        if (xmlData[i] !== ")") {
-            throw new Error("Unterminated content model");
-        }
-
-    }else {
-        throw new Error(`Invalid Element Expression, found "${xmlData[i]}"`);
-    }
-    
-    return {
-        elementName,
-        contentModel: contentModel.trim(),
-        index: i
-    };
-}
-
-function hasSeq(data, seq,i){
-    for(let j=0;j<seq.length;j++){
-        if(seq[j]!==data[i+j+1]) return false;
-    }
-    return true;
-}
-
-function validateEntityName(name){
-    if (isName(name))
-	return name;
-    else
-        throw new Error(`Invalid entity name ${name}`);
-}
-
-const hexRegex = /^[-+]?0x[a-fA-F0-9]+$/;
-const numRegex = /^([\-\+])?(0*)([0-9]*(\.[0-9]*)?)$/;
-// const octRegex = /^0x[a-z0-9]+/;
-// const binRegex = /0x[a-z0-9]+/;
-
- 
-const consider = {
-    hex :  true,
-    // oct: false,
-    leadingZeros: true,
-    decimalPoint: "\.",
-    eNotation: true,
-    //skipLike: /regex/
-};
-
-function toNumber(str, options = {}){
-    options = Object.assign({}, consider, options );
-    if(!str || typeof str !== "string" ) return str;
-    
-    let trimmedStr  = str.trim();
-    
-    if(options.skipLike !== undefined && options.skipLike.test(trimmedStr)) return str;
-    else if(str==="0") return 0;
-    else if (options.hex && hexRegex.test(trimmedStr)) {
-        return parse_int(trimmedStr, 16);
-    // }else if (options.oct && octRegex.test(str)) {
-    //     return Number.parseInt(val, 8);
-    }else if (trimmedStr.includes('e') || trimmedStr.includes('E')) { //eNotation
-        return resolveEnotation(str,trimmedStr,options);
-    // }else if (options.parseBin && binRegex.test(str)) {
-    //     return Number.parseInt(val, 2);
-    }else {
-        //separate negative sign, leading zeros, and rest number
-        const match = numRegex.exec(trimmedStr);
-        // +00.123 => [ , '+', '00', '.123', ..
-        if(match){
-            const sign = match[1] || "";
-            const leadingZeros = match[2];
-            let numTrimmedByZeros = trimZeros(match[3]); //complete num without leading zeros
-            const decimalAdjacentToLeadingZeros = sign ? // 0., -00., 000.
-                str[leadingZeros.length+1] === "." 
-                : str[leadingZeros.length] === ".";
-
-            //trim ending zeros for floating number
-            if(!options.leadingZeros //leading zeros are not allowed
-                && (leadingZeros.length > 1 
-                    || (leadingZeros.length === 1 && !decimalAdjacentToLeadingZeros))){
-                // 00, 00.3, +03.24, 03, 03.24
-                return str;
-            }
-            else {//no leading zeros or leading zeros are allowed
-                const num = Number(trimmedStr);
-                const parsedStr = String(num);
-
-                if( num === 0) return num;
-                if(parsedStr.search(/[eE]/) !== -1){ //given number is long and parsed to eNotation
-                    if(options.eNotation) return num;
-                    else return str;
-                }else if(trimmedStr.indexOf(".") !== -1){ //floating number
-                    if(parsedStr === "0") return num; //0.0
-                    else if(parsedStr === numTrimmedByZeros) return num; //0.456. 0.79000
-                    else if( parsedStr === `${sign}${numTrimmedByZeros}`) return num;
-                    else return str;
-                }
-                
-                let n = leadingZeros? numTrimmedByZeros : trimmedStr;
-                if(leadingZeros){
-                    // -009 => -9
-                    return (n === parsedStr) || (sign+n === parsedStr) ? num : str
-                }else  {
-                    // +9
-                    return (n === parsedStr) || (n === sign+parsedStr) ? num : str
-                }
-            }
-        }else { //non-numeric string
-            return str;
-        }
-    }
-}
-
-const eNotationRegx = /^([-+])?(0*)(\d*(\.\d*)?[eE][-\+]?\d+)$/;
-function resolveEnotation(str,trimmedStr,options){
-    if(!options.eNotation) return str;
-    const notation = trimmedStr.match(eNotationRegx); 
-    if(notation){
-        let sign = notation[1] || "";
-        const eChar = notation[3].indexOf("e") === -1 ? "E" : "e";
-        const leadingZeros = notation[2];
-        const eAdjacentToLeadingZeros = sign ? // 0E.
-            str[leadingZeros.length+1] === eChar 
-            : str[leadingZeros.length] === eChar;
-
-        if(leadingZeros.length > 1 && eAdjacentToLeadingZeros) return str;
-        else if(leadingZeros.length === 1 
-            && (notation[3].startsWith(`.${eChar}`) || notation[3][0] === eChar)){
-                return Number(trimmedStr);
-        }else if(options.leadingZeros && !eAdjacentToLeadingZeros){ //accept with leading zeros
-            //remove leading 0s
-            trimmedStr = (notation[1] || "") + notation[3];
-            return Number(trimmedStr);
-        }else return str;
-    }else {
-        return str;
-    }
-}
-
-/**
- * 
- * @param {string} numStr without leading zeros
- * @returns 
- */
-function trimZeros(numStr){
-    if(numStr && numStr.indexOf(".") !== -1){//float
-        numStr = numStr.replace(/0+$/, ""); //remove ending zeros
-        if(numStr === ".")  numStr = "0";
-        else if(numStr[0] === ".")  numStr = "0"+numStr;
-        else if(numStr[numStr.length-1] === ".")  numStr = numStr.substring(0,numStr.length-1);
-        return numStr;
-    }
-    return numStr;
-}
-
-function parse_int(numStr, base){
-    //polyfill
-    if(parseInt) return parseInt(numStr, base);
-    else if(Number.parseInt) return Number.parseInt(numStr, base);
-    else if(window && window.parseInt) return window.parseInt(numStr, base);
-    else throw new Error("parseInt, Number.parseInt, window.parseInt are not supported")
-}
-
-function getIgnoreAttributesFn(ignoreAttributes) {
-    if (typeof ignoreAttributes === 'function') {
-        return ignoreAttributes
-    }
-    if (Array.isArray(ignoreAttributes)) {
-        return (attrName) => {
-            for (const pattern of ignoreAttributes) {
-                if (typeof pattern === 'string' && attrName === pattern) {
-                    return true
-                }
-                if (pattern instanceof RegExp && pattern.test(attrName)) {
-                    return true
-                }
-            }
-        }
-    }
-    return () => false
-}
-
-// const regx =
-//   '<((!\\[CDATA\\[([\\s\\S]*?)(]]>))|((NAME:)?(NAME))([^>]*)>|((\\/)(NAME)\\s*>))([^<]*)'
-//   .replace(/NAME/g, util.nameRegexp);
-
-//const tagsRegx = new RegExp("<(\\/?[\\w:\\-\._]+)([^>]*)>(\\s*"+cdataRegx+")*([^<]+)?","g");
-//const tagsRegx = new RegExp("<(\\/?)((\\w*:)?([\\w:\\-\._]+))([^>]*)>([^<]*)("+cdataRegx+"([^<]*))*([^<]+)?","g");
-
-class OrderedObjParser{
-  constructor(options){
-    this.options = options;
-    this.currentNode = null;
-    this.tagsNodeStack = [];
-    this.docTypeEntities = {};
-    this.lastEntities = {
-      "apos" : { regex: /&(apos|#39|#x27);/g, val : "'"},
-      "gt" : { regex: /&(gt|#62|#x3E);/g, val : ">"},
-      "lt" : { regex: /&(lt|#60|#x3C);/g, val : "<"},
-      "quot" : { regex: /&(quot|#34|#x22);/g, val : "\""},
-    };
-    this.ampEntity = { regex: /&(amp|#38|#x26);/g, val : "&"};
-    this.htmlEntities = {
-      "space": { regex: /&(nbsp|#160);/g, val: " " },
-      // "lt" : { regex: /&(lt|#60);/g, val: "<" },
-      // "gt" : { regex: /&(gt|#62);/g, val: ">" },
-      // "amp" : { regex: /&(amp|#38);/g, val: "&" },
-      // "quot" : { regex: /&(quot|#34);/g, val: "\"" },
-      // "apos" : { regex: /&(apos|#39);/g, val: "'" },
-      "cent" : { regex: /&(cent|#162);/g, val: "¢" },
-      "pound" : { regex: /&(pound|#163);/g, val: "£" },
-      "yen" : { regex: /&(yen|#165);/g, val: "¥" },
-      "euro" : { regex: /&(euro|#8364);/g, val: "€" },
-      "copyright" : { regex: /&(copy|#169);/g, val: "©" },
-      "reg" : { regex: /&(reg|#174);/g, val: "®" },
-      "inr" : { regex: /&(inr|#8377);/g, val: "₹" },
-      "num_dec": { regex: /&#([0-9]{1,7});/g, val : (_, str) => String.fromCodePoint(Number.parseInt(str, 10)) },
-      "num_hex": { regex: /&#x([0-9a-fA-F]{1,6});/g, val : (_, str) => String.fromCodePoint(Number.parseInt(str, 16)) },
-    };
-    this.addExternalEntities = addExternalEntities;
-    this.parseXml = parseXml;
-    this.parseTextData = parseTextData;
-    this.resolveNameSpace = resolveNameSpace;
-    this.buildAttributesMap = buildAttributesMap;
-    this.isItStopNode = isItStopNode;
-    this.replaceEntitiesValue = replaceEntitiesValue;
-    this.readStopNodeData = readStopNodeData;
-    this.saveTextToParentTag = saveTextToParentTag;
-    this.addChild = addChild;
-    this.ignoreAttributesFn = getIgnoreAttributesFn(this.options.ignoreAttributes);
-  }
-
-}
-
-function addExternalEntities(externalEntities){
-  const entKeys = Object.keys(externalEntities);
-  for (let i = 0; i < entKeys.length; i++) {
-    const ent = entKeys[i];
-    this.lastEntities[ent] = {
-       regex: new RegExp("&"+ent+";","g"),
-       val : externalEntities[ent]
-    };
-  }
-}
-
-/**
- * @param {string} val
- * @param {string} tagName
- * @param {string} jPath
- * @param {boolean} dontTrim
- * @param {boolean} hasAttributes
- * @param {boolean} isLeafNode
- * @param {boolean} escapeEntities
- */
-function parseTextData(val, tagName, jPath, dontTrim, hasAttributes, isLeafNode, escapeEntities) {
-  if (val !== undefined) {
-    if (this.options.trimValues && !dontTrim) {
-      val = val.trim();
-    }
-    if(val.length > 0){
-      if(!escapeEntities) val = this.replaceEntitiesValue(val);
-      
-      const newval = this.options.tagValueProcessor(tagName, val, jPath, hasAttributes, isLeafNode);
-      if(newval === null || newval === undefined){
-        //don't parse
-        return val;
-      }else if(typeof newval !== typeof val || newval !== val){
-        //overwrite
-        return newval;
-      }else if(this.options.trimValues){
-        return parseValue(val, this.options.parseTagValue, this.options.numberParseOptions);
-      }else {
-        const trimmedVal = val.trim();
-        if(trimmedVal === val){
-          return parseValue(val, this.options.parseTagValue, this.options.numberParseOptions);
-        }else {
-          return val;
-        }
-      }
-    }
-  }
-}
-
-function resolveNameSpace(tagname) {
-  if (this.options.removeNSPrefix) {
-    const tags = tagname.split(':');
-    const prefix = tagname.charAt(0) === '/' ? '/' : '';
-    if (tags[0] === 'xmlns') {
-      return '';
-    }
-    if (tags.length === 2) {
-      tagname = prefix + tags[1];
-    }
-  }
-  return tagname;
-}
-
-//TODO: change regex to capture NS
-//const attrsRegx = new RegExp("([\\w\\-\\.\\:]+)\\s*=\\s*(['\"])((.|\n)*?)\\2","gm");
-const attrsRegx = new RegExp('([^\\s=]+)\\s*(=\\s*([\'"])([\\s\\S]*?)\\3)?', 'gm');
-
-function buildAttributesMap(attrStr, jPath, tagName) {
-  if (this.options.ignoreAttributes !== true && typeof attrStr === 'string') {
-    // attrStr = attrStr.replace(/\r?\n/g, ' ');
-    //attrStr = attrStr || attrStr.trim();
-
-    const matches = getAllMatches(attrStr, attrsRegx);
-    const len = matches.length; //don't make it inline
-    const attrs = {};
-    for (let i = 0; i < len; i++) {
-      const attrName = this.resolveNameSpace(matches[i][1]);
-      if (this.ignoreAttributesFn(attrName, jPath)) {
-        continue
-      }
-      let oldVal = matches[i][4];
-      let aName = this.options.attributeNamePrefix + attrName;
-      if (attrName.length) {
-        if (this.options.transformAttributeName) {
-          aName = this.options.transformAttributeName(aName);
-        }
-        if(aName === "__proto__") aName  = "#__proto__";
-        if (oldVal !== undefined) {
-          if (this.options.trimValues) {
-            oldVal = oldVal.trim();
-          }
-          oldVal = this.replaceEntitiesValue(oldVal);
-          const newVal = this.options.attributeValueProcessor(attrName, oldVal, jPath);
-          if(newVal === null || newVal === undefined){
-            //don't parse
-            attrs[aName] = oldVal;
-          }else if(typeof newVal !== typeof oldVal || newVal !== oldVal){
-            //overwrite
-            attrs[aName] = newVal;
-          }else {
-            //parse
-            attrs[aName] = parseValue(
-              oldVal,
-              this.options.parseAttributeValue,
-              this.options.numberParseOptions
-            );
-          }
-        } else if (this.options.allowBooleanAttributes) {
-          attrs[aName] = true;
-        }
-      }
-    }
-    if (!Object.keys(attrs).length) {
-      return;
-    }
-    if (this.options.attributesGroupName) {
-      const attrCollection = {};
-      attrCollection[this.options.attributesGroupName] = attrs;
-      return attrCollection;
-    }
-    return attrs
-  }
-}
-
-const parseXml = function(xmlData) {
-  xmlData = xmlData.replace(/\r\n?/g, "\n"); //TODO: remove this line
-  const xmlObj = new XmlNode('!xml');
-  let currentNode = xmlObj;
-  let textData = "";
-  let jPath = "";
-  for(let i=0; i< xmlData.length; i++){//for each char in XML data
-    const ch = xmlData[i];
-    if(ch === '<'){
-      // const nextIndex = i+1;
-      // const _2ndChar = xmlData[nextIndex];
-      if( xmlData[i+1] === '/') {//Closing Tag
-        const closeIndex = findClosingIndex(xmlData, ">", i, "Closing Tag is not closed.");
-        let tagName = xmlData.substring(i+2,closeIndex).trim();
-
-        if(this.options.removeNSPrefix){
-          const colonIndex = tagName.indexOf(":");
-          if(colonIndex !== -1){
-            tagName = tagName.substr(colonIndex+1);
-          }
-        }
-
-        if(this.options.transformTagName) {
-          tagName = this.options.transformTagName(tagName);
-        }
-
-        if(currentNode){
-          textData = this.saveTextToParentTag(textData, currentNode, jPath);
-        }
-
-        //check if last tag of nested tag was unpaired tag
-        const lastTagName = jPath.substring(jPath.lastIndexOf(".")+1);
-        if(tagName && this.options.unpairedTags.indexOf(tagName) !== -1 ){
-          throw new Error(`Unpaired tag can not be used as closing tag: </${tagName}>`);
-        }
-        let propIndex = 0;
-        if(lastTagName && this.options.unpairedTags.indexOf(lastTagName) !== -1 ){
-          propIndex = jPath.lastIndexOf('.', jPath.lastIndexOf('.')-1);
-          this.tagsNodeStack.pop();
-        }else {
-          propIndex = jPath.lastIndexOf(".");
-        }
-        jPath = jPath.substring(0, propIndex);
-
-        currentNode = this.tagsNodeStack.pop();//avoid recursion, set the parent tag scope
-        textData = "";
-        i = closeIndex;
-      } else if( xmlData[i+1] === '?') {
-
-        let tagData = readTagExp(xmlData,i, false, "?>");
-        if(!tagData) throw new Error("Pi Tag is not closed.");
-
-        textData = this.saveTextToParentTag(textData, currentNode, jPath);
-        if( (this.options.ignoreDeclaration && tagData.tagName === "?xml") || this.options.ignorePiTags);else {
-  
-          const childNode = new XmlNode(tagData.tagName);
-          childNode.add(this.options.textNodeName, "");
-          
-          if(tagData.tagName !== tagData.tagExp && tagData.attrExpPresent){
-            childNode[":@"] = this.buildAttributesMap(tagData.tagExp, jPath, tagData.tagName);
-          }
-          this.addChild(currentNode, childNode, jPath, i);
-        }
-
-
-        i = tagData.closeIndex + 1;
-      } else if(xmlData.substr(i + 1, 3) === '!--') {
-        const endIndex = findClosingIndex(xmlData, "-->", i+4, "Comment is not closed.");
-        if(this.options.commentPropName){
-          const comment = xmlData.substring(i + 4, endIndex - 2);
-
-          textData = this.saveTextToParentTag(textData, currentNode, jPath);
-
-          currentNode.add(this.options.commentPropName, [ { [this.options.textNodeName] : comment } ]);
-        }
-        i = endIndex;
-      } else if( xmlData.substr(i + 1, 2) === '!D') {
-        const result = readDocType(xmlData, i);
-        this.docTypeEntities = result.entities;
-        i = result.i;
-      }else if(xmlData.substr(i + 1, 2) === '![') {
-        const closeIndex = findClosingIndex(xmlData, "]]>", i, "CDATA is not closed.") - 2;
-        const tagExp = xmlData.substring(i + 9,closeIndex);
-
-        textData = this.saveTextToParentTag(textData, currentNode, jPath);
-
-        let val = this.parseTextData(tagExp, currentNode.tagname, jPath, true, false, true, true);
-        if(val == undefined) val = "";
-
-        //cdata should be set even if it is 0 length string
-        if(this.options.cdataPropName){
-          currentNode.add(this.options.cdataPropName, [ { [this.options.textNodeName] : tagExp } ]);
-        }else {
-          currentNode.add(this.options.textNodeName, val);
-        }
-        
-        i = closeIndex + 2;
-      }else {//Opening tag
-        let result = readTagExp(xmlData,i, this.options.removeNSPrefix);
-        let tagName= result.tagName;
-        const rawTagName = result.rawTagName;
-        let tagExp = result.tagExp;
-        let attrExpPresent = result.attrExpPresent;
-        let closeIndex = result.closeIndex;
-
-        if (this.options.transformTagName) {
-          tagName = this.options.transformTagName(tagName);
-        }
-        
-        //save text as child node
-        if (currentNode && textData) {
-          if(currentNode.tagname !== '!xml'){
-            //when nested tag is found
-            textData = this.saveTextToParentTag(textData, currentNode, jPath, false);
-          }
-        }
-
-        //check if last tag was unpaired tag
-        const lastTag = currentNode;
-        if(lastTag && this.options.unpairedTags.indexOf(lastTag.tagname) !== -1 ){
-          currentNode = this.tagsNodeStack.pop();
-          jPath = jPath.substring(0, jPath.lastIndexOf("."));
-        }
-        if(tagName !== xmlObj.tagname){
-          jPath += jPath ? "." + tagName : tagName;
-        }
-        const startIndex = i;
-        if (this.isItStopNode(this.options.stopNodes, jPath, tagName)) {
-          let tagContent = "";
-          //self-closing tag
-          if(tagExp.length > 0 && tagExp.lastIndexOf("/") === tagExp.length - 1){
-            if(tagName[tagName.length - 1] === "/"){ //remove trailing '/'
-              tagName = tagName.substr(0, tagName.length - 1);
-              jPath = jPath.substr(0, jPath.length - 1);
-              tagExp = tagName;
-            }else {
-              tagExp = tagExp.substr(0, tagExp.length - 1);
-            }
-            i = result.closeIndex;
-          }
-          //unpaired tag
-          else if(this.options.unpairedTags.indexOf(tagName) !== -1){
-            
-            i = result.closeIndex;
-          }
-          //normal tag
-          else {
-            //read until closing tag is found
-            const result = this.readStopNodeData(xmlData, rawTagName, closeIndex + 1);
-            if(!result) throw new Error(`Unexpected end of ${rawTagName}`);
-            i = result.i;
-            tagContent = result.tagContent;
-          }
-
-          const childNode = new XmlNode(tagName);
-
-          if(tagName !== tagExp && attrExpPresent){
-            childNode[":@"] = this.buildAttributesMap(tagExp, jPath, tagName);
-          }
-          if(tagContent) {
-            tagContent = this.parseTextData(tagContent, tagName, jPath, true, attrExpPresent, true, true);
-          }
-          
-          jPath = jPath.substr(0, jPath.lastIndexOf("."));
-          childNode.add(this.options.textNodeName, tagContent);
-          
-          this.addChild(currentNode, childNode, jPath, startIndex);
-        }else {
-  //selfClosing tag
-          if(tagExp.length > 0 && tagExp.lastIndexOf("/") === tagExp.length - 1){
-            if(tagName[tagName.length - 1] === "/"){ //remove trailing '/'
-              tagName = tagName.substr(0, tagName.length - 1);
-              jPath = jPath.substr(0, jPath.length - 1);
-              tagExp = tagName;
-            }else {
-              tagExp = tagExp.substr(0, tagExp.length - 1);
-            }
-            
-            if(this.options.transformTagName) {
-              tagName = this.options.transformTagName(tagName);
-            }
-
-            const childNode = new XmlNode(tagName);
-            if(tagName !== tagExp && attrExpPresent){
-              childNode[":@"] = this.buildAttributesMap(tagExp, jPath, tagName);
-            }
-            this.addChild(currentNode, childNode, jPath, startIndex);
-            jPath = jPath.substr(0, jPath.lastIndexOf("."));
-          }
-    //opening tag
-          else {
-            const childNode = new XmlNode( tagName);
-            this.tagsNodeStack.push(currentNode);
-            
-            if(tagName !== tagExp && attrExpPresent){
-              childNode[":@"] = this.buildAttributesMap(tagExp, jPath, tagName);
-            }
-            this.addChild(currentNode, childNode, jPath, startIndex);
-            currentNode = childNode;
-          }
-          textData = "";
-          i = closeIndex;
-        }
-      }
-    }else {
-      textData += xmlData[i];
-    }
-  }
-  return xmlObj.child;
-};
-
-function addChild(currentNode, childNode, jPath, startIndex){
-  // unset startIndex if not requested
-  if (!this.options.captureMetaData) startIndex = undefined;
-  const result = this.options.updateTag(childNode.tagname, jPath, childNode[":@"]);
-  if(result === false); else if(typeof result === "string"){
-    childNode.tagname = result;
-    currentNode.addChild(childNode, startIndex);
-  }else {
-    currentNode.addChild(childNode, startIndex);
-  }
-}
-
-const replaceEntitiesValue = function(val){
-
-  if(this.options.processEntities){
-    for(let entityName in this.docTypeEntities){
-      const entity = this.docTypeEntities[entityName];
-      val = val.replace( entity.regx, entity.val);
-    }
-    for(let entityName in this.lastEntities){
-      const entity = this.lastEntities[entityName];
-      val = val.replace( entity.regex, entity.val);
-    }
-    if(this.options.htmlEntities){
-      for(let entityName in this.htmlEntities){
-        const entity = this.htmlEntities[entityName];
-        val = val.replace( entity.regex, entity.val);
-      }
-    }
-    val = val.replace( this.ampEntity.regex, this.ampEntity.val);
-  }
-  return val;
-};
-function saveTextToParentTag(textData, currentNode, jPath, isLeafNode) {
-  if (textData) { //store previously collected data as textNode
-    if(isLeafNode === undefined) isLeafNode = currentNode.child.length === 0;
-    
-    textData = this.parseTextData(textData,
-      currentNode.tagname,
-      jPath,
-      false,
-      currentNode[":@"] ? Object.keys(currentNode[":@"]).length !== 0 : false,
-      isLeafNode);
-
-    if (textData !== undefined && textData !== "")
-      currentNode.add(this.options.textNodeName, textData);
-    textData = "";
-  }
-  return textData;
-}
-
-//TODO: use jPath to simplify the logic
-/**
- * 
- * @param {string[]} stopNodes 
- * @param {string} jPath
- * @param {string} currentTagName 
- */
-function isItStopNode(stopNodes, jPath, currentTagName){
-  const allNodesExp = "*." + currentTagName;
-  for (const stopNodePath in stopNodes) {
-    const stopNodeExp = stopNodes[stopNodePath];
-    if( allNodesExp === stopNodeExp || jPath === stopNodeExp  ) return true;
-  }
-  return false;
-}
-
-/**
- * Returns the tag Expression and where it is ending handling single-double quotes situation
- * @param {string} xmlData 
- * @param {number} i starting index
- * @returns 
- */
-function tagExpWithClosingIndex(xmlData, i, closingChar = ">"){
-  let attrBoundary;
-  let tagExp = "";
-  for (let index = i; index < xmlData.length; index++) {
-    let ch = xmlData[index];
-    if (attrBoundary) {
-        if (ch === attrBoundary) attrBoundary = "";//reset
-    } else if (ch === '"' || ch === "'") {
-        attrBoundary = ch;
-    } else if (ch === closingChar[0]) {
-      if(closingChar[1]){
-        if(xmlData[index + 1] === closingChar[1]){
-          return {
-            data: tagExp,
-            index: index
-          }
-        }
-      }else {
-        return {
-          data: tagExp,
-          index: index
-        }
-      }
-    } else if (ch === '\t') {
-      ch = " ";
-    }
-    tagExp += ch;
-  }
-}
-
-function findClosingIndex(xmlData, str, i, errMsg){
-  const closingIndex = xmlData.indexOf(str, i);
-  if(closingIndex === -1){
-    throw new Error(errMsg)
-  }else {
-    return closingIndex + str.length - 1;
-  }
-}
-
-function readTagExp(xmlData,i, removeNSPrefix, closingChar = ">"){
-  const result = tagExpWithClosingIndex(xmlData, i+1, closingChar);
-  if(!result) return;
-  let tagExp = result.data;
-  const closeIndex = result.index;
-  const separatorIndex = tagExp.search(/\s/);
-  let tagName = tagExp;
-  let attrExpPresent = true;
-  if(separatorIndex !== -1){//separate tag name and attributes expression
-    tagName = tagExp.substring(0, separatorIndex);
-    tagExp = tagExp.substring(separatorIndex + 1).trimStart();
-  }
-
-  const rawTagName = tagName;
-  if(removeNSPrefix){
-    const colonIndex = tagName.indexOf(":");
-    if(colonIndex !== -1){
-      tagName = tagName.substr(colonIndex+1);
-      attrExpPresent = tagName !== result.data.substr(colonIndex + 1);
-    }
-  }
-
-  return {
-    tagName: tagName,
-    tagExp: tagExp,
-    closeIndex: closeIndex,
-    attrExpPresent: attrExpPresent,
-    rawTagName: rawTagName,
-  }
-}
-/**
- * find paired tag for a stop node
- * @param {string} xmlData 
- * @param {string} tagName 
- * @param {number} i 
- */
-function readStopNodeData(xmlData, tagName, i){
-  const startIndex = i;
-  // Starting at 1 since we already have an open tag
-  let openTagCount = 1;
-
-  for (; i < xmlData.length; i++) {
-    if( xmlData[i] === "<"){ 
-      if (xmlData[i+1] === "/") {//close tag
-          const closeIndex = findClosingIndex(xmlData, ">", i, `${tagName} is not closed`);
-          let closeTagName = xmlData.substring(i+2,closeIndex).trim();
-          if(closeTagName === tagName){
-            openTagCount--;
-            if (openTagCount === 0) {
-              return {
-                tagContent: xmlData.substring(startIndex, i),
-                i : closeIndex
-              }
-            }
-          }
-          i=closeIndex;
-        } else if(xmlData[i+1] === '?') { 
-          const closeIndex = findClosingIndex(xmlData, "?>", i+1, "StopNode is not closed.");
-          i=closeIndex;
-        } else if(xmlData.substr(i + 1, 3) === '!--') { 
-          const closeIndex = findClosingIndex(xmlData, "-->", i+3, "StopNode is not closed.");
-          i=closeIndex;
-        } else if(xmlData.substr(i + 1, 2) === '![') { 
-          const closeIndex = findClosingIndex(xmlData, "]]>", i, "StopNode is not closed.") - 2;
-          i=closeIndex;
-        } else {
-          const tagData = readTagExp(xmlData, i, '>');
-
-          if (tagData) {
-            const openTagName = tagData && tagData.tagName;
-            if (openTagName === tagName && tagData.tagExp[tagData.tagExp.length-1] !== "/") {
-              openTagCount++;
-            }
-            i=tagData.closeIndex;
-          }
-        }
-      }
-  }//end for loop
-}
-
-function parseValue(val, shouldParse, options) {
-  if (shouldParse && typeof val === 'string') {
-    //console.log(options)
-    const newval = val.trim();
-    if(newval === 'true' ) return true;
-    else if(newval === 'false' ) return false;
-    else return toNumber(val, options);
-  } else {
-    if (isExist(val)) {
-      return val;
-    } else {
-      return '';
-    }
-  }
-}
-
-const METADATA_SYMBOL = XmlNode.getMetaDataSymbol();
-
-/**
- * 
- * @param {array} node 
- * @param {any} options 
- * @returns 
- */
-function prettify(node, options){
-  return compress( node, options);
-}
-
-/**
- * 
- * @param {array} arr 
- * @param {object} options 
- * @param {string} jPath 
- * @returns object
- */
-function compress(arr, options, jPath){
-  let text;
-  const compressedObj = {};
-  for (let i = 0; i < arr.length; i++) {
-    const tagObj = arr[i];
-    const property = propName(tagObj);
-    let newJpath = "";
-    if(jPath === undefined) newJpath = property;
-    else newJpath = jPath + "." + property;
-
-    if(property === options.textNodeName){
-      if(text === undefined) text = tagObj[property];
-      else text += "" + tagObj[property];
-    }else if(property === undefined){
-      continue;
-    }else if(tagObj[property]){
-      
-      let val = compress(tagObj[property], options, newJpath);
-      const isLeaf = isLeafTag(val, options);
-      if (tagObj[METADATA_SYMBOL] !== undefined) {
-        val[METADATA_SYMBOL] = tagObj[METADATA_SYMBOL]; // copy over metadata
-      }
-
-      if(tagObj[":@"]){
-        assignAttributes( val, tagObj[":@"], newJpath, options);
-      }else if(Object.keys(val).length === 1 && val[options.textNodeName] !== undefined && !options.alwaysCreateTextNode){
-        val = val[options.textNodeName];
-      }else if(Object.keys(val).length === 0){
-        if(options.alwaysCreateTextNode) val[options.textNodeName] = "";
-        else val = "";
-      }
-
-      if(compressedObj[property] !== undefined && compressedObj.hasOwnProperty(property)) {
-        if(!Array.isArray(compressedObj[property])) {
-            compressedObj[property] = [ compressedObj[property] ];
-        }
-        compressedObj[property].push(val);
-      }else {
-        //TODO: if a node is not an array, then check if it should be an array
-        //also determine if it is a leaf node
-        if (options.isArray(property, newJpath, isLeaf )) {
-          compressedObj[property] = [val];
-        }else {
-          compressedObj[property] = val;
-        }
-      }
-    }
-    
-  }
-  // if(text && text.length > 0) compressedObj[options.textNodeName] = text;
-  if(typeof text === "string"){
-    if(text.length > 0) compressedObj[options.textNodeName] = text;
-  }else if(text !== undefined) compressedObj[options.textNodeName] = text;
-  return compressedObj;
-}
-
-function propName(obj){
-  const keys = Object.keys(obj);
-  for (let i = 0; i < keys.length; i++) {
-    const key = keys[i];
-    if(key !== ":@") return key;
-  }
-}
-
-function assignAttributes(obj, attrMap, jpath, options){
-  if (attrMap) {
-    const keys = Object.keys(attrMap);
-    const len = keys.length; //don't make it inline
-    for (let i = 0; i < len; i++) {
-      const atrrName = keys[i];
-      if (options.isArray(atrrName, jpath + "." + atrrName, true, true)) {
-        obj[atrrName] = [ attrMap[atrrName] ];
-      } else {
-        obj[atrrName] = attrMap[atrrName];
-      }
-    }
-  }
-}
-
-function isLeafTag(obj, options){
-  const { textNodeName } = options;
-  const propCount = Object.keys(obj).length;
-  
-  if (propCount === 0) {
-    return true;
-  }
-
-  if (
-    propCount === 1 &&
-    (obj[textNodeName] || typeof obj[textNodeName] === "boolean" || obj[textNodeName] === 0)
-  ) {
-    return true;
-  }
-
-  return false;
-}
-
-class XMLParser{
-    
-    constructor(options){
-        this.externalEntities = {};
-        this.options = buildOptions(options);
-        
-    }
-    /**
-     * Parse XML dats to JS object 
-     * @param {string|Buffer} xmlData 
-     * @param {boolean|Object} validationOption 
-     */
-    parse(xmlData,validationOption){
-        if(typeof xmlData === "string");else if( xmlData.toString){
-            xmlData = xmlData.toString();
-        }else {
-            throw new Error("XML data is accepted in String or Bytes[] form.")
-        }
-        if( validationOption){
-            if(validationOption === true) validationOption = {}; //validate with default options
-            
-            const result = validate$1(xmlData, validationOption);
-            if (result !== true) {
-              throw Error( `${result.err.msg}:${result.err.line}:${result.err.col}` )
-            }
-          }
-        const orderedObjParser = new OrderedObjParser(this.options);
-        orderedObjParser.addExternalEntities(this.externalEntities);
-        const orderedResult = orderedObjParser.parseXml(xmlData);
-        if(this.options.preserveOrder || orderedResult === undefined) return orderedResult;
-        else return prettify(orderedResult, this.options);
-    }
-
-    /**
-     * Add Entity which is not by default supported by this library
-     * @param {string} key 
-     * @param {string} value 
-     */
-    addEntity(key, value){
-        if(value.indexOf("&") !== -1){
-            throw new Error("Entity value can't have '&'")
-        }else if(key.indexOf("&") !== -1 || key.indexOf(";") !== -1){
-            throw new Error("An entity must be set without '&' and ';'. Eg. use '#xD' for '&#xD;'")
-        }else if(value === "&"){
-            throw new Error("An entity with value '&' is not permitted");
-        }else {
-            this.externalEntities[key] = value;
-        }
-    }
-
-    /**
-     * Returns a Symbol that can be used to access the metadata
-     * property on a node.
-     * 
-     * If Symbol is not available in the environment, an ordinary property is used
-     * and the name of the property is here returned.
-     * 
-     * The XMLMetaData property is only present when `captureMetaData`
-     * is true in the options.
-     */
-    static getMetaDataSymbol() {
-        return XmlNode.getMetaDataSymbol();
-    }
-}
-
-const parser = new XMLParser({
-    attributeNamePrefix: "",
-    htmlEntities: true,
-    ignoreAttributes: false,
-    ignoreDeclaration: true,
-    parseTagValue: false,
-    trimValues: false,
-    tagValueProcessor: (_, val) => (val.trim() === "" && val.includes("\n") ? "" : undefined),
-});
-parser.addEntity("#xD", "\r");
-parser.addEntity("#10", "\n");
-function parseXML(xmlString) {
-    return parser.parse(xmlString, true);
-}
-
-class XmlShapeDeserializer extends SerdeContextConfig {
-    settings;
-    stringDeserializer;
-    constructor(settings) {
-        super();
-        this.settings = settings;
-        this.stringDeserializer = new FromStringShapeDeserializer(settings);
-    }
-    setSerdeContext(serdeContext) {
-        this.serdeContext = serdeContext;
-        this.stringDeserializer.setSerdeContext(serdeContext);
-    }
-    read(schema, bytes, key) {
-        const ns = NormalizedSchema.of(schema);
-        const memberSchemas = ns.getMemberSchemas();
-        const isEventPayload = ns.isStructSchema() &&
-            ns.isMemberSchema() &&
-            !!Object.values(memberSchemas).find((memberNs) => {
-                return !!memberNs.getMemberTraits().eventPayload;
-            });
-        if (isEventPayload) {
-            const output = {};
-            const memberName = Object.keys(memberSchemas)[0];
-            const eventMemberSchema = memberSchemas[memberName];
-            if (eventMemberSchema.isBlobSchema()) {
-                output[memberName] = bytes;
-            }
-            else {
-                output[memberName] = this.read(memberSchemas[memberName], bytes);
-            }
-            return output;
-        }
-        const xmlString = (this.serdeContext?.utf8Encoder ?? toUtf8)(bytes);
-        const parsedObject = this.parseXml(xmlString);
-        return this.readSchema(schema, key ? parsedObject[key] : parsedObject);
-    }
-    readSchema(_schema, value) {
-        const ns = NormalizedSchema.of(_schema);
-        if (ns.isUnitSchema()) {
-            return;
-        }
-        const traits = ns.getMergedTraits();
-        if (ns.isListSchema() && !Array.isArray(value)) {
-            return this.readSchema(ns, [value]);
-        }
-        if (value == null) {
-            return value;
-        }
-        if (typeof value === "object") {
-            const sparse = !!traits.sparse;
-            const flat = !!traits.xmlFlattened;
-            if (ns.isListSchema()) {
-                const listValue = ns.getValueSchema();
-                const buffer = [];
-                const sourceKey = listValue.getMergedTraits().xmlName ?? "member";
-                const source = flat ? value : (value[0] ?? value)[sourceKey];
-                const sourceArray = Array.isArray(source) ? source : [source];
-                for (const v of sourceArray) {
-                    if (v != null || sparse) {
-                        buffer.push(this.readSchema(listValue, v));
-                    }
-                }
-                return buffer;
-            }
-            const buffer = {};
-            if (ns.isMapSchema()) {
-                const keyNs = ns.getKeySchema();
-                const memberNs = ns.getValueSchema();
-                let entries;
-                if (flat) {
-                    entries = Array.isArray(value) ? value : [value];
-                }
-                else {
-                    entries = Array.isArray(value.entry) ? value.entry : [value.entry];
-                }
-                const keyProperty = keyNs.getMergedTraits().xmlName ?? "key";
-                const valueProperty = memberNs.getMergedTraits().xmlName ?? "value";
-                for (const entry of entries) {
-                    const key = entry[keyProperty];
-                    const value = entry[valueProperty];
-                    if (value != null || sparse) {
-                        buffer[key] = this.readSchema(memberNs, value);
-                    }
-                }
-                return buffer;
-            }
-            if (ns.isStructSchema()) {
-                const union = ns.isUnionSchema();
-                let unionSerde;
-                if (union) {
-                    unionSerde = new UnionSerde(value, buffer);
-                }
-                for (const [memberName, memberSchema] of ns.structIterator()) {
-                    const memberTraits = memberSchema.getMergedTraits();
-                    const xmlObjectKey = !memberTraits.httpPayload
-                        ? memberSchema.getMemberTraits().xmlName ?? memberName
-                        : memberTraits.xmlName ?? memberSchema.getName();
-                    if (union) {
-                        unionSerde.mark(xmlObjectKey);
-                    }
-                    if (value[xmlObjectKey] != null) {
-                        buffer[memberName] = this.readSchema(memberSchema, value[xmlObjectKey]);
-                    }
-                }
-                if (union) {
-                    unionSerde.writeUnknown();
-                }
-                return buffer;
-            }
-            if (ns.isDocumentSchema()) {
-                return value;
-            }
-            throw new Error(`@aws-sdk/core/protocols - xml deserializer unhandled schema type for ${ns.getName(true)}`);
-        }
-        if (ns.isListSchema()) {
-            return [];
-        }
-        if (ns.isMapSchema() || ns.isStructSchema()) {
-            return {};
-        }
-        return this.stringDeserializer.read(ns, value);
-    }
-    parseXml(xml) {
-        if (xml.length) {
-            let parsedObj;
-            try {
-                parsedObj = parseXML(xml);
-            }
-            catch (e) {
-                if (e && typeof e === "object") {
-                    Object.defineProperty(e, "$responseBodyText", {
-                        value: xml,
-                    });
-                }
-                throw e;
-            }
-            const textNodeName = "#text";
-            const key = Object.keys(parsedObj)[0];
-            const parsedObjToReturn = parsedObj[key];
-            if (parsedObjToReturn[textNodeName]) {
-                parsedObjToReturn[key] = parsedObjToReturn[textNodeName];
-                delete parsedObjToReturn[textNodeName];
-            }
-            return getValueFromTextNode(parsedObjToReturn);
-        }
-        return {};
-    }
-}
-
-class QueryShapeSerializer extends SerdeContextConfig {
-    settings;
-    buffer;
-    constructor(settings) {
-        super();
-        this.settings = settings;
-    }
-    write(schema, value, prefix = "") {
-        if (this.buffer === undefined) {
-            this.buffer = "";
-        }
-        const ns = NormalizedSchema.of(schema);
-        if (prefix && !prefix.endsWith(".")) {
-            prefix += ".";
-        }
-        if (ns.isBlobSchema()) {
-            if (typeof value === "string" || value instanceof Uint8Array) {
-                this.writeKey(prefix);
-                this.writeValue((this.serdeContext?.base64Encoder ?? toBase64)(value));
-            }
-        }
-        else if (ns.isBooleanSchema() || ns.isNumericSchema() || ns.isStringSchema()) {
-            if (value != null) {
-                this.writeKey(prefix);
-                this.writeValue(String(value));
-            }
-            else if (ns.isIdempotencyToken()) {
-                this.writeKey(prefix);
-                this.writeValue(v4());
-            }
-        }
-        else if (ns.isBigIntegerSchema()) {
-            if (value != null) {
-                this.writeKey(prefix);
-                this.writeValue(String(value));
-            }
-        }
-        else if (ns.isBigDecimalSchema()) {
-            if (value != null) {
-                this.writeKey(prefix);
-                this.writeValue(value instanceof NumericValue ? value.string : String(value));
-            }
-        }
-        else if (ns.isTimestampSchema()) {
-            if (value instanceof Date) {
-                this.writeKey(prefix);
-                const format = determineTimestampFormat(ns, this.settings);
-                switch (format) {
-                    case 5:
-                        this.writeValue(value.toISOString().replace(".000Z", "Z"));
-                        break;
-                    case 6:
-                        this.writeValue(dateToUtcString(value));
-                        break;
-                    case 7:
-                        this.writeValue(String(value.getTime() / 1000));
-                        break;
-                }
-            }
-        }
-        else if (ns.isDocumentSchema()) {
-            if (Array.isArray(value)) {
-                this.write(64 | 15, value, prefix);
-            }
-            else if (value instanceof Date) {
-                this.write(4, value, prefix);
-            }
-            else if (value instanceof Uint8Array) {
-                this.write(21, value, prefix);
-            }
-            else if (value && typeof value === "object") {
-                this.write(128 | 15, value, prefix);
-            }
-            else {
-                this.writeKey(prefix);
-                this.writeValue(String(value));
-            }
-        }
-        else if (ns.isListSchema()) {
-            if (Array.isArray(value)) {
-                if (value.length === 0) {
-                    if (this.settings.serializeEmptyLists) {
-                        this.writeKey(prefix);
-                        this.writeValue("");
-                    }
-                }
-                else {
-                    const member = ns.getValueSchema();
-                    const flat = this.settings.flattenLists || ns.getMergedTraits().xmlFlattened;
-                    let i = 1;
-                    for (const item of value) {
-                        if (item == null) {
-                            continue;
-                        }
-                        const suffix = this.getKey("member", member.getMergedTraits().xmlName);
-                        const key = flat ? `${prefix}${i}` : `${prefix}${suffix}.${i}`;
-                        this.write(member, item, key);
-                        ++i;
-                    }
-                }
-            }
-        }
-        else if (ns.isMapSchema()) {
-            if (value && typeof value === "object") {
-                const keySchema = ns.getKeySchema();
-                const memberSchema = ns.getValueSchema();
-                const flat = ns.getMergedTraits().xmlFlattened;
-                let i = 1;
-                for (const [k, v] of Object.entries(value)) {
-                    if (v == null) {
-                        continue;
-                    }
-                    const keySuffix = this.getKey("key", keySchema.getMergedTraits().xmlName);
-                    const key = flat ? `${prefix}${i}.${keySuffix}` : `${prefix}entry.${i}.${keySuffix}`;
-                    const valueSuffix = this.getKey("value", memberSchema.getMergedTraits().xmlName);
-                    const valueKey = flat ? `${prefix}${i}.${valueSuffix}` : `${prefix}entry.${i}.${valueSuffix}`;
-                    this.write(keySchema, k, key);
-                    this.write(memberSchema, v, valueKey);
-                    ++i;
-                }
-            }
-        }
-        else if (ns.isStructSchema()) {
-            if (value && typeof value === "object") {
-                let didWriteMember = false;
-                for (const [memberName, member] of serializingStructIterator(ns, value)) {
-                    if (value[memberName] == null && !member.isIdempotencyToken()) {
-                        continue;
-                    }
-                    const suffix = this.getKey(memberName, member.getMergedTraits().xmlName);
-                    const key = `${prefix}${suffix}`;
-                    this.write(member, value[memberName], key);
-                    didWriteMember = true;
-                }
-                if (!didWriteMember && ns.isUnionSchema()) {
-                    const { $unknown } = value;
-                    if (Array.isArray($unknown)) {
-                        const [k, v] = $unknown;
-                        const key = `${prefix}${k}`;
-                        this.write(15, v, key);
-                    }
-                }
-            }
-        }
-        else if (ns.isUnitSchema()) ;
-        else {
-            throw new Error(`@aws-sdk/core/protocols - QuerySerializer unrecognized schema type ${ns.getName(true)}`);
-        }
-    }
-    flush() {
-        if (this.buffer === undefined) {
-            throw new Error("@aws-sdk/core/protocols - QuerySerializer cannot flush with nothing written to buffer.");
-        }
-        const str = this.buffer;
-        delete this.buffer;
-        return str;
-    }
-    getKey(memberName, xmlName) {
-        const key = xmlName ?? memberName;
-        if (this.settings.capitalizeKeys) {
-            return key[0].toUpperCase() + key.slice(1);
-        }
-        return key;
-    }
-    writeKey(key) {
-        if (key.endsWith(".")) {
-            key = key.slice(0, key.length - 1);
-        }
-        this.buffer += `&${extendedEncodeURIComponent(key)}=`;
-    }
-    writeValue(value) {
-        this.buffer += extendedEncodeURIComponent(value);
-    }
-}
-
-class AwsQueryProtocol extends RpcProtocol {
-    options;
-    serializer;
-    deserializer;
-    mixin = new ProtocolLib();
-    constructor(options) {
-        super({
-            defaultNamespace: options.defaultNamespace,
-        });
-        this.options = options;
-        const settings = {
-            timestampFormat: {
-                useTrait: true,
-                default: 5,
-            },
-            httpBindings: false,
-            xmlNamespace: options.xmlNamespace,
-            serviceNamespace: options.defaultNamespace,
-            serializeEmptyLists: true,
-        };
-        this.serializer = new QueryShapeSerializer(settings);
-        this.deserializer = new XmlShapeDeserializer(settings);
-    }
-    getShapeId() {
-        return "aws.protocols#awsQuery";
-    }
-    setSerdeContext(serdeContext) {
-        this.serializer.setSerdeContext(serdeContext);
-        this.deserializer.setSerdeContext(serdeContext);
-    }
-    getPayloadCodec() {
-        throw new Error("AWSQuery protocol has no payload codec.");
-    }
-    async serializeRequest(operationSchema, input, context) {
-        const request = await super.serializeRequest(operationSchema, input, context);
-        if (!request.path.endsWith("/")) {
-            request.path += "/";
-        }
-        Object.assign(request.headers, {
-            "content-type": `application/x-www-form-urlencoded`,
-        });
-        if (deref(operationSchema.input) === "unit" || !request.body) {
-            request.body = "";
-        }
-        const action = operationSchema.name.split("#")[1] ?? operationSchema.name;
-        request.body = `Action=${action}&Version=${this.options.version}` + request.body;
-        if (request.body.endsWith("&")) {
-            request.body = request.body.slice(-1);
-        }
-        return request;
-    }
-    async deserializeResponse(operationSchema, context, response) {
-        const deserializer = this.deserializer;
-        const ns = NormalizedSchema.of(operationSchema.output);
-        const dataObject = {};
-        if (response.statusCode >= 300) {
-            const bytes = await collectBody$1(response.body, context);
-            if (bytes.byteLength > 0) {
-                Object.assign(dataObject, await deserializer.read(15, bytes));
-            }
-            await this.handleError(operationSchema, context, response, dataObject, this.deserializeMetadata(response));
-        }
-        for (const header in response.headers) {
-            const value = response.headers[header];
-            delete response.headers[header];
-            response.headers[header.toLowerCase()] = value;
-        }
-        const shortName = operationSchema.name.split("#")[1] ?? operationSchema.name;
-        const awsQueryResultKey = ns.isStructSchema() && this.useNestedResult() ? shortName + "Result" : undefined;
-        const bytes = await collectBody$1(response.body, context);
-        if (bytes.byteLength > 0) {
-            Object.assign(dataObject, await deserializer.read(ns, bytes, awsQueryResultKey));
-        }
-        const output = {
-            $metadata: this.deserializeMetadata(response),
-            ...dataObject,
-        };
-        return output;
-    }
-    useNestedResult() {
-        return true;
-    }
-    async handleError(operationSchema, context, response, dataObject, metadata) {
-        const errorIdentifier = this.loadQueryErrorCode(response, dataObject) ?? "Unknown";
-        const errorData = this.loadQueryError(dataObject);
-        const message = this.loadQueryErrorMessage(dataObject);
-        errorData.message = message;
-        errorData.Error = {
-            Type: errorData.Type,
-            Code: errorData.Code,
-            Message: message,
-        };
-        const { errorSchema, errorMetadata } = await this.mixin.getErrorSchemaOrThrowBaseException(errorIdentifier, this.options.defaultNamespace, response, errorData, metadata, this.mixin.findQueryCompatibleError);
-        const ns = NormalizedSchema.of(errorSchema);
-        const ErrorCtor = TypeRegistry.for(errorSchema[1]).getErrorCtor(errorSchema) ?? Error;
-        const exception = new ErrorCtor(message);
-        const output = {
-            Type: errorData.Error.Type,
-            Code: errorData.Error.Code,
-            Error: errorData.Error,
-        };
-        for (const [name, member] of ns.structIterator()) {
-            const target = member.getMergedTraits().xmlName ?? name;
-            const value = errorData[target] ?? dataObject[target];
-            output[name] = this.deserializer.readSchema(member, value);
-        }
-        throw this.mixin.decorateServiceException(Object.assign(exception, errorMetadata, {
-            $fault: ns.getMergedTraits().error,
-            message,
-        }, output), dataObject);
-    }
-    loadQueryErrorCode(output, data) {
-        const code = (data.Errors?.[0]?.Error ?? data.Errors?.Error ?? data.Error)?.Code;
-        if (code !== undefined) {
-            return code;
-        }
-        if (output.statusCode == 404) {
-            return "NotFound";
-        }
-    }
-    loadQueryError(data) {
-        return data.Errors?.[0]?.Error ?? data.Errors?.Error ?? data.Error;
-    }
-    loadQueryErrorMessage(data) {
-        const errorData = this.loadQueryError(data);
-        return errorData?.message ?? errorData?.Message ?? data.message ?? data.Message ?? "Unknown";
-    }
-    getDefaultContentType() {
-        return "application/x-www-form-urlencoded";
-    }
-}
-
-const loadRestXmlErrorCode = (output, data) => {
-    if (data?.Error?.Code !== undefined) {
-        return data.Error.Code;
-    }
-    if (data?.Code !== undefined) {
-        return data.Code;
-    }
-    if (output.statusCode == 404) {
-        return "NotFound";
-    }
-};
-
-class XmlShapeSerializer extends SerdeContextConfig {
-    settings;
-    stringBuffer;
-    byteBuffer;
-    buffer;
-    constructor(settings) {
-        super();
-        this.settings = settings;
-    }
-    write(schema, value) {
-        const ns = NormalizedSchema.of(schema);
-        if (ns.isStringSchema() && typeof value === "string") {
-            this.stringBuffer = value;
-        }
-        else if (ns.isBlobSchema()) {
-            this.byteBuffer =
-                "byteLength" in value
-                    ? value
-                    : (this.serdeContext?.base64Decoder ?? fromBase64)(value);
-        }
-        else {
-            this.buffer = this.writeStruct(ns, value, undefined);
-            const traits = ns.getMergedTraits();
-            if (traits.httpPayload && !traits.xmlName) {
-                this.buffer.withName(ns.getName());
-            }
-        }
-    }
-    flush() {
-        if (this.byteBuffer !== undefined) {
-            const bytes = this.byteBuffer;
-            delete this.byteBuffer;
-            return bytes;
-        }
-        if (this.stringBuffer !== undefined) {
-            const str = this.stringBuffer;
-            delete this.stringBuffer;
-            return str;
-        }
-        const buffer = this.buffer;
-        if (this.settings.xmlNamespace) {
-            if (!buffer?.attributes?.["xmlns"]) {
-                buffer.addAttribute("xmlns", this.settings.xmlNamespace);
-            }
-        }
-        delete this.buffer;
-        return buffer.toString();
-    }
-    writeStruct(ns, value, parentXmlns) {
-        const traits = ns.getMergedTraits();
-        const name = ns.isMemberSchema() && !traits.httpPayload
-            ? ns.getMemberTraits().xmlName ?? ns.getMemberName()
-            : traits.xmlName ?? ns.getName();
-        if (!name || !ns.isStructSchema()) {
-            throw new Error(`@aws-sdk/core/protocols - xml serializer, cannot write struct with empty name or non-struct, schema=${ns.getName(true)}.`);
-        }
-        const structXmlNode = XmlNode$1.of(name);
-        const [xmlnsAttr, xmlns] = this.getXmlnsAttribute(ns, parentXmlns);
-        for (const [memberName, memberSchema] of serializingStructIterator(ns, value)) {
-            const val = value[memberName];
-            if (val != null || memberSchema.isIdempotencyToken()) {
-                if (memberSchema.getMergedTraits().xmlAttribute) {
-                    structXmlNode.addAttribute(memberSchema.getMergedTraits().xmlName ?? memberName, this.writeSimple(memberSchema, val));
-                    continue;
-                }
-                if (memberSchema.isListSchema()) {
-                    this.writeList(memberSchema, val, structXmlNode, xmlns);
-                }
-                else if (memberSchema.isMapSchema()) {
-                    this.writeMap(memberSchema, val, structXmlNode, xmlns);
-                }
-                else if (memberSchema.isStructSchema()) {
-                    structXmlNode.addChildNode(this.writeStruct(memberSchema, val, xmlns));
-                }
-                else {
-                    const memberNode = XmlNode$1.of(memberSchema.getMergedTraits().xmlName ?? memberSchema.getMemberName());
-                    this.writeSimpleInto(memberSchema, val, memberNode, xmlns);
-                    structXmlNode.addChildNode(memberNode);
-                }
-            }
-        }
-        const { $unknown } = value;
-        if ($unknown && ns.isUnionSchema() && Array.isArray($unknown) && Object.keys(value).length === 1) {
-            const [k, v] = $unknown;
-            const node = XmlNode$1.of(k);
-            if (typeof v !== "string") {
-                if (value instanceof XmlNode$1 || value instanceof XmlText) {
-                    structXmlNode.addChildNode(value);
-                }
-                else {
-                    throw new Error(`@aws-sdk - $unknown union member in XML requires ` +
-                        `value of type string, @aws-sdk/xml-builder::XmlNode or XmlText.`);
-                }
-            }
-            this.writeSimpleInto(0, v, node, xmlns);
-            structXmlNode.addChildNode(node);
-        }
-        if (xmlns) {
-            structXmlNode.addAttribute(xmlnsAttr, xmlns);
-        }
-        return structXmlNode;
-    }
-    writeList(listMember, array, container, parentXmlns) {
-        if (!listMember.isMemberSchema()) {
-            throw new Error(`@aws-sdk/core/protocols - xml serializer, cannot write non-member list: ${listMember.getName(true)}`);
-        }
-        const listTraits = listMember.getMergedTraits();
-        const listValueSchema = listMember.getValueSchema();
-        const listValueTraits = listValueSchema.getMergedTraits();
-        const sparse = !!listValueTraits.sparse;
-        const flat = !!listTraits.xmlFlattened;
-        const [xmlnsAttr, xmlns] = this.getXmlnsAttribute(listMember, parentXmlns);
-        const writeItem = (container, value) => {
-            if (listValueSchema.isListSchema()) {
-                this.writeList(listValueSchema, Array.isArray(value) ? value : [value], container, xmlns);
-            }
-            else if (listValueSchema.isMapSchema()) {
-                this.writeMap(listValueSchema, value, container, xmlns);
-            }
-            else if (listValueSchema.isStructSchema()) {
-                const struct = this.writeStruct(listValueSchema, value, xmlns);
-                container.addChildNode(struct.withName(flat ? listTraits.xmlName ?? listMember.getMemberName() : listValueTraits.xmlName ?? "member"));
-            }
-            else {
-                const listItemNode = XmlNode$1.of(flat ? listTraits.xmlName ?? listMember.getMemberName() : listValueTraits.xmlName ?? "member");
-                this.writeSimpleInto(listValueSchema, value, listItemNode, xmlns);
-                container.addChildNode(listItemNode);
-            }
-        };
-        if (flat) {
-            for (const value of array) {
-                if (sparse || value != null) {
-                    writeItem(container, value);
-                }
-            }
-        }
-        else {
-            const listNode = XmlNode$1.of(listTraits.xmlName ?? listMember.getMemberName());
-            if (xmlns) {
-                listNode.addAttribute(xmlnsAttr, xmlns);
-            }
-            for (const value of array) {
-                if (sparse || value != null) {
-                    writeItem(listNode, value);
-                }
-            }
-            container.addChildNode(listNode);
-        }
-    }
-    writeMap(mapMember, map, container, parentXmlns, containerIsMap = false) {
-        if (!mapMember.isMemberSchema()) {
-            throw new Error(`@aws-sdk/core/protocols - xml serializer, cannot write non-member map: ${mapMember.getName(true)}`);
-        }
-        const mapTraits = mapMember.getMergedTraits();
-        const mapKeySchema = mapMember.getKeySchema();
-        const mapKeyTraits = mapKeySchema.getMergedTraits();
-        const keyTag = mapKeyTraits.xmlName ?? "key";
-        const mapValueSchema = mapMember.getValueSchema();
-        const mapValueTraits = mapValueSchema.getMergedTraits();
-        const valueTag = mapValueTraits.xmlName ?? "value";
-        const sparse = !!mapValueTraits.sparse;
-        const flat = !!mapTraits.xmlFlattened;
-        const [xmlnsAttr, xmlns] = this.getXmlnsAttribute(mapMember, parentXmlns);
-        const addKeyValue = (entry, key, val) => {
-            const keyNode = XmlNode$1.of(keyTag, key);
-            const [keyXmlnsAttr, keyXmlns] = this.getXmlnsAttribute(mapKeySchema, xmlns);
-            if (keyXmlns) {
-                keyNode.addAttribute(keyXmlnsAttr, keyXmlns);
-            }
-            entry.addChildNode(keyNode);
-            let valueNode = XmlNode$1.of(valueTag);
-            if (mapValueSchema.isListSchema()) {
-                this.writeList(mapValueSchema, val, valueNode, xmlns);
-            }
-            else if (mapValueSchema.isMapSchema()) {
-                this.writeMap(mapValueSchema, val, valueNode, xmlns, true);
-            }
-            else if (mapValueSchema.isStructSchema()) {
-                valueNode = this.writeStruct(mapValueSchema, val, xmlns);
-            }
-            else {
-                this.writeSimpleInto(mapValueSchema, val, valueNode, xmlns);
-            }
-            entry.addChildNode(valueNode);
-        };
-        if (flat) {
-            for (const [key, val] of Object.entries(map)) {
-                if (sparse || val != null) {
-                    const entry = XmlNode$1.of(mapTraits.xmlName ?? mapMember.getMemberName());
-                    addKeyValue(entry, key, val);
-                    container.addChildNode(entry);
-                }
-            }
-        }
-        else {
-            let mapNode;
-            if (!containerIsMap) {
-                mapNode = XmlNode$1.of(mapTraits.xmlName ?? mapMember.getMemberName());
-                if (xmlns) {
-                    mapNode.addAttribute(xmlnsAttr, xmlns);
-                }
-                container.addChildNode(mapNode);
-            }
-            for (const [key, val] of Object.entries(map)) {
-                if (sparse || val != null) {
-                    const entry = XmlNode$1.of("entry");
-                    addKeyValue(entry, key, val);
-                    (containerIsMap ? container : mapNode).addChildNode(entry);
-                }
-            }
-        }
-    }
-    writeSimple(_schema, value) {
-        if (null === value) {
-            throw new Error("@aws-sdk/core/protocols - (XML serializer) cannot write null value.");
-        }
-        const ns = NormalizedSchema.of(_schema);
-        let nodeContents = null;
-        if (value && typeof value === "object") {
-            if (ns.isBlobSchema()) {
-                nodeContents = (this.serdeContext?.base64Encoder ?? toBase64)(value);
-            }
-            else if (ns.isTimestampSchema() && value instanceof Date) {
-                const format = determineTimestampFormat(ns, this.settings);
-                switch (format) {
-                    case 5:
-                        nodeContents = value.toISOString().replace(".000Z", "Z");
-                        break;
-                    case 6:
-                        nodeContents = dateToUtcString(value);
-                        break;
-                    case 7:
-                        nodeContents = String(value.getTime() / 1000);
-                        break;
-                    default:
-                        console.warn("Missing timestamp format, using http date", value);
-                        nodeContents = dateToUtcString(value);
-                        break;
-                }
-            }
-            else if (ns.isBigDecimalSchema() && value) {
-                if (value instanceof NumericValue) {
-                    return value.string;
-                }
-                return String(value);
-            }
-            else if (ns.isMapSchema() || ns.isListSchema()) {
-                throw new Error("@aws-sdk/core/protocols - xml serializer, cannot call _write() on List/Map schema, call writeList or writeMap() instead.");
-            }
-            else {
-                throw new Error(`@aws-sdk/core/protocols - xml serializer, unhandled schema type for object value and schema: ${ns.getName(true)}`);
-            }
-        }
-        if (ns.isBooleanSchema() || ns.isNumericSchema() || ns.isBigIntegerSchema() || ns.isBigDecimalSchema()) {
-            nodeContents = String(value);
-        }
-        if (ns.isStringSchema()) {
-            if (value === undefined && ns.isIdempotencyToken()) {
-                nodeContents = v4();
-            }
-            else {
-                nodeContents = String(value);
-            }
-        }
-        if (nodeContents === null) {
-            throw new Error(`Unhandled schema-value pair ${ns.getName(true)}=${value}`);
-        }
-        return nodeContents;
-    }
-    writeSimpleInto(_schema, value, into, parentXmlns) {
-        const nodeContents = this.writeSimple(_schema, value);
-        const ns = NormalizedSchema.of(_schema);
-        const content = new XmlText(nodeContents);
-        const [xmlnsAttr, xmlns] = this.getXmlnsAttribute(ns, parentXmlns);
-        if (xmlns) {
-            into.addAttribute(xmlnsAttr, xmlns);
-        }
-        into.addChildNode(content);
-    }
-    getXmlnsAttribute(ns, parentXmlns) {
-        const traits = ns.getMergedTraits();
-        const [prefix, xmlns] = traits.xmlNamespace ?? [];
-        if (xmlns && xmlns !== parentXmlns) {
-            return [prefix ? `xmlns:${prefix}` : "xmlns", xmlns];
-        }
-        return [void 0, void 0];
-    }
-}
-
-class XmlCodec extends SerdeContextConfig {
-    settings;
-    constructor(settings) {
-        super();
-        this.settings = settings;
-    }
-    createSerializer() {
-        const serializer = new XmlShapeSerializer(this.settings);
-        serializer.setSerdeContext(this.serdeContext);
-        return serializer;
-    }
-    createDeserializer() {
-        const deserializer = new XmlShapeDeserializer(this.settings);
-        deserializer.setSerdeContext(this.serdeContext);
-        return deserializer;
-    }
-}
-
-class AwsRestXmlProtocol extends HttpBindingProtocol {
-    codec;
-    serializer;
-    deserializer;
-    mixin = new ProtocolLib();
-    constructor(options) {
-        super(options);
-        const settings = {
-            timestampFormat: {
-                useTrait: true,
-                default: 5,
-            },
-            httpBindings: true,
-            xmlNamespace: options.xmlNamespace,
-            serviceNamespace: options.defaultNamespace,
-        };
-        this.codec = new XmlCodec(settings);
-        this.serializer = new HttpInterceptingShapeSerializer(this.codec.createSerializer(), settings);
-        this.deserializer = new HttpInterceptingShapeDeserializer(this.codec.createDeserializer(), settings);
-    }
-    getPayloadCodec() {
-        return this.codec;
-    }
-    getShapeId() {
-        return "aws.protocols#restXml";
-    }
-    async serializeRequest(operationSchema, input, context) {
-        const request = await super.serializeRequest(operationSchema, input, context);
-        const inputSchema = NormalizedSchema.of(operationSchema.input);
-        if (!request.headers["content-type"]) {
-            const contentType = this.mixin.resolveRestContentType(this.getDefaultContentType(), inputSchema);
-            if (contentType) {
-                request.headers["content-type"] = contentType;
-            }
-        }
-        if (typeof request.body === "string" &&
-            request.headers["content-type"] === this.getDefaultContentType() &&
-            !request.body.startsWith("<?xml ") &&
-            !this.hasUnstructuredPayloadBinding(inputSchema)) {
-            request.body = '<?xml version="1.0" encoding="UTF-8"?>' + request.body;
-        }
-        return request;
-    }
-    async deserializeResponse(operationSchema, context, response) {
-        return super.deserializeResponse(operationSchema, context, response);
-    }
-    async handleError(operationSchema, context, response, dataObject, metadata) {
-        const errorIdentifier = loadRestXmlErrorCode(response, dataObject) ?? "Unknown";
-        const { errorSchema, errorMetadata } = await this.mixin.getErrorSchemaOrThrowBaseException(errorIdentifier, this.options.defaultNamespace, response, dataObject, metadata);
-        const ns = NormalizedSchema.of(errorSchema);
-        const message = dataObject.Error?.message ?? dataObject.Error?.Message ?? dataObject.message ?? dataObject.Message ?? "Unknown";
-        const ErrorCtor = TypeRegistry.for(errorSchema[1]).getErrorCtor(errorSchema) ?? Error;
-        const exception = new ErrorCtor(message);
-        await this.deserializeHttpMessage(errorSchema, context, response, dataObject);
-        const output = {};
-        for (const [name, member] of ns.structIterator()) {
-            const target = member.getMergedTraits().xmlName ?? name;
-            const value = dataObject.Error?.[target] ?? dataObject[target];
-            output[name] = this.codec.createDeserializer().readSchema(member, value);
-        }
-        throw this.mixin.decorateServiceException(Object.assign(exception, errorMetadata, {
-            $fault: ns.getMergedTraits().error,
-            message,
-        }, output), dataObject);
-    }
-    getDefaultContentType() {
-        return "application/xml";
-    }
-    hasUnstructuredPayloadBinding(ns) {
-        for (const [, member] of ns.structIterator()) {
-            if (member.getMergedTraits().httpPayload) {
-                return !(member.isStructSchema() || member.isMapSchema() || member.isListSchema());
-            }
-        }
-        return false;
-    }
-}
-
-const CLIENT_SUPPORTED_ALGORITHMS = [
-    ChecksumAlgorithm.CRC32,
-    ChecksumAlgorithm.CRC32C,
-    ChecksumAlgorithm.CRC64NVME,
-    ChecksumAlgorithm.SHA1,
-    ChecksumAlgorithm.SHA256,
-];
-const PRIORITY_ORDER_ALGORITHMS = [
-    ChecksumAlgorithm.SHA256,
-    ChecksumAlgorithm.SHA1,
-    ChecksumAlgorithm.CRC32,
-    ChecksumAlgorithm.CRC32C,
-    ChecksumAlgorithm.CRC64NVME,
-];
-
-const getChecksumAlgorithmForRequest = (input, { requestChecksumRequired, requestAlgorithmMember, requestChecksumCalculation }) => {
-    if (!requestAlgorithmMember) {
-        return requestChecksumCalculation === RequestChecksumCalculation.WHEN_SUPPORTED || requestChecksumRequired
-            ? DEFAULT_CHECKSUM_ALGORITHM
-            : undefined;
-    }
-    if (!input[requestAlgorithmMember]) {
-        return undefined;
-    }
-    const checksumAlgorithm = input[requestAlgorithmMember];
-    if (!CLIENT_SUPPORTED_ALGORITHMS.includes(checksumAlgorithm)) {
-        throw new Error(`The checksum algorithm "${checksumAlgorithm}" is not supported by the client.` +
-            ` Select one of ${CLIENT_SUPPORTED_ALGORITHMS}.`);
-    }
-    return checksumAlgorithm;
-};
-
-const getChecksumLocationName = (algorithm) => algorithm === ChecksumAlgorithm.MD5 ? "content-md5" : `x-amz-checksum-${algorithm.toLowerCase()}`;
-
-const hasHeader = (header, headers) => {
-    const soughtHeader = header.toLowerCase();
-    for (const headerName of Object.keys(headers)) {
-        if (soughtHeader === headerName.toLowerCase()) {
-            return true;
-        }
-    }
-    return false;
-};
-
-const hasHeaderWithPrefix = (headerPrefix, headers) => {
-    const soughtHeaderPrefix = headerPrefix.toLowerCase();
-    for (const headerName of Object.keys(headers)) {
-        if (headerName.toLowerCase().startsWith(soughtHeaderPrefix)) {
-            return true;
-        }
-    }
-    return false;
-};
-
-const isStreaming = (body) => body !== undefined && typeof body !== "string" && !ArrayBuffer.isView(body) && !isArrayBuffer(body);
-
-/******************************************************************************
-Copyright (c) Microsoft Corporation.
-
-Permission to use, copy, modify, and/or distribute this software for any
-purpose with or without fee is hereby granted.
-
-THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
-REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
-AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
-INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
-LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
-OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
-PERFORMANCE OF THIS SOFTWARE.
-***************************************************************************** */
-/* global Reflect, Promise, SuppressedError, Symbol, Iterator */
-
-
-function __awaiter(thisArg, _arguments, P, generator) {
-  function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
-  return new (P || (P = Promise))(function (resolve, reject) {
-      function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
-      function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
-      function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
-      step((generator = generator.apply(thisArg, _arguments || [])).next());
-  });
-}
-
-function __generator(thisArg, body) {
-  var _ = { label: 0, sent: function() { if (t[0] & 1) throw t[1]; return t[1]; }, trys: [], ops: [] }, f, y, t, g = Object.create((typeof Iterator === "function" ? Iterator : Object).prototype);
-  return g.next = verb(0), g["throw"] = verb(1), g["return"] = verb(2), typeof Symbol === "function" && (g[Symbol.iterator] = function() { return this; }), g;
-  function verb(n) { return function (v) { return step([n, v]); }; }
-  function step(op) {
-      if (f) throw new TypeError("Generator is already executing.");
-      while (g && (g = 0, op[0] && (_ = 0)), _) try {
-          if (f = 1, y && (t = op[0] & 2 ? y["return"] : op[0] ? y["throw"] || ((t = y["return"]) && t.call(y), 0) : y.next) && !(t = t.call(y, op[1])).done) return t;
-          if (y = 0, t) op = [op[0] & 2, t.value];
-          switch (op[0]) {
-              case 0: case 1: t = op; break;
-              case 4: _.label++; return { value: op[1], done: false };
-              case 5: _.label++; y = op[1]; op = [0]; continue;
-              case 7: op = _.ops.pop(); _.trys.pop(); continue;
-              default:
-                  if (!(t = _.trys, t = t.length > 0 && t[t.length - 1]) && (op[0] === 6 || op[0] === 2)) { _ = 0; continue; }
-                  if (op[0] === 3 && (!t || (op[1] > t[0] && op[1] < t[3]))) { _.label = op[1]; break; }
-                  if (op[0] === 6 && _.label < t[1]) { _.label = t[1]; t = op; break; }
-                  if (t && _.label < t[2]) { _.label = t[2]; _.ops.push(op); break; }
-                  if (t[2]) _.ops.pop();
-                  _.trys.pop(); continue;
-          }
-          op = body.call(thisArg, _);
-      } catch (e) { op = [6, e]; y = 0; } finally { f = t = 0; }
-      if (op[0] & 5) throw op[1]; return { value: op[0] ? op[1] : void 0, done: true };
-  }
-}
-
-function __values(o) {
-  var s = typeof Symbol === "function" && Symbol.iterator, m = s && o[s], i = 0;
-  if (m) return m.call(o);
-  if (o && typeof o.length === "number") return {
-      next: function () {
-          if (o && i >= o.length) o = void 0;
-          return { value: o && o[i++], done: !o };
-      }
-  };
-  throw new TypeError(s ? "Object is not iterable." : "Symbol.iterator is not defined.");
-}
-
-typeof SuppressedError === "function" ? SuppressedError : function (error, suppressed, message) {
-  var e = new Error(message);
-  return e.name = "SuppressedError", e.error = error, e.suppressed = suppressed, e;
-};
-
-const fromString = (input, encoding) => {
-    if (typeof input !== "string") {
-        throw new TypeError(`The "input" argument must be of type string. Received type ${typeof input} (${input})`);
-    }
-    return encoding ? Buffer$1.from(input, encoding) : Buffer$1.from(input);
-};
-
-const fromUtf8$1 = (input) => {
-    const buf = fromString(input, "utf8");
-    return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength / Uint8Array.BYTES_PER_ELEMENT);
-};
-
-// Copyright Amazon.com Inc. or its affiliates. All Rights Reserved.
-// SPDX-License-Identifier: Apache-2.0
-// Quick polyfill
-var fromUtf8 = typeof Buffer !== "undefined" && Buffer.from
-    ? function (input) { return Buffer.from(input, "utf8"); }
-    : fromUtf8$1;
-function convertToBuffer(data) {
-    // Already a Uint8, do nothing
-    if (data instanceof Uint8Array)
-        return data;
-    if (typeof data === "string") {
-        return fromUtf8(data);
-    }
-    if (ArrayBuffer.isView(data)) {
-        return new Uint8Array(data.buffer, data.byteOffset, data.byteLength / Uint8Array.BYTES_PER_ELEMENT);
-    }
-    return new Uint8Array(data);
-}
-
-// Copyright Amazon.com Inc. or its affiliates. All Rights Reserved.
-// SPDX-License-Identifier: Apache-2.0
-function isEmptyData(data) {
-    if (typeof data === "string") {
-        return data.length === 0;
-    }
-    return data.byteLength === 0;
-}
-
-// Copyright Amazon.com Inc. or its affiliates. All Rights Reserved.
-// SPDX-License-Identifier: Apache-2.0
-function numToUint8(num) {
-    return new Uint8Array([
-        (num & 0xff000000) >> 24,
-        (num & 0x00ff0000) >> 16,
-        (num & 0x0000ff00) >> 8,
-        num & 0x000000ff,
-    ]);
-}
-
-// Copyright Amazon.com Inc. or its affiliates. All Rights Reserved.
-// SPDX-License-Identifier: Apache-2.0
-// IE 11 does not support Array.from, so we do it manually
-function uint32ArrayFrom(a_lookUpTable) {
-    if (!Uint32Array.from) {
-        var return_array = new Uint32Array(a_lookUpTable.length);
-        var a_index = 0;
-        while (a_index < a_lookUpTable.length) {
-            return_array[a_index] = a_lookUpTable[a_index];
-            a_index += 1;
-        }
-        return return_array;
-    }
-    return Uint32Array.from(a_lookUpTable);
-}
-
-// Copyright Amazon.com Inc. or its affiliates. All Rights Reserved.
-// SPDX-License-Identifier: Apache-2.0
-var AwsCrc32c = /** @class */ (function () {
-    function AwsCrc32c() {
-        this.crc32c = new Crc32c();
-    }
-    AwsCrc32c.prototype.update = function (toHash) {
-        if (isEmptyData(toHash))
-            return;
-        this.crc32c.update(convertToBuffer(toHash));
-    };
-    AwsCrc32c.prototype.digest = function () {
-        return __awaiter(this, void 0, void 0, function () {
-            return __generator(this, function (_a) {
-                return [2 /*return*/, numToUint8(this.crc32c.digest())];
-            });
-        });
-    };
-    AwsCrc32c.prototype.reset = function () {
-        this.crc32c = new Crc32c();
-    };
-    return AwsCrc32c;
-}());
-
-// Copyright Amazon.com Inc. or its affiliates. All Rights Reserved.
-// SPDX-License-Identifier: Apache-2.0
-var Crc32c = /** @class */ (function () {
-    function Crc32c() {
-        this.checksum = 0xffffffff;
-    }
-    Crc32c.prototype.update = function (data) {
-        var e_1, _a;
-        try {
-            for (var data_1 = __values(data), data_1_1 = data_1.next(); !data_1_1.done; data_1_1 = data_1.next()) {
-                var byte = data_1_1.value;
-                this.checksum =
-                    (this.checksum >>> 8) ^ lookupTable$1[(this.checksum ^ byte) & 0xff];
-            }
-        }
-        catch (e_1_1) { e_1 = { error: e_1_1 }; }
-        finally {
-            try {
-                if (data_1_1 && !data_1_1.done && (_a = data_1.return)) _a.call(data_1);
-            }
-            finally { if (e_1) throw e_1.error; }
-        }
-        return this;
-    };
-    Crc32c.prototype.digest = function () {
-        return (this.checksum ^ 0xffffffff) >>> 0;
-    };
-    return Crc32c;
-}());
-// prettier-ignore
-var a_lookupTable = [
-    0x00000000, 0xF26B8303, 0xE13B70F7, 0x1350F3F4, 0xC79A971F, 0x35F1141C, 0x26A1E7E8, 0xD4CA64EB,
-    0x8AD958CF, 0x78B2DBCC, 0x6BE22838, 0x9989AB3B, 0x4D43CFD0, 0xBF284CD3, 0xAC78BF27, 0x5E133C24,
-    0x105EC76F, 0xE235446C, 0xF165B798, 0x030E349B, 0xD7C45070, 0x25AFD373, 0x36FF2087, 0xC494A384,
-    0x9A879FA0, 0x68EC1CA3, 0x7BBCEF57, 0x89D76C54, 0x5D1D08BF, 0xAF768BBC, 0xBC267848, 0x4E4DFB4B,
-    0x20BD8EDE, 0xD2D60DDD, 0xC186FE29, 0x33ED7D2A, 0xE72719C1, 0x154C9AC2, 0x061C6936, 0xF477EA35,
-    0xAA64D611, 0x580F5512, 0x4B5FA6E6, 0xB93425E5, 0x6DFE410E, 0x9F95C20D, 0x8CC531F9, 0x7EAEB2FA,
-    0x30E349B1, 0xC288CAB2, 0xD1D83946, 0x23B3BA45, 0xF779DEAE, 0x05125DAD, 0x1642AE59, 0xE4292D5A,
-    0xBA3A117E, 0x4851927D, 0x5B016189, 0xA96AE28A, 0x7DA08661, 0x8FCB0562, 0x9C9BF696, 0x6EF07595,
-    0x417B1DBC, 0xB3109EBF, 0xA0406D4B, 0x522BEE48, 0x86E18AA3, 0x748A09A0, 0x67DAFA54, 0x95B17957,
-    0xCBA24573, 0x39C9C670, 0x2A993584, 0xD8F2B687, 0x0C38D26C, 0xFE53516F, 0xED03A29B, 0x1F682198,
-    0x5125DAD3, 0xA34E59D0, 0xB01EAA24, 0x42752927, 0x96BF4DCC, 0x64D4CECF, 0x77843D3B, 0x85EFBE38,
-    0xDBFC821C, 0x2997011F, 0x3AC7F2EB, 0xC8AC71E8, 0x1C661503, 0xEE0D9600, 0xFD5D65F4, 0x0F36E6F7,
-    0x61C69362, 0x93AD1061, 0x80FDE395, 0x72966096, 0xA65C047D, 0x5437877E, 0x4767748A, 0xB50CF789,
-    0xEB1FCBAD, 0x197448AE, 0x0A24BB5A, 0xF84F3859, 0x2C855CB2, 0xDEEEDFB1, 0xCDBE2C45, 0x3FD5AF46,
-    0x7198540D, 0x83F3D70E, 0x90A324FA, 0x62C8A7F9, 0xB602C312, 0x44694011, 0x5739B3E5, 0xA55230E6,
-    0xFB410CC2, 0x092A8FC1, 0x1A7A7C35, 0xE811FF36, 0x3CDB9BDD, 0xCEB018DE, 0xDDE0EB2A, 0x2F8B6829,
-    0x82F63B78, 0x709DB87B, 0x63CD4B8F, 0x91A6C88C, 0x456CAC67, 0xB7072F64, 0xA457DC90, 0x563C5F93,
-    0x082F63B7, 0xFA44E0B4, 0xE9141340, 0x1B7F9043, 0xCFB5F4A8, 0x3DDE77AB, 0x2E8E845F, 0xDCE5075C,
-    0x92A8FC17, 0x60C37F14, 0x73938CE0, 0x81F80FE3, 0x55326B08, 0xA759E80B, 0xB4091BFF, 0x466298FC,
-    0x1871A4D8, 0xEA1A27DB, 0xF94AD42F, 0x0B21572C, 0xDFEB33C7, 0x2D80B0C4, 0x3ED04330, 0xCCBBC033,
-    0xA24BB5A6, 0x502036A5, 0x4370C551, 0xB11B4652, 0x65D122B9, 0x97BAA1BA, 0x84EA524E, 0x7681D14D,
-    0x2892ED69, 0xDAF96E6A, 0xC9A99D9E, 0x3BC21E9D, 0xEF087A76, 0x1D63F975, 0x0E330A81, 0xFC588982,
-    0xB21572C9, 0x407EF1CA, 0x532E023E, 0xA145813D, 0x758FE5D6, 0x87E466D5, 0x94B49521, 0x66DF1622,
-    0x38CC2A06, 0xCAA7A905, 0xD9F75AF1, 0x2B9CD9F2, 0xFF56BD19, 0x0D3D3E1A, 0x1E6DCDEE, 0xEC064EED,
-    0xC38D26C4, 0x31E6A5C7, 0x22B65633, 0xD0DDD530, 0x0417B1DB, 0xF67C32D8, 0xE52CC12C, 0x1747422F,
-    0x49547E0B, 0xBB3FFD08, 0xA86F0EFC, 0x5A048DFF, 0x8ECEE914, 0x7CA56A17, 0x6FF599E3, 0x9D9E1AE0,
-    0xD3D3E1AB, 0x21B862A8, 0x32E8915C, 0xC083125F, 0x144976B4, 0xE622F5B7, 0xF5720643, 0x07198540,
-    0x590AB964, 0xAB613A67, 0xB831C993, 0x4A5A4A90, 0x9E902E7B, 0x6CFBAD78, 0x7FAB5E8C, 0x8DC0DD8F,
-    0xE330A81A, 0x115B2B19, 0x020BD8ED, 0xF0605BEE, 0x24AA3F05, 0xD6C1BC06, 0xC5914FF2, 0x37FACCF1,
-    0x69E9F0D5, 0x9B8273D6, 0x88D28022, 0x7AB90321, 0xAE7367CA, 0x5C18E4C9, 0x4F48173D, 0xBD23943E,
-    0xF36E6F75, 0x0105EC76, 0x12551F82, 0xE03E9C81, 0x34F4F86A, 0xC69F7B69, 0xD5CF889D, 0x27A40B9E,
-    0x79B737BA, 0x8BDCB4B9, 0x988C474D, 0x6AE7C44E, 0xBE2DA0A5, 0x4C4623A6, 0x5F16D052, 0xAD7D5351,
-];
-var lookupTable$1 = uint32ArrayFrom(a_lookupTable);
-
-const generateCRC64NVMETable = () => {
-    const sliceLength = 8;
-    const tables = new Array(sliceLength);
-    for (let slice = 0; slice < sliceLength; slice++) {
-        const table = new Array(512);
-        for (let i = 0; i < 256; i++) {
-            let crc = BigInt(i);
-            for (let j = 0; j < 8 * (slice + 1); j++) {
-                if (crc & 1n) {
-                    crc = (crc >> 1n) ^ 0x9a6c9329ac4bc9b5n;
-                }
-                else {
-                    crc = crc >> 1n;
-                }
-            }
-            table[i * 2] = Number((crc >> 32n) & 0xffffffffn);
-            table[i * 2 + 1] = Number(crc & 0xffffffffn);
-        }
-        tables[slice] = new Uint32Array(table);
-    }
-    return tables;
-};
-let CRC64_NVME_REVERSED_TABLE;
-let t0, t1, t2, t3;
-let t4, t5, t6, t7;
-const ensureTablesInitialized = () => {
-    if (!CRC64_NVME_REVERSED_TABLE) {
-        CRC64_NVME_REVERSED_TABLE = generateCRC64NVMETable();
-        [t0, t1, t2, t3, t4, t5, t6, t7] = CRC64_NVME_REVERSED_TABLE;
-    }
-};
-class Crc64Nvme {
-    c1 = 0;
-    c2 = 0;
-    constructor() {
-        ensureTablesInitialized();
-        this.reset();
-    }
-    update(data) {
-        const len = data.length;
-        let i = 0;
-        let crc1 = this.c1;
-        let crc2 = this.c2;
-        while (i + 8 <= len) {
-            const idx0 = ((crc2 ^ data[i++]) & 255) << 1;
-            const idx1 = (((crc2 >>> 8) ^ data[i++]) & 255) << 1;
-            const idx2 = (((crc2 >>> 16) ^ data[i++]) & 255) << 1;
-            const idx3 = (((crc2 >>> 24) ^ data[i++]) & 255) << 1;
-            const idx4 = ((crc1 ^ data[i++]) & 255) << 1;
-            const idx5 = (((crc1 >>> 8) ^ data[i++]) & 255) << 1;
-            const idx6 = (((crc1 >>> 16) ^ data[i++]) & 255) << 1;
-            const idx7 = (((crc1 >>> 24) ^ data[i++]) & 255) << 1;
-            crc1 = t7[idx0] ^ t6[idx1] ^ t5[idx2] ^ t4[idx3] ^ t3[idx4] ^ t2[idx5] ^ t1[idx6] ^ t0[idx7];
-            crc2 =
-                t7[idx0 + 1] ^
-                    t6[idx1 + 1] ^
-                    t5[idx2 + 1] ^
-                    t4[idx3 + 1] ^
-                    t3[idx4 + 1] ^
-                    t2[idx5 + 1] ^
-                    t1[idx6 + 1] ^
-                    t0[idx7 + 1];
-        }
-        while (i < len) {
-            const idx = ((crc2 ^ data[i]) & 255) << 1;
-            crc2 = ((crc2 >>> 8) | ((crc1 & 255) << 24)) >>> 0;
-            crc1 = (crc1 >>> 8) ^ t0[idx];
-            crc2 ^= t0[idx + 1];
-            i++;
-        }
-        this.c1 = crc1;
-        this.c2 = crc2;
-    }
-    async digest() {
-        const c1 = this.c1 ^ 4294967295;
-        const c2 = this.c2 ^ 4294967295;
-        return new Uint8Array([
-            c1 >>> 24,
-            (c1 >>> 16) & 255,
-            (c1 >>> 8) & 255,
-            c1 & 255,
-            c2 >>> 24,
-            (c2 >>> 16) & 255,
-            (c2 >>> 8) & 255,
-            c2 & 255,
-        ]);
-    }
-    reset() {
-        this.c1 = 4294967295;
-        this.c2 = 4294967295;
-    }
-}
-
-// Copyright Amazon.com Inc. or its affiliates. All Rights Reserved.
-// SPDX-License-Identifier: Apache-2.0
-var AwsCrc32 = /** @class */ (function () {
-    function AwsCrc32() {
-        this.crc32 = new Crc32();
-    }
-    AwsCrc32.prototype.update = function (toHash) {
-        if (isEmptyData(toHash))
-            return;
-        this.crc32.update(convertToBuffer(toHash));
-    };
-    AwsCrc32.prototype.digest = function () {
-        return __awaiter(this, void 0, void 0, function () {
-            return __generator(this, function (_a) {
-                return [2 /*return*/, numToUint8(this.crc32.digest())];
-            });
-        });
-    };
-    AwsCrc32.prototype.reset = function () {
-        this.crc32 = new Crc32();
-    };
-    return AwsCrc32;
-}());
-
-var Crc32 = /** @class */ (function () {
-    function Crc32() {
-        this.checksum = 0xffffffff;
-    }
-    Crc32.prototype.update = function (data) {
-        var e_1, _a;
-        try {
-            for (var data_1 = __values(data), data_1_1 = data_1.next(); !data_1_1.done; data_1_1 = data_1.next()) {
-                var byte = data_1_1.value;
-                this.checksum =
-                    (this.checksum >>> 8) ^ lookupTable[(this.checksum ^ byte) & 0xff];
-            }
-        }
-        catch (e_1_1) { e_1 = { error: e_1_1 }; }
-        finally {
-            try {
-                if (data_1_1 && !data_1_1.done && (_a = data_1.return)) _a.call(data_1);
-            }
-            finally { if (e_1) throw e_1.error; }
-        }
-        return this;
-    };
-    Crc32.prototype.digest = function () {
-        return (this.checksum ^ 0xffffffff) >>> 0;
-    };
-    return Crc32;
-}());
-// prettier-ignore
-var a_lookUpTable = [
-    0x00000000, 0x77073096, 0xEE0E612C, 0x990951BA,
-    0x076DC419, 0x706AF48F, 0xE963A535, 0x9E6495A3,
-    0x0EDB8832, 0x79DCB8A4, 0xE0D5E91E, 0x97D2D988,
-    0x09B64C2B, 0x7EB17CBD, 0xE7B82D07, 0x90BF1D91,
-    0x1DB71064, 0x6AB020F2, 0xF3B97148, 0x84BE41DE,
-    0x1ADAD47D, 0x6DDDE4EB, 0xF4D4B551, 0x83D385C7,
-    0x136C9856, 0x646BA8C0, 0xFD62F97A, 0x8A65C9EC,
-    0x14015C4F, 0x63066CD9, 0xFA0F3D63, 0x8D080DF5,
-    0x3B6E20C8, 0x4C69105E, 0xD56041E4, 0xA2677172,
-    0x3C03E4D1, 0x4B04D447, 0xD20D85FD, 0xA50AB56B,
-    0x35B5A8FA, 0x42B2986C, 0xDBBBC9D6, 0xACBCF940,
-    0x32D86CE3, 0x45DF5C75, 0xDCD60DCF, 0xABD13D59,
-    0x26D930AC, 0x51DE003A, 0xC8D75180, 0xBFD06116,
-    0x21B4F4B5, 0x56B3C423, 0xCFBA9599, 0xB8BDA50F,
-    0x2802B89E, 0x5F058808, 0xC60CD9B2, 0xB10BE924,
-    0x2F6F7C87, 0x58684C11, 0xC1611DAB, 0xB6662D3D,
-    0x76DC4190, 0x01DB7106, 0x98D220BC, 0xEFD5102A,
-    0x71B18589, 0x06B6B51F, 0x9FBFE4A5, 0xE8B8D433,
-    0x7807C9A2, 0x0F00F934, 0x9609A88E, 0xE10E9818,
-    0x7F6A0DBB, 0x086D3D2D, 0x91646C97, 0xE6635C01,
-    0x6B6B51F4, 0x1C6C6162, 0x856530D8, 0xF262004E,
-    0x6C0695ED, 0x1B01A57B, 0x8208F4C1, 0xF50FC457,
-    0x65B0D9C6, 0x12B7E950, 0x8BBEB8EA, 0xFCB9887C,
-    0x62DD1DDF, 0x15DA2D49, 0x8CD37CF3, 0xFBD44C65,
-    0x4DB26158, 0x3AB551CE, 0xA3BC0074, 0xD4BB30E2,
-    0x4ADFA541, 0x3DD895D7, 0xA4D1C46D, 0xD3D6F4FB,
-    0x4369E96A, 0x346ED9FC, 0xAD678846, 0xDA60B8D0,
-    0x44042D73, 0x33031DE5, 0xAA0A4C5F, 0xDD0D7CC9,
-    0x5005713C, 0x270241AA, 0xBE0B1010, 0xC90C2086,
-    0x5768B525, 0x206F85B3, 0xB966D409, 0xCE61E49F,
-    0x5EDEF90E, 0x29D9C998, 0xB0D09822, 0xC7D7A8B4,
-    0x59B33D17, 0x2EB40D81, 0xB7BD5C3B, 0xC0BA6CAD,
-    0xEDB88320, 0x9ABFB3B6, 0x03B6E20C, 0x74B1D29A,
-    0xEAD54739, 0x9DD277AF, 0x04DB2615, 0x73DC1683,
-    0xE3630B12, 0x94643B84, 0x0D6D6A3E, 0x7A6A5AA8,
-    0xE40ECF0B, 0x9309FF9D, 0x0A00AE27, 0x7D079EB1,
-    0xF00F9344, 0x8708A3D2, 0x1E01F268, 0x6906C2FE,
-    0xF762575D, 0x806567CB, 0x196C3671, 0x6E6B06E7,
-    0xFED41B76, 0x89D32BE0, 0x10DA7A5A, 0x67DD4ACC,
-    0xF9B9DF6F, 0x8EBEEFF9, 0x17B7BE43, 0x60B08ED5,
-    0xD6D6A3E8, 0xA1D1937E, 0x38D8C2C4, 0x4FDFF252,
-    0xD1BB67F1, 0xA6BC5767, 0x3FB506DD, 0x48B2364B,
-    0xD80D2BDA, 0xAF0A1B4C, 0x36034AF6, 0x41047A60,
-    0xDF60EFC3, 0xA867DF55, 0x316E8EEF, 0x4669BE79,
-    0xCB61B38C, 0xBC66831A, 0x256FD2A0, 0x5268E236,
-    0xCC0C7795, 0xBB0B4703, 0x220216B9, 0x5505262F,
-    0xC5BA3BBE, 0xB2BD0B28, 0x2BB45A92, 0x5CB36A04,
-    0xC2D7FFA7, 0xB5D0CF31, 0x2CD99E8B, 0x5BDEAE1D,
-    0x9B64C2B0, 0xEC63F226, 0x756AA39C, 0x026D930A,
-    0x9C0906A9, 0xEB0E363F, 0x72076785, 0x05005713,
-    0x95BF4A82, 0xE2B87A14, 0x7BB12BAE, 0x0CB61B38,
-    0x92D28E9B, 0xE5D5BE0D, 0x7CDCEFB7, 0x0BDBDF21,
-    0x86D3D2D4, 0xF1D4E242, 0x68DDB3F8, 0x1FDA836E,
-    0x81BE16CD, 0xF6B9265B, 0x6FB077E1, 0x18B74777,
-    0x88085AE6, 0xFF0F6A70, 0x66063BCA, 0x11010B5C,
-    0x8F659EFF, 0xF862AE69, 0x616BFFD3, 0x166CCF45,
-    0xA00AE278, 0xD70DD2EE, 0x4E048354, 0x3903B3C2,
-    0xA7672661, 0xD06016F7, 0x4969474D, 0x3E6E77DB,
-    0xAED16A4A, 0xD9D65ADC, 0x40DF0B66, 0x37D83BF0,
-    0xA9BCAE53, 0xDEBB9EC5, 0x47B2CF7F, 0x30B5FFE9,
-    0xBDBDF21C, 0xCABAC28A, 0x53B39330, 0x24B4A3A6,
-    0xBAD03605, 0xCDD70693, 0x54DE5729, 0x23D967BF,
-    0xB3667A2E, 0xC4614AB8, 0x5D681B02, 0x2A6F2B94,
-    0xB40BBE37, 0xC30C8EA1, 0x5A05DF1B, 0x2D02EF8D,
-];
-var lookupTable = uint32ArrayFrom(a_lookUpTable);
-
-class NodeCrc32 {
-    checksum = 0;
-    update(data) {
-        this.checksum = zlib.crc32(data, this.checksum);
-    }
-    async digest() {
-        return numToUint8(this.checksum);
-    }
-    reset() {
-        this.checksum = 0;
-    }
-}
-const getCrc32ChecksumAlgorithmFunction = () => {
-    if (typeof zlib.crc32 === "undefined") {
-        return AwsCrc32;
-    }
-    return NodeCrc32;
-};
-
-const selectChecksumAlgorithmFunction = (checksumAlgorithm, config) => {
-    switch (checksumAlgorithm) {
-        case ChecksumAlgorithm.MD5:
-            return config.md5;
-        case ChecksumAlgorithm.CRC32:
-            return getCrc32ChecksumAlgorithmFunction();
-        case ChecksumAlgorithm.CRC32C:
-            return AwsCrc32c;
-        case ChecksumAlgorithm.CRC64NVME:
-            {
-                return Crc64Nvme;
-            }
-        case ChecksumAlgorithm.SHA1:
-            return config.sha1;
-        case ChecksumAlgorithm.SHA256:
-            return config.sha256;
-        default:
-            throw new Error(`Unsupported checksum algorithm: ${checksumAlgorithm}`);
-    }
-};
-
-const stringHasher = (checksumAlgorithmFn, body) => {
-    const hash = new checksumAlgorithmFn();
-    hash.update(toUint8Array(body || ""));
-    return hash.digest();
-};
-
-const flexibleChecksumsMiddlewareOptions = {
-    name: "flexibleChecksumsMiddleware",
-    step: "build",
-    tags: ["BODY_CHECKSUM"],
-    override: true,
-};
-const flexibleChecksumsMiddleware = (config, middlewareConfig) => (next, context) => async (args) => {
-    if (!HttpRequest.isInstance(args.request)) {
-        return next(args);
-    }
-    if (hasHeaderWithPrefix("x-amz-checksum-", args.request.headers)) {
-        return next(args);
-    }
-    const { request, input } = args;
-    const { body: requestBody, headers } = request;
-    const { base64Encoder, streamHasher } = config;
-    const { requestChecksumRequired, requestAlgorithmMember } = middlewareConfig;
-    const requestChecksumCalculation = await config.requestChecksumCalculation();
-    const requestAlgorithmMemberName = requestAlgorithmMember?.name;
-    const requestAlgorithmMemberHttpHeader = requestAlgorithmMember?.httpHeader;
-    if (requestAlgorithmMemberName && !input[requestAlgorithmMemberName]) {
-        if (requestChecksumCalculation === RequestChecksumCalculation.WHEN_SUPPORTED || requestChecksumRequired) {
-            input[requestAlgorithmMemberName] = DEFAULT_CHECKSUM_ALGORITHM;
-            if (requestAlgorithmMemberHttpHeader) {
-                headers[requestAlgorithmMemberHttpHeader] = DEFAULT_CHECKSUM_ALGORITHM;
-            }
-        }
-    }
-    const checksumAlgorithm = getChecksumAlgorithmForRequest(input, {
-        requestChecksumRequired,
-        requestAlgorithmMember: requestAlgorithmMember?.name,
-        requestChecksumCalculation,
-    });
-    let updatedBody = requestBody;
-    let updatedHeaders = headers;
-    if (checksumAlgorithm) {
-        switch (checksumAlgorithm) {
-            case ChecksumAlgorithm.CRC32:
-                setFeature$1(context, "FLEXIBLE_CHECKSUMS_REQ_CRC32", "U");
-                break;
-            case ChecksumAlgorithm.CRC32C:
-                setFeature$1(context, "FLEXIBLE_CHECKSUMS_REQ_CRC32C", "V");
-                break;
-            case ChecksumAlgorithm.CRC64NVME:
-                setFeature$1(context, "FLEXIBLE_CHECKSUMS_REQ_CRC64", "W");
-                break;
-            case ChecksumAlgorithm.SHA1:
-                setFeature$1(context, "FLEXIBLE_CHECKSUMS_REQ_SHA1", "X");
-                break;
-            case ChecksumAlgorithm.SHA256:
-                setFeature$1(context, "FLEXIBLE_CHECKSUMS_REQ_SHA256", "Y");
-                break;
-        }
-        const checksumLocationName = getChecksumLocationName(checksumAlgorithm);
-        const checksumAlgorithmFn = selectChecksumAlgorithmFunction(checksumAlgorithm, config);
-        if (isStreaming(requestBody)) {
-            const { getAwsChunkedEncodingStream, bodyLengthChecker } = config;
-            updatedBody = getAwsChunkedEncodingStream(typeof config.requestStreamBufferSize === "number" && config.requestStreamBufferSize >= 8 * 1024
-                ? createBufferedReadable(requestBody, config.requestStreamBufferSize, context.logger)
-                : requestBody, {
-                base64Encoder,
-                bodyLengthChecker,
-                checksumLocationName,
-                checksumAlgorithmFn,
-                streamHasher,
-            });
-            updatedHeaders = {
-                ...headers,
-                "content-encoding": headers["content-encoding"]
-                    ? `${headers["content-encoding"]},aws-chunked`
-                    : "aws-chunked",
-                "transfer-encoding": "chunked",
-                "x-amz-decoded-content-length": headers["content-length"],
-                "x-amz-content-sha256": "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
-                "x-amz-trailer": checksumLocationName,
-            };
-            delete updatedHeaders["content-length"];
-        }
-        else if (!hasHeader(checksumLocationName, headers)) {
-            const rawChecksum = await stringHasher(checksumAlgorithmFn, requestBody);
-            updatedHeaders = {
-                ...headers,
-                [checksumLocationName]: base64Encoder(rawChecksum),
-            };
-        }
-    }
-    try {
-        const result = await next({
-            ...args,
-            request: {
-                ...request,
-                headers: updatedHeaders,
-                body: updatedBody,
-            },
-        });
-        return result;
-    }
-    catch (e) {
-        if (e instanceof Error && e.name === "InvalidChunkSizeError") {
-            try {
-                if (!e.message.endsWith(".")) {
-                    e.message += ".";
-                }
-                e.message +=
-                    " Set [requestStreamBufferSize=number e.g. 65_536] in client constructor to instruct AWS SDK to buffer your input stream.";
-            }
-            catch (ignored) {
-            }
-        }
-        throw e;
-    }
-};
-
-const flexibleChecksumsInputMiddlewareOptions = {
-    name: "flexibleChecksumsInputMiddleware",
-    toMiddleware: "serializerMiddleware",
-    relation: "before",
-    tags: ["BODY_CHECKSUM"],
-    override: true,
-};
-const flexibleChecksumsInputMiddleware = (config, middlewareConfig) => (next, context) => async (args) => {
-    const input = args.input;
-    const { requestValidationModeMember } = middlewareConfig;
-    const requestChecksumCalculation = await config.requestChecksumCalculation();
-    const responseChecksumValidation = await config.responseChecksumValidation();
-    switch (requestChecksumCalculation) {
-        case RequestChecksumCalculation.WHEN_REQUIRED:
-            setFeature$1(context, "FLEXIBLE_CHECKSUMS_REQ_WHEN_REQUIRED", "a");
-            break;
-        case RequestChecksumCalculation.WHEN_SUPPORTED:
-            setFeature$1(context, "FLEXIBLE_CHECKSUMS_REQ_WHEN_SUPPORTED", "Z");
-            break;
-    }
-    switch (responseChecksumValidation) {
-        case ResponseChecksumValidation.WHEN_REQUIRED:
-            setFeature$1(context, "FLEXIBLE_CHECKSUMS_RES_WHEN_REQUIRED", "c");
-            break;
-        case ResponseChecksumValidation.WHEN_SUPPORTED:
-            setFeature$1(context, "FLEXIBLE_CHECKSUMS_RES_WHEN_SUPPORTED", "b");
-            break;
-    }
-    if (requestValidationModeMember && !input[requestValidationModeMember]) {
-        if (responseChecksumValidation === ResponseChecksumValidation.WHEN_SUPPORTED) {
-            input[requestValidationModeMember] = "ENABLED";
-        }
-    }
-    return next(args);
-};
-
-const getChecksumAlgorithmListForResponse = (responseAlgorithms = []) => {
-    const validChecksumAlgorithms = [];
-    for (const algorithm of PRIORITY_ORDER_ALGORITHMS) {
-        if (!responseAlgorithms.includes(algorithm) || !CLIENT_SUPPORTED_ALGORITHMS.includes(algorithm)) {
-            continue;
-        }
-        validChecksumAlgorithms.push(algorithm);
-    }
-    return validChecksumAlgorithms;
-};
-
-const isChecksumWithPartNumber = (checksum) => {
-    const lastHyphenIndex = checksum.lastIndexOf("-");
-    if (lastHyphenIndex !== -1) {
-        const numberPart = checksum.slice(lastHyphenIndex + 1);
-        if (!numberPart.startsWith("0")) {
-            const number = parseInt(numberPart, 10);
-            if (!isNaN(number) && number >= 1 && number <= 10000) {
-                return true;
-            }
-        }
-    }
-    return false;
-};
-
-const getChecksum = async (body, { checksumAlgorithmFn, base64Encoder }) => base64Encoder(await stringHasher(checksumAlgorithmFn, body));
-
-const validateChecksumFromResponse = async (response, { config, responseAlgorithms, logger }) => {
-    const checksumAlgorithms = getChecksumAlgorithmListForResponse(responseAlgorithms);
-    const { body: responseBody, headers: responseHeaders } = response;
-    for (const algorithm of checksumAlgorithms) {
-        const responseHeader = getChecksumLocationName(algorithm);
-        const checksumFromResponse = responseHeaders[responseHeader];
-        if (checksumFromResponse) {
-            let checksumAlgorithmFn;
-            try {
-                checksumAlgorithmFn = selectChecksumAlgorithmFunction(algorithm, config);
-            }
-            catch (error) {
-                if (algorithm === ChecksumAlgorithm.CRC64NVME) {
-                    logger?.warn(`Skipping ${ChecksumAlgorithm.CRC64NVME} checksum validation: ${error.message}`);
-                    continue;
-                }
-                throw error;
-            }
-            const { base64Encoder } = config;
-            if (isStreaming(responseBody)) {
-                response.body = createChecksumStream({
-                    expectedChecksum: checksumFromResponse,
-                    checksumSourceLocation: responseHeader,
-                    checksum: new checksumAlgorithmFn(),
-                    source: responseBody,
-                    base64Encoder,
-                });
-                return;
-            }
-            const checksum = await getChecksum(responseBody, { checksumAlgorithmFn, base64Encoder });
-            if (checksum === checksumFromResponse) {
-                break;
-            }
-            throw new Error(`Checksum mismatch: expected "${checksum}" but received "${checksumFromResponse}"` +
-                ` in response header "${responseHeader}".`);
-        }
-    }
-};
-
-const flexibleChecksumsResponseMiddlewareOptions = {
-    name: "flexibleChecksumsResponseMiddleware",
-    toMiddleware: "deserializerMiddleware",
-    relation: "after",
-    tags: ["BODY_CHECKSUM"],
-    override: true,
-};
-const flexibleChecksumsResponseMiddleware = (config, middlewareConfig) => (next, context) => async (args) => {
-    if (!HttpRequest.isInstance(args.request)) {
-        return next(args);
-    }
-    const input = args.input;
-    const result = await next(args);
-    const response = result.response;
-    const { requestValidationModeMember, responseAlgorithms } = middlewareConfig;
-    if (requestValidationModeMember && input[requestValidationModeMember] === "ENABLED") {
-        const { clientName, commandName } = context;
-        const isS3WholeObjectMultipartGetResponseChecksum = clientName === "S3Client" &&
-            commandName === "GetObjectCommand" &&
-            getChecksumAlgorithmListForResponse(responseAlgorithms).every((algorithm) => {
-                const responseHeader = getChecksumLocationName(algorithm);
-                const checksumFromResponse = response.headers[responseHeader];
-                return !checksumFromResponse || isChecksumWithPartNumber(checksumFromResponse);
-            });
-        if (isS3WholeObjectMultipartGetResponseChecksum) {
-            return result;
-        }
-        await validateChecksumFromResponse(response, {
-            config,
-            responseAlgorithms,
-            logger: context.logger,
-        });
-    }
-    return result;
-};
-
-const getFlexibleChecksumsPlugin = (config, middlewareConfig) => ({
-    applyToStack: (clientStack) => {
-        clientStack.add(flexibleChecksumsMiddleware(config, middlewareConfig), flexibleChecksumsMiddlewareOptions);
-        clientStack.addRelativeTo(flexibleChecksumsInputMiddleware(config, middlewareConfig), flexibleChecksumsInputMiddlewareOptions);
-        clientStack.addRelativeTo(flexibleChecksumsResponseMiddleware(config, middlewareConfig), flexibleChecksumsResponseMiddlewareOptions);
-    },
-});
-
-const resolveFlexibleChecksumsConfig = (input) => {
-    const { requestChecksumCalculation, responseChecksumValidation, requestStreamBufferSize } = input;
-    return Object.assign(input, {
-        requestChecksumCalculation: normalizeProvider$1(requestChecksumCalculation ?? DEFAULT_REQUEST_CHECKSUM_CALCULATION),
-        responseChecksumValidation: normalizeProvider$1(responseChecksumValidation ?? DEFAULT_RESPONSE_CHECKSUM_VALIDATION),
-        requestStreamBufferSize: Number(requestStreamBufferSize ?? 0),
-    });
-};
-
-function resolveHostHeaderConfig(input) {
-    return input;
-}
-const hostHeaderMiddleware = (options) => (next) => async (args) => {
-    if (!HttpRequest.isInstance(args.request))
-        return next(args);
-    const { request } = args;
-    const { handlerProtocol = "" } = options.requestHandler.metadata || {};
-    if (handlerProtocol.indexOf("h2") >= 0 && !request.headers[":authority"]) {
-        delete request.headers["host"];
-        request.headers[":authority"] = request.hostname + (request.port ? ":" + request.port : "");
-    }
-    else if (!request.headers["host"]) {
-        let host = request.hostname;
-        if (request.port != null)
-            host += `:${request.port}`;
-        request.headers["host"] = host;
-    }
-    return next(args);
-};
-const hostHeaderMiddlewareOptions = {
-    name: "hostHeaderMiddleware",
-    step: "build",
-    priority: "low",
-    tags: ["HOST"],
-    override: true,
-};
-const getHostHeaderPlugin = (options) => ({
-    applyToStack: (clientStack) => {
-        clientStack.add(hostHeaderMiddleware(options), hostHeaderMiddlewareOptions);
-    },
-});
-
-const loggerMiddleware = () => (next, context) => async (args) => {
-    try {
-        const response = await next(args);
-        const { clientName, commandName, logger, dynamoDbDocumentClientOptions = {} } = context;
-        const { overrideInputFilterSensitiveLog, overrideOutputFilterSensitiveLog } = dynamoDbDocumentClientOptions;
-        const inputFilterSensitiveLog = overrideInputFilterSensitiveLog ?? context.inputFilterSensitiveLog;
-        const outputFilterSensitiveLog = overrideOutputFilterSensitiveLog ?? context.outputFilterSensitiveLog;
-        const { $metadata, ...outputWithoutMetadata } = response.output;
-        logger?.info?.({
-            clientName,
-            commandName,
-            input: inputFilterSensitiveLog(args.input),
-            output: outputFilterSensitiveLog(outputWithoutMetadata),
-            metadata: $metadata,
-        });
-        return response;
-    }
-    catch (error) {
-        const { clientName, commandName, logger, dynamoDbDocumentClientOptions = {} } = context;
-        const { overrideInputFilterSensitiveLog } = dynamoDbDocumentClientOptions;
-        const inputFilterSensitiveLog = overrideInputFilterSensitiveLog ?? context.inputFilterSensitiveLog;
-        logger?.error?.({
-            clientName,
-            commandName,
-            input: inputFilterSensitiveLog(args.input),
-            error,
-            metadata: error.$metadata,
-        });
-        throw error;
-    }
-};
-const loggerMiddlewareOptions = {
-    name: "loggerMiddleware",
-    tags: ["LOGGER"],
-    step: "initialize",
-    override: true,
-};
-const getLoggerPlugin = (options) => ({
-    applyToStack: (clientStack) => {
-        clientStack.add(loggerMiddleware(), loggerMiddlewareOptions);
-    },
-});
-
-const recursionDetectionMiddlewareOptions = {
-    step: "build",
-    tags: ["RECURSION_DETECTION"],
-    name: "recursionDetectionMiddleware",
-    override: true,
-    priority: "low",
-};
-
-const PROTECTED_KEYS = {
-    REQUEST_ID: Symbol.for("_AWS_LAMBDA_REQUEST_ID"),
-    X_RAY_TRACE_ID: Symbol.for("_AWS_LAMBDA_X_RAY_TRACE_ID"),
-    TENANT_ID: Symbol.for("_AWS_LAMBDA_TENANT_ID"),
-};
-const NO_GLOBAL_AWS_LAMBDA = ["true", "1"].includes(process.env?.AWS_LAMBDA_NODEJS_NO_GLOBAL_AWSLAMBDA ?? "");
-if (!NO_GLOBAL_AWS_LAMBDA) {
-    globalThis.awslambda = globalThis.awslambda || {};
-}
-class InvokeStoreBase {
-    static PROTECTED_KEYS = PROTECTED_KEYS;
-    isProtectedKey(key) {
-        return Object.values(PROTECTED_KEYS).includes(key);
-    }
-    getRequestId() {
-        return this.get(PROTECTED_KEYS.REQUEST_ID) ?? "-";
-    }
-    getXRayTraceId() {
-        return this.get(PROTECTED_KEYS.X_RAY_TRACE_ID);
-    }
-    getTenantId() {
-        return this.get(PROTECTED_KEYS.TENANT_ID);
-    }
-}
-class InvokeStoreSingle extends InvokeStoreBase {
-    currentContext;
-    getContext() {
-        return this.currentContext;
-    }
-    hasContext() {
-        return this.currentContext !== undefined;
-    }
-    get(key) {
-        return this.currentContext?.[key];
-    }
-    set(key, value) {
-        if (this.isProtectedKey(key)) {
-            throw new Error(`Cannot modify protected Lambda context field: ${String(key)}`);
-        }
-        this.currentContext = this.currentContext || {};
-        this.currentContext[key] = value;
-    }
-    run(context, fn) {
-        this.currentContext = context;
-        return fn();
-    }
-}
-class InvokeStoreMulti extends InvokeStoreBase {
-    als;
-    static async create() {
-        const instance = new InvokeStoreMulti();
-        const asyncHooks = await import('node:async_hooks');
-        instance.als = new asyncHooks.AsyncLocalStorage();
-        return instance;
-    }
-    getContext() {
-        return this.als.getStore();
-    }
-    hasContext() {
-        return this.als.getStore() !== undefined;
-    }
-    get(key) {
-        return this.als.getStore()?.[key];
-    }
-    set(key, value) {
-        if (this.isProtectedKey(key)) {
-            throw new Error(`Cannot modify protected Lambda context field: ${String(key)}`);
-        }
-        const store = this.als.getStore();
-        if (!store) {
-            throw new Error("No context available");
-        }
-        store[key] = value;
-    }
-    run(context, fn) {
-        return this.als.run(context, fn);
-    }
-}
-var InvokeStore;
-(function (InvokeStore) {
-    let instance = null;
-    async function getInstanceAsync() {
-        if (!instance) {
-            instance = (async () => {
-                const isMulti = "AWS_LAMBDA_MAX_CONCURRENCY" in process.env;
-                const newInstance = isMulti
-                    ? await InvokeStoreMulti.create()
-                    : new InvokeStoreSingle();
-                if (!NO_GLOBAL_AWS_LAMBDA && globalThis.awslambda?.InvokeStore) {
-                    return globalThis.awslambda.InvokeStore;
-                }
-                else if (!NO_GLOBAL_AWS_LAMBDA && globalThis.awslambda) {
-                    globalThis.awslambda.InvokeStore = newInstance;
-                    return newInstance;
-                }
-                else {
-                    return newInstance;
-                }
-            })();
-        }
-        return instance;
-    }
-    InvokeStore.getInstanceAsync = getInstanceAsync;
-    InvokeStore._testing = process.env.AWS_LAMBDA_BENCHMARK_MODE === "1"
-        ? {
-            reset: () => {
-                instance = null;
-                if (globalThis.awslambda?.InvokeStore) {
-                    delete globalThis.awslambda.InvokeStore;
-                }
-                globalThis.awslambda = { InvokeStore: undefined };
-            },
-        }
-        : undefined;
-})(InvokeStore || (InvokeStore = {}));
-
-const TRACE_ID_HEADER_NAME = "X-Amzn-Trace-Id";
-const ENV_LAMBDA_FUNCTION_NAME = "AWS_LAMBDA_FUNCTION_NAME";
-const ENV_TRACE_ID = "_X_AMZN_TRACE_ID";
-const recursionDetectionMiddleware = () => (next) => async (args) => {
-    const { request } = args;
-    if (!HttpRequest.isInstance(request)) {
-        return next(args);
-    }
-    const traceIdHeader = Object.keys(request.headers ?? {}).find((h) => h.toLowerCase() === TRACE_ID_HEADER_NAME.toLowerCase()) ??
-        TRACE_ID_HEADER_NAME;
-    if (request.headers.hasOwnProperty(traceIdHeader)) {
-        return next(args);
-    }
-    const functionName = process.env[ENV_LAMBDA_FUNCTION_NAME];
-    const traceIdFromEnv = process.env[ENV_TRACE_ID];
-    const invokeStore = await InvokeStore.getInstanceAsync();
-    const traceIdFromInvokeStore = invokeStore?.getXRayTraceId();
-    const traceId = traceIdFromInvokeStore ?? traceIdFromEnv;
-    const nonEmptyString = (str) => typeof str === "string" && str.length > 0;
-    if (nonEmptyString(functionName) && nonEmptyString(traceId)) {
-        request.headers[TRACE_ID_HEADER_NAME] = traceId;
-    }
-    return next({
-        ...args,
-        request,
-    });
-};
-
-const getRecursionDetectionPlugin = (options) => ({
-    applyToStack: (clientStack) => {
-        clientStack.add(recursionDetectionMiddleware(), recursionDetectionMiddlewareOptions);
-    },
-});
-
 const CONTENT_LENGTH_HEADER$1 = "content-length";
 const DECODED_CONTENT_LENGTH_HEADER = "x-amz-decoded-content-length";
 function checkContentLengthHeader() {
     return (next, context) => async (args) => {
         const { request } = args;
-        if (HttpRequest.isInstance(request)) {
+        if (HttpRequest$1.isInstance(request)) {
             if (!(CONTENT_LENGTH_HEADER$1 in request.headers) && !(DECODED_CONTENT_LENGTH_HEADER in request.headers)) {
                 const message = `Are you using a Stream of unknown length as the Body of a PutObject request? Consider using Upload instead from @aws-sdk/lib-storage.`;
                 if (typeof context?.logger?.warn === "function" && !(context.logger instanceof NoOpLogger)) {
@@ -14046,7 +14387,7 @@ const s3ExpiresMiddleware = (config) => {
     return (next, context) => async (args) => {
         const result = await next(args);
         const { response } = result;
-        if (HttpResponse.isInstance(response)) {
+        if (HttpResponse$1.isInstance(response)) {
             if (response.headers.expires) {
                 response.headers.expiresstring = response.headers.expires;
                 try {
@@ -14224,7 +14565,7 @@ const s3ExpressMiddleware = (options) => {
                         Bucket: requestBucket,
                     });
                     context.s3ExpressIdentity = s3ExpressIdentity;
-                    if (HttpRequest.isInstance(args.request) && s3ExpressIdentity.sessionToken) {
+                    if (HttpRequest$1.isInstance(args.request) && s3ExpressIdentity.sessionToken) {
                         args.request.headers[SESSION_TOKEN_HEADER$1] = s3ExpressIdentity.sessionToken;
                     }
                 }
@@ -14258,7 +14599,7 @@ const defaultErrorHandler = (signingProperties) => (error) => {
 };
 const defaultSuccessHandler = (httpResponse, signingProperties) => { };
 const s3ExpressHttpSigningMiddleware = (config) => (next, context) => async (args) => {
-    if (!HttpRequest.isInstance(args.request)) {
+    if (!HttpRequest$1.isInstance(args.request)) {
         return next(args);
     }
     const smithyContext = getSmithyContext(context);
@@ -14313,7 +14654,7 @@ const MAX_BYTES_TO_INSPECT = 3000;
 const throw200ExceptionsMiddleware = (config) => (next, context) => async (args) => {
     const result = await next(args);
     const { response } = result;
-    if (!HttpResponse.isInstance(response)) {
+    if (!HttpResponse$1.isInstance(response)) {
         return result;
     }
     const { statusCode, body: sourceBody } = response;
@@ -14441,7 +14782,7 @@ function isValidUserAgentAppId(appId) {
     return typeof appId === "string" && appId.length <= 50;
 }
 function resolveUserAgentConfig(input) {
-    const normalizedAppIdProvider = normalizeProvider(input.userAgentAppId ?? DEFAULT_UA_APP_ID);
+    const normalizedAppIdProvider = normalizeProvider$1(input.userAgentAppId ?? DEFAULT_UA_APP_ID);
     const { customUserAgent } = input;
     return Object.assign(input, {
         customUserAgent: typeof customUserAgent === "string" ? [[customUserAgent]] : customUserAgent,
@@ -15404,7 +15745,7 @@ function encodeFeatures(features) {
 
 const userAgentMiddleware = (options) => (next, context) => async (args) => {
     const { request } = args;
-    if (!HttpRequest.isInstance(request)) {
+    if (!HttpRequest$1.isInstance(request)) {
         return next(args);
     }
     const { headers } = request;
@@ -15561,7 +15902,7 @@ const CONTENT_LENGTH_HEADER = "content-length";
 function contentLengthMiddleware(bodyLengthChecker) {
     return (next) => async (args) => {
         const request = args.request;
-        if (HttpRequest.isInstance(request)) {
+        if (HttpRequest$1.isInstance(request)) {
             const { body, headers } = request;
             if (body &&
                 Object.keys(headers)
@@ -15683,6 +16024,115 @@ const createConfigValueProvider = (configKey, canonicalEndpointParamKey, config,
     return configProvider;
 };
 
+class ProviderError extends Error {
+    name = "ProviderError";
+    tryNextLink;
+    constructor(message, options = true) {
+        let logger;
+        let tryNextLink = true;
+        if (typeof options === "boolean") {
+            logger = undefined;
+            tryNextLink = options;
+        }
+        else if (options != null && typeof options === "object") {
+            logger = options.logger;
+            tryNextLink = options.tryNextLink ?? true;
+        }
+        super(message);
+        this.tryNextLink = tryNextLink;
+        Object.setPrototypeOf(this, ProviderError.prototype);
+        logger?.debug?.(`@smithy/property-provider ${tryNextLink ? "->" : "(!)"} ${message}`);
+    }
+    static from(error, options = true) {
+        return Object.assign(new this(error.message, options), error);
+    }
+}
+
+class CredentialsProviderError extends ProviderError {
+    name = "CredentialsProviderError";
+    constructor(message, options = true) {
+        super(message, options);
+        Object.setPrototypeOf(this, CredentialsProviderError.prototype);
+    }
+}
+
+class TokenProviderError extends ProviderError {
+    name = "TokenProviderError";
+    constructor(message, options = true) {
+        super(message, options);
+        Object.setPrototypeOf(this, TokenProviderError.prototype);
+    }
+}
+
+const chain = (...providers) => async () => {
+    if (providers.length === 0) {
+        throw new ProviderError("No providers in chain");
+    }
+    let lastProviderError;
+    for (const provider of providers) {
+        try {
+            const credentials = await provider();
+            return credentials;
+        }
+        catch (err) {
+            lastProviderError = err;
+            if (err?.tryNextLink) {
+                continue;
+            }
+            throw err;
+        }
+    }
+    throw lastProviderError;
+};
+
+const fromStatic$1 = (staticValue) => () => Promise.resolve(staticValue);
+
+const memoize = (provider, isExpired, requiresRefresh) => {
+    let resolved;
+    let pending;
+    let hasResult;
+    let isConstant = false;
+    const coalesceProvider = async () => {
+        if (!pending) {
+            pending = provider();
+        }
+        try {
+            resolved = await pending;
+            hasResult = true;
+            isConstant = false;
+        }
+        finally {
+            pending = undefined;
+        }
+        return resolved;
+    };
+    if (isExpired === undefined) {
+        return async (options) => {
+            if (!hasResult || options?.forceRefresh) {
+                resolved = await coalesceProvider();
+            }
+            return resolved;
+        };
+    }
+    return async (options) => {
+        if (!hasResult || options?.forceRefresh) {
+            resolved = await coalesceProvider();
+        }
+        if (isConstant) {
+            return resolved;
+        }
+        if (requiresRefresh && !requiresRefresh(resolved)) {
+            isConstant = true;
+            return resolved;
+        }
+        if (isExpired(resolved)) {
+            await coalesceProvider();
+            return resolved;
+        }
+        return resolved;
+    };
+};
+
 function getSelectorName(functionString) {
     try {
         const constants = new Set(Array.from(functionString.match(/([A-Z_]){3,}/g) ?? []));
@@ -15717,7 +16167,7 @@ const getHomeDirCacheKey = () => {
     return "DEFAULT";
 };
 const getHomeDir = () => {
-    const { HOME, USERPROFILE, HOMEPATH, HOMEDRIVE = `C:${sep}` } = process.env;
+    const { HOME, USERPROFILE, HOMEPATH, HOMEDRIVE = `C:${sep$1}` } = process.env;
     if (HOME)
         return HOME;
     if (USERPROFILE)
@@ -15726,7 +16176,7 @@ const getHomeDir = () => {
         return `${HOMEDRIVE}${HOMEPATH}`;
     const homeDirCacheKey = getHomeDirCacheKey();
     if (!homeDirCache[homeDirCacheKey])
-        homeDirCache[homeDirCacheKey] = homedir();
+        homeDirCache[homeDirCacheKey] = homedir$1();
     return homeDirCache[homeDirCacheKey];
 };
 
@@ -15737,7 +16187,7 @@ const getProfileName = (init) => init.profile || process.env[ENV_PROFILE] || DEF
 const getSSOTokenFilepath = (id) => {
     const hasher = createHash("sha1");
     const cacheName = hasher.update(id).digest("hex");
-    return join(getHomeDir(), ".aws", "sso", "cache", `${cacheName}.json`);
+    return join$1(getHomeDir(), ".aws", "sso", "cache", `${cacheName}.json`);
 };
 
 const tokenIntercept = {};
@@ -15746,7 +16196,7 @@ const getSSOTokenFromFile = async (id) => {
         return tokenIntercept[id];
     }
     const ssoTokenFilepath = getSSOTokenFilepath(id);
-    const ssoTokenText = await readFile$1(ssoTokenFilepath, "utf8");
+    const ssoTokenText = await readFile$3(ssoTokenFilepath, "utf8");
     return JSON.parse(ssoTokenText);
 };
 
@@ -15770,10 +16220,10 @@ const getConfigData = (data) => Object.entries(data)
 });
 
 const ENV_CONFIG_PATH = "AWS_CONFIG_FILE";
-const getConfigFilepath = () => process.env[ENV_CONFIG_PATH] || join(getHomeDir(), ".aws", "config");
+const getConfigFilepath = () => process.env[ENV_CONFIG_PATH] || join$1(getHomeDir(), ".aws", "config");
 
 const ENV_CREDENTIALS_PATH = "AWS_SHARED_CREDENTIALS_FILE";
-const getCredentialsFilepath = () => process.env[ENV_CREDENTIALS_PATH] || join(getHomeDir(), ".aws", "credentials");
+const getCredentialsFilepath = () => process.env[ENV_CREDENTIALS_PATH] || join$1(getHomeDir(), ".aws", "credentials");
 
 const prefixKeyRegex = /^([\w-]+)\s(["'])?([\w-@\+\.%:/]+)\2$/;
 const profileNameBlockList = ["__proto__", "profile __proto__"];
@@ -15845,11 +16295,11 @@ const loadSharedConfigFiles = async (init = {}) => {
     const relativeHomeDirPrefix = "~/";
     let resolvedFilepath = filepath;
     if (filepath.startsWith(relativeHomeDirPrefix)) {
-        resolvedFilepath = join(homeDir, filepath.slice(2));
+        resolvedFilepath = join$1(homeDir, filepath.slice(2));
     }
     let resolvedConfigFilepath = configFilepath;
     if (configFilepath.startsWith(relativeHomeDirPrefix)) {
-        resolvedConfigFilepath = join(homeDir, configFilepath.slice(2));
+        resolvedConfigFilepath = join$1(homeDir, configFilepath.slice(2));
     }
     const parsedFiles = await Promise.all([
         readFile(resolvedConfigFilepath, {
@@ -16074,13 +16524,20 @@ const endpointMiddleware = ({ config, instructions, }) => {
     };
 };
 
+const serializerMiddlewareOption = {
+    name: "serializerMiddleware",
+    step: "serialize",
+    tags: ["SERIALIZER"],
+    override: true,
+};
+
 const endpointMiddlewareOptions = {
     step: "serialize",
     tags: ["ENDPOINT_PARAMETERS", "ENDPOINT_V2", "ENDPOINT"],
     name: "endpointV2Middleware",
     override: true,
     relation: "before",
-    toMiddleware: serializerMiddlewareOption$1.name,
+    toMiddleware: serializerMiddlewareOption.name,
 };
 const getEndpointPlugin = (config, instructions) => ({
     applyToStack: (clientStack) => {
@@ -16094,14 +16551,14 @@ const getEndpointPlugin = (config, instructions) => ({
 const resolveEndpointConfig = (input) => {
     const tls = input.tls ?? true;
     const { endpoint, useDualstackEndpoint, useFipsEndpoint } = input;
-    const customEndpointProvider = endpoint != null ? async () => toEndpointV1(await normalizeProvider$1(endpoint)()) : undefined;
+    const customEndpointProvider = endpoint != null ? async () => toEndpointV1(await normalizeProvider(endpoint)()) : undefined;
     const isCustomEndpoint = !!endpoint;
     const resolvedConfig = Object.assign(input, {
         endpoint: customEndpointProvider,
         tls,
         isCustomEndpoint,
-        useDualstackEndpoint: normalizeProvider$1(useDualstackEndpoint ?? false),
-        useFipsEndpoint: normalizeProvider$1(useFipsEndpoint ?? false),
+        useDualstackEndpoint: normalizeProvider(useDualstackEndpoint ?? false),
+        useFipsEndpoint: normalizeProvider(useFipsEndpoint ?? false),
     });
     let configuredEndpointPromise = undefined;
     resolvedConfig.serviceConfiguredEndpoint = async () => {
@@ -16413,6 +16870,39 @@ class AdaptiveRetryStrategy {
     }
 }
 
+const randomUUID = crypto$1.randomUUID.bind(crypto$1);
+
+const decimalToHex = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, "0"));
+const v4 = () => {
+    if (randomUUID) {
+        return randomUUID();
+    }
+    const rnds = new Uint8Array(16);
+    crypto.getRandomValues(rnds);
+    rnds[6] = (rnds[6] & 0x0f) | 0x40;
+    rnds[8] = (rnds[8] & 0x3f) | 0x80;
+    return (decimalToHex[rnds[0]] +
+        decimalToHex[rnds[1]] +
+        decimalToHex[rnds[2]] +
+        decimalToHex[rnds[3]] +
+        "-" +
+        decimalToHex[rnds[4]] +
+        decimalToHex[rnds[5]] +
+        "-" +
+        decimalToHex[rnds[6]] +
+        decimalToHex[rnds[7]] +
+        "-" +
+        decimalToHex[rnds[8]] +
+        decimalToHex[rnds[9]] +
+        "-" +
+        decimalToHex[rnds[10]] +
+        decimalToHex[rnds[11]] +
+        decimalToHex[rnds[12]] +
+        decimalToHex[rnds[13]] +
+        decimalToHex[rnds[14]] +
+        decimalToHex[rnds[15]]);
+};
+
 const asSdkError = (error) => {
     if (error instanceof Error)
         return error;
@@ -16450,14 +16940,14 @@ const NODE_MAX_ATTEMPT_CONFIG_OPTIONS = {
 };
 const resolveRetryConfig = (input) => {
     const { retryStrategy, retryMode: _retryMode, maxAttempts: _maxAttempts } = input;
-    const maxAttempts = normalizeProvider$1(_maxAttempts ?? DEFAULT_MAX_ATTEMPTS);
+    const maxAttempts = normalizeProvider(_maxAttempts ?? DEFAULT_MAX_ATTEMPTS);
     return Object.assign(input, {
         maxAttempts,
         retryStrategy: async () => {
             if (retryStrategy) {
                 return retryStrategy;
             }
-            const retryMode = await normalizeProvider$1(_retryMode)();
+            const retryMode = await normalizeProvider(_retryMode)();
             if (retryMode === RETRY_MODES.ADAPTIVE) {
                 return new AdaptiveRetryStrategy(maxAttempts);
             }
@@ -16486,7 +16976,7 @@ const retryMiddleware = (options) => (next, context) => async (args) => {
         let attempts = 0;
         let totalRetryDelay = 0;
         const { request } = args;
-        const isRequest = HttpRequest.isInstance(request);
+        const isRequest = HttpRequest$1.isInstance(request);
         if (isRequest) {
             request.headers[INVOCATION_ID_HEADER] = v4();
         }
@@ -16569,7 +17059,7 @@ const getRetryPlugin = (options) => ({
     },
 });
 const getRetryAfterHint = (response) => {
-    if (!HttpResponse.isInstance(response))
+    if (!HttpResponse$1.isInstance(response))
         return;
     const retryAfterHeaderName = Object.keys(response.headers).find((key) => key.toLowerCase() === "retry-after");
     if (!retryAfterHeaderName)
@@ -16747,7 +17237,7 @@ const createEndpointRuleSetHttpAuthSchemeParametersProvider = (defaultHttpAuthSc
 const _defaultS3HttpAuthSchemeParametersProvider = async (config, context, input) => {
     return {
         operation: getSmithyContext(context).operation,
-        region: await normalizeProvider$1(config.region)() || (() => {
+        region: await normalizeProvider(config.region)() || (() => {
             throw new Error("expected `region` to be configured for `aws.auth#sigv4`");
         })(),
     };
@@ -16845,7 +17335,7 @@ const resolveHttpAuthSchemeConfig$4 = (config) => {
     const config_0 = resolveAwsSdkSigV4Config(config);
     const config_1 = resolveAwsSdkSigV4AConfig(config_0);
     return Object.assign(config_1, {
-        authSchemePreference: normalizeProvider$1(config.authSchemePreference ?? []),
+        authSchemePreference: normalizeProvider(config.authSchemePreference ?? []),
     });
 };
 
@@ -17906,7 +18396,7 @@ const createDefaultUserAgentProvider = ({ serviceId, clientVersion }) => {
         const sections = [
             ["aws-sdk-js", clientVersion],
             ["ua", "2.1"],
-            [`os/${platform()}`, release()],
+            [`os/${platform()}`, release$1()],
             ["lang/js"],
             ["md/nodejs", `${versions.node}`],
         ];
@@ -17935,7 +18425,7 @@ const NODE_APP_ID_CONFIG_OPTIONS = {
     default: DEFAULT_UA_APP_ID,
 };
 
-class Int64 {
+let Int64$1 = class Int64 {
     bytes;
     constructor(bytes) {
         this.bytes = bytes;
@@ -17952,7 +18442,7 @@ class Int64 {
             bytes[i] = remaining;
         }
         if (number < 0) {
-            negate(bytes);
+            negate$1(bytes);
         }
         return new Int64(bytes);
     }
@@ -17960,15 +18450,15 @@ class Int64 {
         const bytes = this.bytes.slice(0);
         const negative = bytes[0] & 0b10000000;
         if (negative) {
-            negate(bytes);
+            negate$1(bytes);
         }
         return parseInt(toHex(bytes), 16) * (negative ? -1 : 1);
     }
     toString() {
         return String(this.valueOf());
     }
-}
-function negate(bytes) {
+};
+function negate$1(bytes) {
     for (let i = 0; i < 8; i++) {
         bytes[i] ^= 0xff;
     }
@@ -17979,7 +18469,7 @@ function negate(bytes) {
     }
 }
 
-class HeaderMarshaller {
+let HeaderMarshaller$1 = class HeaderMarshaller {
     toUtf8;
     fromUtf8;
     constructor(toUtf8, fromUtf8) {
@@ -18039,10 +18529,10 @@ class HeaderMarshaller {
             case "timestamp":
                 const tsBytes = new Uint8Array(9);
                 tsBytes[0] = 8;
-                tsBytes.set(Int64.fromNumber(header.value.valueOf()).bytes, 1);
+                tsBytes.set(Int64$1.fromNumber(header.value.valueOf()).bytes, 1);
                 return tsBytes;
             case "uuid":
-                if (!UUID_PATTERN.test(header.value)) {
+                if (!UUID_PATTERN$1.test(header.value)) {
                     throw new Error(`Invalid UUID received: ${header.value}`);
                 }
                 const uuidBytes = new Uint8Array(17);
@@ -18061,40 +18551,40 @@ class HeaderMarshaller {
             switch (headers.getUint8(position++)) {
                 case 0:
                     out[name] = {
-                        type: BOOLEAN_TAG,
+                        type: BOOLEAN_TAG$1,
                         value: true,
                     };
                     break;
                 case 1:
                     out[name] = {
-                        type: BOOLEAN_TAG,
+                        type: BOOLEAN_TAG$1,
                         value: false,
                     };
                     break;
                 case 2:
                     out[name] = {
-                        type: BYTE_TAG,
+                        type: BYTE_TAG$1,
                         value: headers.getInt8(position++),
                     };
                     break;
                 case 3:
                     out[name] = {
-                        type: SHORT_TAG,
+                        type: SHORT_TAG$1,
                         value: headers.getInt16(position, false),
                     };
                     position += 2;
                     break;
                 case 4:
                     out[name] = {
-                        type: INT_TAG,
+                        type: INT_TAG$1,
                         value: headers.getInt32(position, false),
                     };
                     position += 4;
                     break;
                 case 5:
                     out[name] = {
-                        type: LONG_TAG,
-                        value: new Int64(new Uint8Array(headers.buffer, headers.byteOffset + position, 8)),
+                        type: LONG_TAG$1,
+                        value: new Int64$1(new Uint8Array(headers.buffer, headers.byteOffset + position, 8)),
                     };
                     position += 8;
                     break;
@@ -18102,7 +18592,7 @@ class HeaderMarshaller {
                     const binaryLength = headers.getUint16(position, false);
                     position += 2;
                     out[name] = {
-                        type: BINARY_TAG,
+                        type: BINARY_TAG$1,
                         value: new Uint8Array(headers.buffer, headers.byteOffset + position, binaryLength),
                     };
                     position += binaryLength;
@@ -18111,15 +18601,15 @@ class HeaderMarshaller {
                     const stringLength = headers.getUint16(position, false);
                     position += 2;
                     out[name] = {
-                        type: STRING_TAG,
+                        type: STRING_TAG$1,
                         value: this.toUtf8(new Uint8Array(headers.buffer, headers.byteOffset + position, stringLength)),
                     };
                     position += stringLength;
                     break;
                 case 8:
                     out[name] = {
-                        type: TIMESTAMP_TAG,
-                        value: new Date(new Int64(new Uint8Array(headers.buffer, headers.byteOffset + position, 8)).valueOf()),
+                        type: TIMESTAMP_TAG$1,
+                        value: new Date(new Int64$1(new Uint8Array(headers.buffer, headers.byteOffset + position, 8)).valueOf()),
                     };
                     position += 8;
                     break;
@@ -18127,7 +18617,7 @@ class HeaderMarshaller {
                     const uuidBytes = new Uint8Array(headers.buffer, headers.byteOffset + position, 16);
                     position += 16;
                     out[name] = {
-                        type: UUID_TAG,
+                        type: UUID_TAG$1,
                         value: `${toHex(uuidBytes.subarray(0, 4))}-${toHex(uuidBytes.subarray(4, 6))}-${toHex(uuidBytes.subarray(6, 8))}-${toHex(uuidBytes.subarray(8, 10))}-${toHex(uuidBytes.subarray(10))}`,
                     };
                     break;
@@ -18137,8 +18627,8 @@ class HeaderMarshaller {
         }
         return out;
     }
-}
-var HEADER_VALUE_TYPE;
+};
+var HEADER_VALUE_TYPE$1;
 (function (HEADER_VALUE_TYPE) {
     HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["boolTrue"] = 0] = "boolTrue";
     HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["boolFalse"] = 1] = "boolFalse";
@@ -18150,24 +18640,24 @@ var HEADER_VALUE_TYPE;
     HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["string"] = 7] = "string";
     HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["timestamp"] = 8] = "timestamp";
     HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["uuid"] = 9] = "uuid";
-})(HEADER_VALUE_TYPE || (HEADER_VALUE_TYPE = {}));
-const BOOLEAN_TAG = "boolean";
-const BYTE_TAG = "byte";
-const SHORT_TAG = "short";
-const INT_TAG = "integer";
-const LONG_TAG = "long";
-const BINARY_TAG = "binary";
-const STRING_TAG = "string";
-const TIMESTAMP_TAG = "timestamp";
-const UUID_TAG = "uuid";
-const UUID_PATTERN = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+})(HEADER_VALUE_TYPE$1 || (HEADER_VALUE_TYPE$1 = {}));
+const BOOLEAN_TAG$1 = "boolean";
+const BYTE_TAG$1 = "byte";
+const SHORT_TAG$1 = "short";
+const INT_TAG$1 = "integer";
+const LONG_TAG$1 = "long";
+const BINARY_TAG$1 = "binary";
+const STRING_TAG$1 = "string";
+const TIMESTAMP_TAG$1 = "timestamp";
+const UUID_TAG$1 = "uuid";
+const UUID_PATTERN$1 = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 
-const PRELUDE_MEMBER_LENGTH = 4;
-const PRELUDE_LENGTH = PRELUDE_MEMBER_LENGTH * 2;
-const CHECKSUM_LENGTH = 4;
-const MINIMUM_MESSAGE_LENGTH = PRELUDE_LENGTH + CHECKSUM_LENGTH * 2;
-function splitMessage({ byteLength, byteOffset, buffer }) {
-    if (byteLength < MINIMUM_MESSAGE_LENGTH) {
+const PRELUDE_MEMBER_LENGTH$1 = 4;
+const PRELUDE_LENGTH$1 = PRELUDE_MEMBER_LENGTH$1 * 2;
+const CHECKSUM_LENGTH$1 = 4;
+const MINIMUM_MESSAGE_LENGTH$1 = PRELUDE_LENGTH$1 + CHECKSUM_LENGTH$1 * 2;
+function splitMessage$1({ byteLength, byteOffset, buffer }) {
+    if (byteLength < MINIMUM_MESSAGE_LENGTH$1) {
         throw new Error("Provided message too short to accommodate event stream message overhead");
     }
     const view = new DataView(buffer, byteOffset, byteLength);
@@ -18175,29 +18665,29 @@ function splitMessage({ byteLength, byteOffset, buffer }) {
     if (byteLength !== messageLength) {
         throw new Error("Reported message length does not match received message length");
     }
-    const headerLength = view.getUint32(PRELUDE_MEMBER_LENGTH, false);
-    const expectedPreludeChecksum = view.getUint32(PRELUDE_LENGTH, false);
-    const expectedMessageChecksum = view.getUint32(byteLength - CHECKSUM_LENGTH, false);
-    const checksummer = new Crc32().update(new Uint8Array(buffer, byteOffset, PRELUDE_LENGTH));
+    const headerLength = view.getUint32(PRELUDE_MEMBER_LENGTH$1, false);
+    const expectedPreludeChecksum = view.getUint32(PRELUDE_LENGTH$1, false);
+    const expectedMessageChecksum = view.getUint32(byteLength - CHECKSUM_LENGTH$1, false);
+    const checksummer = new Crc32().update(new Uint8Array(buffer, byteOffset, PRELUDE_LENGTH$1));
     if (expectedPreludeChecksum !== checksummer.digest()) {
         throw new Error(`The prelude checksum specified in the message (${expectedPreludeChecksum}) does not match the calculated CRC32 checksum (${checksummer.digest()})`);
     }
-    checksummer.update(new Uint8Array(buffer, byteOffset + PRELUDE_LENGTH, byteLength - (PRELUDE_LENGTH + CHECKSUM_LENGTH)));
+    checksummer.update(new Uint8Array(buffer, byteOffset + PRELUDE_LENGTH$1, byteLength - (PRELUDE_LENGTH$1 + CHECKSUM_LENGTH$1)));
     if (expectedMessageChecksum !== checksummer.digest()) {
         throw new Error(`The message checksum (${checksummer.digest()}) did not match the expected value of ${expectedMessageChecksum}`);
     }
     return {
-        headers: new DataView(buffer, byteOffset + PRELUDE_LENGTH + CHECKSUM_LENGTH, headerLength),
-        body: new Uint8Array(buffer, byteOffset + PRELUDE_LENGTH + CHECKSUM_LENGTH + headerLength, messageLength - headerLength - (PRELUDE_LENGTH + CHECKSUM_LENGTH + CHECKSUM_LENGTH)),
+        headers: new DataView(buffer, byteOffset + PRELUDE_LENGTH$1 + CHECKSUM_LENGTH$1, headerLength),
+        body: new Uint8Array(buffer, byteOffset + PRELUDE_LENGTH$1 + CHECKSUM_LENGTH$1 + headerLength, messageLength - headerLength - (PRELUDE_LENGTH$1 + CHECKSUM_LENGTH$1 + CHECKSUM_LENGTH$1)),
     };
 }
 
-class EventStreamCodec {
+let EventStreamCodec$1 = class EventStreamCodec {
     headerMarshaller;
     messageBuffer;
     isEndOfStream;
     constructor(toUtf8, fromUtf8) {
-        this.headerMarshaller = new HeaderMarshaller(toUtf8, fromUtf8);
+        this.headerMarshaller = new HeaderMarshaller$1(toUtf8, fromUtf8);
         this.messageBuffer = [];
         this.isEndOfStream = false;
     }
@@ -18247,15 +18737,15 @@ class EventStreamCodec {
         return out;
     }
     decode(message) {
-        const { headers, body } = splitMessage(message);
+        const { headers, body } = splitMessage$1(message);
         return { headers: this.headerMarshaller.parse(headers), body };
     }
     formatHeaders(rawHeaders) {
         return this.headerMarshaller.format(rawHeaders);
     }
-}
+};
 
-class MessageDecoderStream {
+let MessageDecoderStream$1 = class MessageDecoderStream {
     options;
     constructor(options) {
         this.options = options;
@@ -18269,9 +18759,9 @@ class MessageDecoderStream {
             yield decoded;
         }
     }
-}
+};
 
-class MessageEncoderStream {
+let MessageEncoderStream$1 = class MessageEncoderStream {
     options;
     constructor(options) {
         this.options = options;
@@ -18288,9 +18778,9 @@ class MessageEncoderStream {
             yield new Uint8Array(0);
         }
     }
-}
+};
 
-class SmithyMessageDecoderStream {
+let SmithyMessageDecoderStream$1 = class SmithyMessageDecoderStream {
     options;
     constructor(options) {
         this.options = options;
@@ -18306,9 +18796,9 @@ class SmithyMessageDecoderStream {
             yield deserialized;
         }
     }
-}
+};
 
-class SmithyMessageEncoderStream {
+let SmithyMessageEncoderStream$1 = class SmithyMessageEncoderStream {
     options;
     constructor(options) {
         this.options = options;
@@ -18322,9 +18812,9 @@ class SmithyMessageEncoderStream {
             yield payloadBuf;
         }
     }
-}
+};
 
-function getChunkedStream(source) {
+function getChunkedStream$1(source) {
     let currentMessageTotalLength = 0;
     let currentMessagePendingLength = 0;
     let currentMessage = null;
@@ -18391,7 +18881,7 @@ function getChunkedStream(source) {
     };
 }
 
-function getMessageUnmarshaller(deserializer, toUtf8) {
+function getMessageUnmarshaller$1(deserializer, toUtf8) {
     return async function (message) {
         const { value: messageType } = message.headers[":message-type"];
         if (messageType === "error") {
@@ -18425,23 +18915,23 @@ function getMessageUnmarshaller(deserializer, toUtf8) {
     };
 }
 
-let EventStreamMarshaller$1 = class EventStreamMarshaller {
+let EventStreamMarshaller$3 = class EventStreamMarshaller {
     eventStreamCodec;
     utfEncoder;
     constructor({ utf8Encoder, utf8Decoder }) {
-        this.eventStreamCodec = new EventStreamCodec(utf8Encoder, utf8Decoder);
+        this.eventStreamCodec = new EventStreamCodec$1(utf8Encoder, utf8Decoder);
         this.utfEncoder = utf8Encoder;
     }
     deserialize(body, deserializer) {
-        const inputStream = getChunkedStream(body);
-        return new SmithyMessageDecoderStream({
-            messageStream: new MessageDecoderStream({ inputStream, decoder: this.eventStreamCodec }),
-            deserializer: getMessageUnmarshaller(deserializer, this.utfEncoder),
+        const inputStream = getChunkedStream$1(body);
+        return new SmithyMessageDecoderStream$1({
+            messageStream: new MessageDecoderStream$1({ inputStream, decoder: this.eventStreamCodec }),
+            deserializer: getMessageUnmarshaller$1(deserializer, this.utfEncoder),
         });
     }
     serialize(inputStream, serializer) {
-        return new MessageEncoderStream({
-            messageStream: new SmithyMessageEncoderStream({ inputStream, serializer }),
+        return new MessageEncoderStream$1({
+            messageStream: new SmithyMessageEncoderStream$1({ inputStream, serializer }),
             encoder: this.eventStreamCodec,
             includeEndFrame: true,
         });
@@ -18475,10 +18965,10 @@ async function* readabletoIterable(readStream) {
     }
 }
 
-class EventStreamMarshaller {
+let EventStreamMarshaller$2 = class EventStreamMarshaller {
     universalMarshaller;
     constructor({ utf8Encoder, utf8Decoder }) {
-        this.universalMarshaller = new EventStreamMarshaller$1({
+        this.universalMarshaller = new EventStreamMarshaller$3({
             utf8Decoder,
             utf8Encoder,
         });
@@ -18490,9 +18980,9 @@ class EventStreamMarshaller {
     serialize(input, serializer) {
         return Readable$1.from(this.universalMarshaller.serialize(input, serializer));
     }
-}
+};
 
-const eventStreamSerdeProvider = (options) => new EventStreamMarshaller(options);
+const eventStreamSerdeProvider$1 = (options) => new EventStreamMarshaller$2(options);
 
 class Hash {
     algorithmIdentifier;
@@ -18528,7 +19018,7 @@ function castSourceData(toCast, encoding) {
     return fromArrayBuffer(toCast);
 }
 
-class HashCalculator extends Writable {
+class HashCalculator extends Writable$1 {
     hash;
     constructor(hash, options) {
         super(options);
@@ -18719,7 +19209,7 @@ const getRuntimeConfig$8 = (config) => {
         credentialDefaultProvider: config?.credentialDefaultProvider ?? defaultProvider,
         defaultUserAgentProvider: config?.defaultUserAgentProvider ?? createDefaultUserAgentProvider({ serviceId: clientSharedValues.serviceId, clientVersion: packageInfo$2.version }),
         disableS3ExpressSessionAuth: config?.disableS3ExpressSessionAuth ?? loadConfig(NODE_DISABLE_S3_EXPRESS_SESSION_AUTH_OPTIONS, loaderConfig),
-        eventStreamSerdeProvider: config?.eventStreamSerdeProvider ?? eventStreamSerdeProvider,
+        eventStreamSerdeProvider: config?.eventStreamSerdeProvider ?? eventStreamSerdeProvider$1,
         maxAttempts: config?.maxAttempts ?? loadConfig(NODE_MAX_ATTEMPT_CONFIG_OPTIONS, config),
         md5: config?.md5 ?? Hash.bind(null, "md5"),
         region: config?.region ?? loadConfig(NODE_REGION_CONFIG_OPTIONS, { ...NODE_REGION_CONFIG_FILE_OPTIONS, ...loaderConfig }),
@@ -19124,6 +19614,22 @@ async function existsInS3(client, bucket, key) {
     return false;
   }
 }
+async function getObjectMetadata(client, bucket, key) {
+  try {
+    const response = await client.send(
+      new HeadObjectCommand({
+        Bucket: bucket,
+        Key: key
+      })
+    );
+    return {
+      size: response.ContentLength ?? 0,
+      contentType: response.ContentType
+    };
+  } catch {
+    return null;
+  }
+}
 async function deleteFromS3(client, bucket, key) {
   await withRetry(
     () => client.send(
@@ -19298,6 +19804,23 @@ async function loadPresetConfig(client, bucket, root, presetKey) {
     return null;
   }
 }
+async function downloadToFile(client, bucket, key, filePath, maxBytes) {
+  const { createWriteStream } = await import('node:fs');
+  const { pipeline } = await import('node:stream/promises');
+  const { Transform } = await import('node:stream');
+  const response = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  let total = 0;
+  const limiter = new Transform({
+    transform(chunk, _enc, cb) {
+      total += chunk.length;
+      if (total > maxBytes)
+        return cb(new Error(`object exceeds ${maxBytes} bytes`));
+      cb(null, chunk);
+    }
+  });
+  await pipeline(response.Body, limiter, createWriteStream(filePath));
+  return total;
+}
 
 async function generateThumbnail(fileId, preset, format, services, schema) {
   const { AssetsService } = services;
@@ -19331,6 +19854,476 @@ async function generateThumbnail(fileId, preset, format, services, schema) {
 }
 
 const presetConfigSaved = /* @__PURE__ */ new Set();
+async function ensurePresetConfigSaved(s3Client, bucket, root, preset, logger, verbose) {
+  const presetCacheKey = `${bucket}:${preset.key}`;
+  if (presetConfigSaved.has(presetCacheKey))
+    return;
+  try {
+    const hash = computePresetConfigHash(preset);
+    const storedConfig = {
+      hash,
+      config: getNormalizedPresetConfig(preset),
+      updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    await savePresetConfig(s3Client, bucket, root, preset.key, storedConfig);
+    presetConfigSaved.add(presetCacheKey);
+    if (verbose) {
+      logger.info(`[thumbnails] Saved preset config: ${preset.key} (hash: ${hash})`);
+    }
+  } catch (configError) {
+    const msg = configError instanceof Error ? configError.message : String(configError);
+    logger.warn(`[thumbnails] Failed to save preset config for ${preset.key}: ${msg}`);
+  }
+}
+
+const FFMPEG_RELEASE = "b6.1.1";
+const FFMPEG_BASE_URL = `https://github.com/eugeneware/ffmpeg-static/releases/download/${FFMPEG_RELEASE}`;
+const FFMPEG_GZ_SHA256 = {
+  "linux-x64": "bfe8a8fc511530457b528c48d77b5737527b504a3797a9bc4866aeca69c2dffa",
+  "linux-arm64": "754a678672298bc68156adff58aa7385a592c2b30b1d0ae8750c45c915c4bac0",
+  "darwin-arm64": "8923876afa8db5585022d7860ec7e589af192f441c56793971276d450ed3bbfa"
+};
+let resolvedPath = null;
+let resolving = null;
+function checkBinary(binary, timeoutMs = 1e4) {
+  return new Promise((resolve) => {
+    try {
+      const child = spawn(binary, ["-version"], { stdio: "ignore" });
+      const timer = setTimeout(() => {
+        child.kill("SIGKILL");
+        resolve(false);
+      }, timeoutMs);
+      child.on("error", () => {
+        clearTimeout(timer);
+        resolve(false);
+      });
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        resolve(code === 0);
+      });
+    } catch {
+      resolve(false);
+    }
+  });
+}
+function cacheBinaryPath(opts) {
+  const dir = opts.ffmpegDir || join(tmpdir(), "directus-s3-thumbnails-ffmpeg");
+  return join(dir, `ffmpeg-${FFMPEG_RELEASE}-${process.platform}-${process.arch}`);
+}
+async function downloadFfmpeg(opts, logger, fetchImpl = fetch) {
+  const target = `${process.platform}-${process.arch}`;
+  const expected = FFMPEG_GZ_SHA256[target];
+  if (!expected) {
+    throw new Error(`no pinned ffmpeg binary for ${target}; set THUMBNAILS_FFMPEG_PATH`);
+  }
+  const dest = cacheBinaryPath(opts);
+  await mkdir(join(dest, ".."), { recursive: true });
+  const url = `${FFMPEG_BASE_URL}/ffmpeg-${target}.gz`;
+  logger.info(`[thumbnails] Downloading ffmpeg ${FFMPEG_RELEASE} (${target}) ...`);
+  const response = await fetchImpl(url, { redirect: "follow" });
+  if (!response.ok || !response.body) {
+    throw new Error(`ffmpeg download failed: HTTP ${response.status}`);
+  }
+  const hash = createHash$1("sha256");
+  const tmpFile = `${dest}.${process.pid}.part`;
+  const hasher = new Transform({
+    transform(chunk, _enc, cb) {
+      hash.update(chunk);
+      cb(null, chunk);
+    }
+  });
+  try {
+    await pipeline(
+      Readable.fromWeb(response.body),
+      hasher,
+      createGunzip(),
+      createWriteStream(tmpFile)
+    );
+    const digest = hash.digest("hex");
+    if (digest !== expected) {
+      throw new Error(`ffmpeg checksum mismatch (got ${digest})`);
+    }
+    await chmod(tmpFile, 493);
+    await rename(tmpFile, dest);
+  } catch (e) {
+    await rm(tmpFile, { force: true });
+    throw e;
+  }
+  logger.info(`[thumbnails] ffmpeg saved to ${dest}`);
+  return dest;
+}
+async function resolveUncached(opts, logger) {
+  if (opts.ffmpegPath) {
+    if (await checkBinary(opts.ffmpegPath))
+      return opts.ffmpegPath;
+    throw new Error(`THUMBNAILS_FFMPEG_PATH is not a working ffmpeg: ${opts.ffmpegPath}`);
+  }
+  try {
+    const req = createRequire(import.meta.url);
+    const p = req("ffmpeg-static");
+    if (p && await checkBinary(p))
+      return p;
+  } catch {
+  }
+  const cached = cacheBinaryPath(opts);
+  try {
+    await stat(cached);
+    if (await checkBinary(cached))
+      return cached;
+  } catch {
+  }
+  if (await checkBinary("ffmpeg"))
+    return "ffmpeg";
+  if (!opts.allowDownload) {
+    throw new Error("ffmpeg not found (set THUMBNAILS_FFMPEG_PATH or allow THUMBNAILS_FFMPEG_DOWNLOAD)");
+  }
+  const downloaded = await downloadFfmpeg(opts, logger);
+  if (!await checkBinary(downloaded)) {
+    throw new Error(`downloaded ffmpeg does not run: ${downloaded}`);
+  }
+  return downloaded;
+}
+async function resolveFfmpeg(opts, logger) {
+  if (resolvedPath)
+    return resolvedPath;
+  if (!resolving) {
+    resolving = resolveUncached(opts, logger).then((p) => {
+      resolvedPath = p;
+      return p;
+    }).finally(() => {
+      resolving = null;
+    });
+  }
+  return resolving;
+}
+const MAX_FRAME_BYTES = 64 * 1024 * 1024;
+function buildFfmpegArgs(input, seekSec) {
+  const isUrl = /^https?:\/\//i.test(input);
+  return [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-nostdin",
+    ...isUrl ? ["-protocol_whitelist", "http,https,tcp,tls,crypto", "-rw_timeout", "20000000"] : [],
+    "-ss",
+    String(seekSec),
+    "-i",
+    input,
+    "-frames:v",
+    "1",
+    "-an",
+    "-sn",
+    "-dn",
+    // ограничиваем огромные исходники (8K); пресеты всё равно < 5000px
+    "-vf",
+    "scale='min(3840,iw)':-2",
+    "-f",
+    "image2pipe",
+    "-c:v",
+    "png",
+    "pipe:1"
+  ];
+}
+function extractFrame(opts) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(opts.ffmpegPath, buildFfmpegArgs(opts.input, opts.seekSec), {
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    const out = [];
+    let outSize = 0;
+    let stderr = "";
+    let timedOut = false;
+    let overflow = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, opts.timeoutMs);
+    child.stdout.on("data", (chunk) => {
+      outSize += chunk.length;
+      if (outSize > MAX_FRAME_BYTES) {
+        overflow = true;
+        child.kill("SIGKILL");
+        return;
+      }
+      out.push(chunk);
+    });
+    child.stderr.on("data", (chunk) => {
+      if (stderr.length < 2e3)
+        stderr += chunk.toString();
+    });
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (timedOut) {
+        const e = new Error(`ffmpeg timed out after ${opts.timeoutMs} ms`);
+        e.timedOut = true;
+        return reject(e);
+      }
+      if (overflow)
+        return reject(new Error("ffmpeg frame output too large"));
+      if (code !== 0) {
+        return reject(new Error(`ffmpeg exited with code ${code}: ${stderr.trim().slice(0, 500)}`));
+      }
+      const buffer = Buffer.concat(out);
+      if (buffer.length === 0) {
+        const e = new Error("ffmpeg produced no frame");
+        e.noFrame = true;
+        return reject(e);
+      }
+      resolve(buffer);
+    });
+  });
+}
+async function grabPosterFrame(opts) {
+  try {
+    return await extractFrame({ ...opts, seekSec: 1 });
+  } catch (e) {
+    if (e?.timedOut)
+      throw e;
+    return extractFrame({ ...opts, seekSec: 0 });
+  }
+}
+
+function parseRange(header, size) {
+  if (!header)
+    return null;
+  const m = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (!m || m[1] === "" && m[2] === "")
+    return null;
+  let start;
+  let end;
+  if (m[1] === "") {
+    const n = parseInt(m[2], 10);
+    start = Math.max(0, size - n);
+    end = size - 1;
+  } else {
+    start = parseInt(m[1], 10);
+    end = m[2] === "" ? size - 1 : Math.min(parseInt(m[2], 10), size - 1);
+  }
+  if (!(start <= end) || start >= size)
+    return null;
+  return { start, end };
+}
+async function startRangeProxy(client, bucket, key, size) {
+  const server = createServer(async (req, res) => {
+    try {
+      const range = parseRange(req.headers.range, size);
+      if (req.headers.range && !range) {
+        res.writeHead(416, { "Content-Range": `bytes */${size}` });
+        return res.end();
+      }
+      const start = range ? range.start : 0;
+      const end = range ? range.end : size - 1;
+      res.writeHead(range ? 206 : 200, {
+        "Accept-Ranges": "bytes",
+        "Content-Type": "application/octet-stream",
+        "Content-Length": String(end - start + 1),
+        ...range ? { "Content-Range": `bytes ${start}-${end}/${size}` } : {}
+      });
+      if (req.method === "HEAD" || size === 0)
+        return res.end();
+      const response = await client.send(
+        new GetObjectCommand({ Bucket: bucket, Key: key, Range: `bytes=${start}-${end}` })
+      );
+      const body = response.Body;
+      res.on("close", () => body.destroy());
+      body.on("error", () => res.destroy());
+      body.pipe(res);
+    } catch {
+      if (!res.headersSent)
+        res.writeHead(502);
+      res.destroy();
+    }
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  const { port } = server.address();
+  return {
+    url: `http://127.0.0.1:${port}/video`,
+    close: () => new Promise((resolve) => {
+      server.closeAllConnections?.();
+      server.close(() => resolve());
+    })
+  };
+}
+
+let cachedSharp = null;
+function loadSharp() {
+  if (cachedSharp)
+    return cachedSharp;
+  const req = createRequire(import.meta.url);
+  const errors = [];
+  const tryLoad = (r) => {
+    try {
+      const mod = r("sharp");
+      return mod?.default ?? mod;
+    } catch (e) {
+      errors.push(e instanceof Error ? e.message.split("\n")[0] : String(e));
+      return null;
+    }
+  };
+  let sharp = tryLoad(req);
+  if (!sharp) {
+    try {
+      const apiPkg = req.resolve("@directus/api/package.json");
+      sharp = tryLoad(createRequire(apiPkg));
+    } catch (e) {
+      errors.push(e instanceof Error ? e.message.split("\n")[0] : String(e));
+    }
+  }
+  if (!sharp) {
+    throw new Error(`sharp is not available (${errors.join("; ")})`);
+  }
+  cachedSharp = sharp;
+  return sharp;
+}
+async function processBufferWithPreset(input, preset, format, sharpFactory = loadSharp()) {
+  const sharpFormat = format === "jpg" ? "jpeg" : format;
+  let pipeline = sharpFactory(input).rotate();
+  if (preset.width || preset.height) {
+    pipeline = pipeline.resize({
+      width: preset.width || void 0,
+      height: preset.height || void 0,
+      fit: preset.fit || "cover",
+      withoutEnlargement: preset.withoutEnlargement !== false
+    });
+  }
+  pipeline = pipeline.toFormat(sharpFormat, { quality: preset.quality || 80 });
+  const { data, info } = await pipeline.toBuffer({ resolveWithObject: true });
+  return { buffer: data, format, width: info?.width, height: info?.height };
+}
+
+const MAX_CONCURRENT = 2;
+let active = 0;
+const waiters = [];
+async function acquire() {
+  if (active < MAX_CONCURRENT) {
+    active++;
+    return;
+  }
+  await new Promise((resolve) => waiters.push(resolve));
+}
+function release() {
+  const next = waiters.shift();
+  if (next)
+    next();
+  else
+    active--;
+}
+async function generateVideoPostersForFile(file, context, options = {}) {
+  const { database, env, logger } = context;
+  const result = { generated: 0, skipped: 0, errors: 0 };
+  const video = getVideoConfig(env);
+  if (!video.enabled)
+    return result;
+  try {
+    const config = await loadConfig$2(database, env);
+    const presets = options.presets || config.presets;
+    if (presets.length === 0)
+      return result;
+    const s3Config = getS3Config(env);
+    const s3Client = createS3Client(s3Config);
+    const basename = getBasename(file.filename_disk);
+    const pending = [];
+    for (const preset of presets) {
+      const format = getPresetFormat(preset);
+      const key = buildThumbnailKey(s3Config.root, preset.key, basename, format);
+      if (!options.force && await existsInS3(s3Client, s3Config.bucket, key)) {
+        result.skipped++;
+        continue;
+      }
+      pending.push({ preset, format, key });
+    }
+    if (pending.length === 0)
+      return result;
+    const originalKey = buildOriginalKey(s3Config.root, file.filename_disk);
+    const meta = await getObjectMetadata(s3Client, s3Config.bucket, originalKey);
+    if (!meta) {
+      logger.warn(`[thumbnails] Video poster skipped (original not found in S3): ${originalKey}`);
+      result.errors++;
+      return result;
+    }
+    if (meta.size > video.maxBytes) {
+      logger.warn(
+        `[thumbnails] Video poster skipped (size ${Math.round(meta.size / 1048576)} MB > THUMBNAILS_VIDEO_MAX_MB): ${file.filename_disk}`
+      );
+      return result;
+    }
+    await acquire();
+    let frame;
+    try {
+      const ffmpegPath = await resolveFfmpeg(video, logger);
+      frame = await grabFrameWithFallback({
+        ffmpegPath,
+        s3Client,
+        bucket: s3Config.bucket,
+        key: originalKey,
+        size: meta.size,
+        video,
+        logger
+      });
+    } finally {
+      release();
+    }
+    for (const { preset, format, key } of pending) {
+      try {
+        const out = await processBufferWithPreset(frame, preset, format);
+        await uploadToS3(s3Client, s3Config.bucket, key, out.buffer, getMimeType(format));
+        result.generated++;
+        if (config.verbose) {
+          logger.info(`[thumbnails] Video poster: ${key} (${out.width}x${out.height})`);
+        }
+        await ensurePresetConfigSaved(
+          s3Client,
+          s3Config.bucket,
+          s3Config.root,
+          preset,
+          logger,
+          config.verbose
+        );
+      } catch (e) {
+        result.errors++;
+        logger.error(`[thumbnails] Failed to generate video poster ${key}: ${errMsg(e)}`);
+      }
+    }
+  } catch (e) {
+    result.errors++;
+    logger.error(`[thumbnails] Video poster failed for ${file.filename_disk}: ${errMsg(e)}`);
+  }
+  return result;
+}
+function errMsg(e) {
+  return e instanceof Error ? e.message : String(e);
+}
+async function grabFrameWithFallback(args) {
+  const { ffmpegPath, s3Client, bucket, key, size, video, logger } = args;
+  try {
+    const proxy = await startRangeProxy(s3Client, bucket, key, size);
+    try {
+      return await grabPosterFrame({ ffmpegPath, input: proxy.url, timeoutMs: video.timeoutMs });
+    } finally {
+      await proxy.close();
+    }
+  } catch (e) {
+    if (e?.timedOut)
+      throw e;
+    logger.warn(`[thumbnails] ffmpeg streaming from S3 failed (${errMsg(e)}), falling back to temp file`);
+  }
+  const dir = await mkdtemp(join(tmpdir(), "ngs-poster-"));
+  try {
+    const filePath = join(dir, "source");
+    await downloadToFile(s3Client, bucket, key, filePath, video.maxBytes);
+    return await grabPosterFrame({ ffmpegPath, input: filePath, timeoutMs: video.timeoutMs });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
 const oldFileDataCache = /* @__PURE__ */ new Map();
 function cacheOldFileData(fileId, data) {
   oldFileDataCache.set(fileId, data);
@@ -19344,7 +20337,13 @@ function popOldFileData(fileId) {
 }
 async function generateThumbnailsForFile(file, context, options = {}) {
   const { database, env, logger, services, getSchema } = context;
-  const config = await loadConfig$1(database, env);
+  if (isVideo(file.type)) {
+    if (!getVideoConfig(env).enabled) {
+      return { generated: 0, skipped: 0 };
+    }
+    return generateVideoPostersForFile(file, context, options);
+  }
+  const config = await loadConfig$2(database, env);
   const s3Config = getS3Config(env);
   const s3Client = createS3Client(s3Config);
   const schema = await getSchema();
@@ -19375,26 +20374,7 @@ async function generateThumbnailsForFile(file, context, options = {}) {
       if (config.verbose) {
         logger.info(`[thumbnails] Generated: ${thumbnailKey} (${thumbnail.width}x${thumbnail.height})`);
       }
-      const presetCacheKey = `${s3Config.bucket}:${preset.key}`;
-      if (!presetConfigSaved.has(presetCacheKey)) {
-        try {
-          const normalizedConfig = getNormalizedPresetConfig(preset);
-          const hash = computePresetConfigHash(preset);
-          const storedConfig = {
-            hash,
-            config: normalizedConfig,
-            updatedAt: (/* @__PURE__ */ new Date()).toISOString()
-          };
-          await savePresetConfig(s3Client, s3Config.bucket, s3Config.root, preset.key, storedConfig);
-          presetConfigSaved.add(presetCacheKey);
-          if (config.verbose) {
-            logger.info(`[thumbnails] Saved preset config: ${preset.key} (hash: ${hash})`);
-          }
-        } catch (configError) {
-          const msg = configError instanceof Error ? configError.message : String(configError);
-          logger.warn(`[thumbnails] Failed to save preset config for ${preset.key}: ${msg}`);
-        }
-      }
+      await ensurePresetConfigSaved(s3Client, s3Config.bucket, s3Config.root, preset, logger, config.verbose);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const e = error;
@@ -19410,10 +20390,10 @@ function createUploadHandler(context) {
       if (collection !== "directus_files") {
         return;
       }
-      if (!isImage(payload.type)) {
+      if (!isThumbnailSource(payload.type, getVideoConfig(env).enabled)) {
         return;
       }
-      const config = await loadConfig$1(database, env);
+      const config = await loadConfig$2(database, env);
       if (config.presets.length === 0) {
         if (config.verbose) {
           logger.info("[thumbnails] No presets configured, skipping");
@@ -19422,7 +20402,7 @@ function createUploadHandler(context) {
       }
       logger.info(`[thumbnails] Processing upload: ${payload.filename_disk}`);
       const file = { ...payload, id: key };
-      const result = await withRetry(() => generateThumbnailsForFile(file, context));
+      const result = isVideo(file.type) ? await generateThumbnailsForFile(file, context) : await withRetry(() => generateThumbnailsForFile(file, context));
       logger.info(
         `[thumbnails] Completed: ${payload.filename_disk} (generated: ${result.generated}, skipped: ${result.skipped})`
       );
@@ -19445,10 +20425,10 @@ function createUpdateHandler(context) {
           continue;
         }
         const newFile = await database("directus_files").where("id", fileId).first();
-        if (!newFile || !isImage(newFile.type)) {
+        if (!newFile || !isThumbnailSource(newFile.type, getVideoConfig(env).enabled)) {
           continue;
         }
-        const config = await loadConfig$1(database, env);
+        const config = await loadConfig$2(database, env);
         const s3Config = getS3Config(env);
         const s3Client = createS3Client(s3Config);
         const oldBasename = getBasename(oldFileData.filename_disk);
@@ -19467,28 +20447,74 @@ function createUpdateHandler(context) {
   };
 }
 
+const pendingDeletes = /* @__PURE__ */ new Map();
+const MAX_PENDING = 2e3;
+function createDeletePrefetch(database) {
+  return async (keys) => {
+    try {
+      const ids = (Array.isArray(keys) ? keys : [keys]).filter(
+        (k) => typeof k === "string" || typeof k === "number"
+      );
+      if (ids.length > 0) {
+        const rows = await database("directus_files").whereIn("id", ids).select("id", "filename_disk", "type");
+        for (const row of rows) {
+          if (pendingDeletes.size >= MAX_PENDING) {
+            const oldest = pendingDeletes.keys().next().value;
+            if (oldest !== void 0)
+              pendingDeletes.delete(oldest);
+          }
+          pendingDeletes.set(String(row.id), {
+            filename_disk: row.filename_disk,
+            type: row.type
+          });
+        }
+      }
+    } catch {
+    }
+    return keys;
+  };
+}
+function collectDeletedFiles(payload, keys) {
+  const result = [];
+  for (const key of Array.isArray(keys) ? keys : []) {
+    const cached = pendingDeletes.get(String(key));
+    if (cached) {
+      pendingDeletes.delete(String(key));
+      result.push(cached);
+    }
+  }
+  if (Array.isArray(payload)) {
+    for (const item of payload) {
+      if (item && typeof item === "object" && item.filename_disk) {
+        result.push({ filename_disk: item.filename_disk, type: item.type });
+      }
+    }
+  }
+  return result;
+}
 function createDeleteHandler(database, env, logger) {
   return async ({ payload, keys, collection }) => {
     try {
-      if (collection !== "directus_files") {
+      if (collection && collection !== "directus_files") {
         return;
       }
-      if (!payload || !Array.isArray(payload)) {
+      const files = collectDeletedFiles(payload, keys);
+      if (files.length === 0) {
         return;
       }
-      const config = await loadConfig$1(database, env);
+      const config = await loadConfig$2(database, env);
       const s3Config = getS3Config(env);
       const s3Client = createS3Client(s3Config);
-      for (const file of payload) {
-        if (!isImage(file.type)) {
+      for (const file of files) {
+        if (!isImage(file.type) && !isVideo(file.type)) {
           continue;
         }
         const basename = getBasename(file.filename_disk);
         let deletedCount = 0;
         for (const preset of config.presets) {
           const prefix = buildThumbnailKey(s3Config.root, preset.key, basename, "");
-          const keys2 = await listS3Objects(s3Client, s3Config.bucket, prefix);
-          for (const key of keys2) {
+          const objectKeys = await listS3Objects(s3Client, s3Config.bucket, prefix);
+          for (const key of objectKeys) {
             await deleteFromS3(s3Client, s3Config.bucket, key);
             deletedCount++;
             if (config.verbose) {
@@ -19512,12 +20538,13 @@ var e0 = defineHook(({ filter, action }, { database, env, logger, services, getS
     logger.info("[thumbnails] S3 storage not configured, hook disabled");
     return;
   }
-  logger.info("[thumbnails] Hook initialized");
+  const videoPosters = getVideoConfig(env).enabled;
+  logger.info(`[thumbnails] Hook initialized (video posters: ${videoPosters ? "on" : "off"})`);
   const context = { database, env, logger, services, getSchema };
   action("files.upload", async (meta) => {
     const { payload, key } = meta;
     logger.info(`[thumbnails] files.upload triggered: key=${key}, type=${payload?.type}`);
-    if (!payload?.type || !isImage(payload.type)) {
+    if (!payload?.type || !isThumbnailSource(payload.type, videoPosters)) {
       return;
     }
     const handler = createUploadHandler(context);
@@ -19534,7 +20561,7 @@ var e0 = defineHook(({ filter, action }, { database, env, logger, services, getS
         continue;
       }
       const oldFile = await database("directus_files").where("id", fileId).select("filename_disk", "type").first();
-      if (oldFile && isImage(oldFile.type)) {
+      if (oldFile && isThumbnailSource(oldFile.type, videoPosters)) {
         const isFileChanged = p.filename_disk && p.filename_disk !== oldFile.filename_disk || p.type && p.type !== oldFile.type;
         if (isFileChanged) {
           cacheOldFileData(fileId, {
@@ -19547,7 +20574,10 @@ var e0 = defineHook(({ filter, action }, { database, env, logger, services, getS
     return payload;
   });
   action("items.update", createUpdateHandler(context));
-  action("items.delete", createDeleteHandler(database, env, logger));
+  filter("files.delete", createDeletePrefetch(database));
+  const deleteHandler = createDeleteHandler(database, env, logger);
+  action("files.delete", deleteHandler);
+  action("items.delete", deleteHandler);
 });
 
 let currentJob = null;
@@ -19568,14 +20598,19 @@ function registerRegenerateEndpoint(router, context) {
         progress: currentJob.progress
       });
     }
-    const config = await loadConfig$1(database, env);
+    const config = await loadConfig$2(database, env);
     const presetsToProcess = preset ? config.presets.filter((p) => p.key === preset) : config.presets;
     if (presetsToProcess.length === 0) {
       return res.status(400).json({
         error: preset ? `Preset "${preset}" not found` : "No presets configured"
       });
     }
-    let countQuery = database("directus_files").where("type", "like", "image/%").count("id as total");
+    const includeVideo = getVideoConfig(env).enabled;
+    let countQuery = database("directus_files").where(function() {
+      this.where("type", "like", "image/%");
+      if (includeVideo)
+        this.orWhere("type", "like", "video/%");
+    }).count("id as total");
     if (fileIds?.length) {
       countQuery = countQuery.whereIn("id", fileIds);
     }
@@ -19701,7 +20736,8 @@ function registerRegenerateEndpoint(router, context) {
   async function processRegeneration(ctx, presets, signal) {
     if (!currentJob)
       return;
-    const { database: database2 } = ctx;
+    const { database: database2, env: env2 } = ctx;
+    const includeVideo = getVideoConfig(env2).enabled;
     const { fileIds } = currentJob.options;
     const force = currentJob.options.force;
     const PAGE_SIZE = 100;
@@ -19710,7 +20746,11 @@ function registerRegenerateEndpoint(router, context) {
     let hasMore = true;
     try {
       while (hasMore && !signal.aborted) {
-        let query = database2("directus_files").select("id", "filename_disk", "filename_download", "type").where("type", "like", "image/%").limit(PAGE_SIZE).offset(offset);
+        let query = database2("directus_files").select("id", "filename_disk", "filename_download", "type").where(function() {
+          this.where("type", "like", "image/%");
+          if (includeVideo)
+            this.orWhere("type", "like", "video/%");
+        }).orderBy("id").limit(PAGE_SIZE).offset(offset);
         if (fileIds?.length) {
           query = query.whereIn("id", fileIds);
         }
@@ -19752,6 +20792,10 @@ function registerRegenerateEndpoint(router, context) {
               if (success && result) {
                 currentJob.progress.generated += result.generated;
                 currentJob.progress.skipped += result.skipped;
+                if (result.errors) {
+                  currentJob.progress.errors++;
+                  currentJob.failed.push({ id: file.id, error: "video poster failed (see server log)" });
+                }
               } else {
                 currentJob.progress.errors++;
                 currentJob.failed.push({ id: file.id, error: error || "Unknown error" });
@@ -19906,7 +20950,7 @@ function registerCleanupEndpoint(router, env, logger, database) {
       return res.status(403).json({ error: "Admin access required" });
     }
     try {
-      const config = await loadConfig$1(database, env);
+      const config = await loadConfig$2(database, env);
       const presetKeys = new Set(config.presets.map((p) => p.key));
       const s3Config = getS3Config(env);
       const s3Client = createS3Client(s3Config);
@@ -19948,7 +20992,7 @@ function registerCleanupEndpoint(router, env, logger, database) {
     if (!folder) {
       return res.status(400).json({ error: "folder is required" });
     }
-    const config = await loadConfig$1(database, env);
+    const config = await loadConfig$2(database, env);
     const presetKeys = new Set(config.presets.map((p) => p.key));
     if (presetKeys.has(folder)) {
       return res.status(400).json({
@@ -20005,11 +21049,17 @@ var e1 = defineEndpoint((router, { database, env, logger, services, getSchema })
       return res.status(403).json({ error: "Admin access required" });
     }
     try {
-      const config = await loadConfig$1(database, env);
+      const config = await loadConfig$2(database, env);
       const s3Config = getS3Config(env);
       const s3Client = createS3Client(s3Config);
       const imageCountResult = await database("directus_files").where("type", "like", "image/%").count("* as count").first();
-      const totalImages = Number(imageCountResult?.count ?? 0);
+      const totalImagesOnly = Number(imageCountResult?.count ?? 0);
+      let totalVideos = 0;
+      if (getVideoConfig(env).enabled) {
+        const videoCountResult = await database("directus_files").where("type", "like", "video/%").count("* as count").first();
+        totalVideos = Number(videoCountResult?.count ?? 0);
+      }
+      const totalImages = totalImagesOnly + totalVideos;
       const presetStats = await Promise.all(
         config.presets.map(async (preset) => {
           const prefix = s3Config.root ? `${s3Config.root}/${preset.key}/` : `${preset.key}/`;
@@ -20051,6 +21101,7 @@ var e1 = defineEndpoint((router, { database, env, logger, services, getSchema })
       const totalOutdated = presetStats.filter((p) => p.outdated).reduce((sum, p) => sum + p.count, 0);
       res.json({
         totalImages,
+        totalVideos,
         totalPresets: config.presets.length,
         totalThumbnails,
         totalExpected,
@@ -20086,20 +21137,660 @@ var e1 = defineEndpoint((router, { database, env, logger, services, getSchema })
 
 const hooks = [{name:'thumbnails-hook',config:e0}];const endpoints = [{name:'thumbnails',config:e1}];const operations = [];
 
+Array.from({ length: 64 }, (_, i) => (Math.abs(Math.sin(i + 1)) * 2 ** 32) >>> 0);
+
+(() => {
+    try {
+        createHash$1("md5");
+        return true;
+    }
+    catch {
+        return false;
+    }
+})();
+
+const CRC32_TABLE = new Uint32Array(256);
+for (let i = 0; i < 256; ++i) {
+    let c = i;
+    for (let j = 0; j < 8; ++j) {
+        c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    }
+    CRC32_TABLE[i] = c >>> 0;
+}
+const ONES = 0xffff_ffff;
+class Crc32Js {
+    digestLength = 4;
+    checksum = ONES;
+    update(data) {
+        for (let i = 0; i < data.length; ++i) {
+            this.checksum = (this.checksum >>> 8) ^ CRC32_TABLE[(this.checksum ^ data[i]) & 0xff];
+        }
+    }
+    digestSync() {
+        return (this.checksum ^ ONES) >>> 0;
+    }
+    async digest() {
+        const value = this.digestSync();
+        const out = new Uint8Array(4);
+        new DataView(out.buffer).setUint32(0, value, false);
+        return out;
+    }
+    reset() {
+        this.checksum = ONES;
+    }
+}
+
+const zlibCrc32 = typeof zlib$1.crc32 === "function" ? zlib$1.crc32 : undefined;
+const Crc32Node = zlibCrc32 ? buildNativeClass(zlibCrc32) : Crc32Js;
+function buildNativeClass(nativeCrc32) {
+    return class Crc32Node {
+        digestLength = 4;
+        value = 0;
+        update(data) {
+            this.value = nativeCrc32(data, this.value);
+        }
+        digestSync() {
+            return this.value >>> 0;
+        }
+        async digest() {
+            const out = new Uint8Array(4);
+            new DataView(out.buffer).setUint32(0, this.digestSync(), false);
+            return out;
+        }
+        reset() {
+            this.value = 0;
+        }
+    };
+}
+
+(() => {
+    try {
+        createHash$1("sha256");
+        return true;
+    }
+    catch {
+        return false;
+    }
+})();
+
+class Int64 {
+    bytes;
+    constructor(bytes) {
+        this.bytes = bytes;
+        if (bytes.byteLength !== 8) {
+            throw new Error("Int64 buffers must be exactly 8 bytes");
+        }
+    }
+    static fromNumber(number) {
+        if (number > 9_223_372_036_854_775_807 || number < -9_223_372_036_854_775_808) {
+            throw new Error(`${number} is too large (or, if negative, too small) to represent as an Int64`);
+        }
+        const bytes = new Uint8Array(8);
+        for (let i = 7, remaining = Math.abs(Math.round(number)); i > -1 && remaining > 0; i--, remaining /= 256) {
+            bytes[i] = remaining;
+        }
+        if (number < 0) {
+            negate(bytes);
+        }
+        return new Int64(bytes);
+    }
+    valueOf() {
+        const bytes = this.bytes.slice(0);
+        const negative = bytes[0] & 0b10000000;
+        if (negative) {
+            negate(bytes);
+        }
+        return parseInt(toHex$1(bytes), 16) * (negative ? -1 : 1);
+    }
+    toString() {
+        return String(this.valueOf());
+    }
+}
+function negate(bytes) {
+    for (let i = 0; i < 8; i++) {
+        bytes[i] ^= 0xff;
+    }
+    for (let i = 7; i > -1; i--) {
+        bytes[i]++;
+        if (bytes[i] !== 0)
+            break;
+    }
+}
+
+class HeaderMarshaller {
+    toUtf8;
+    fromUtf8;
+    constructor(toUtf8, fromUtf8) {
+        this.toUtf8 = toUtf8;
+        this.fromUtf8 = fromUtf8;
+    }
+    format(headers) {
+        const chunks = [];
+        for (const headerName in headers) {
+            if (!hasOwn(headers, headerName))
+                continue;
+            const bytes = this.fromUtf8(headerName);
+            chunks.push(Uint8Array.from([bytes.byteLength]), bytes, this.formatHeaderValue(headers[headerName]));
+        }
+        const out = new Uint8Array(chunks.reduce((carry, bytes) => carry + bytes.byteLength, 0));
+        let position = 0;
+        for (const chunk of chunks) {
+            out.set(chunk, position);
+            position += chunk.byteLength;
+        }
+        return out;
+    }
+    formatHeaderValue(header) {
+        switch (header.type) {
+            case "boolean":
+                return Uint8Array.from([header.value ? 0 : 1]);
+            case "byte":
+                return Uint8Array.from([2, header.value]);
+            case "short":
+                const shortView = new DataView(new ArrayBuffer(3));
+                shortView.setUint8(0, 3);
+                shortView.setInt16(1, header.value, false);
+                return new Uint8Array(shortView.buffer);
+            case "integer":
+                const intView = new DataView(new ArrayBuffer(5));
+                intView.setUint8(0, 4);
+                intView.setInt32(1, header.value, false);
+                return new Uint8Array(intView.buffer);
+            case "long":
+                const longBytes = new Uint8Array(9);
+                longBytes[0] = 5;
+                longBytes.set(header.value.bytes, 1);
+                return longBytes;
+            case "binary":
+                const binView = new DataView(new ArrayBuffer(3 + header.value.byteLength));
+                binView.setUint8(0, 6);
+                binView.setUint16(1, header.value.byteLength, false);
+                const binBytes = new Uint8Array(binView.buffer);
+                binBytes.set(header.value, 3);
+                return binBytes;
+            case "string":
+                const utf8Bytes = this.fromUtf8(header.value);
+                const strView = new DataView(new ArrayBuffer(3 + utf8Bytes.byteLength));
+                strView.setUint8(0, 7);
+                strView.setUint16(1, utf8Bytes.byteLength, false);
+                const strBytes = new Uint8Array(strView.buffer);
+                strBytes.set(utf8Bytes, 3);
+                return strBytes;
+            case "timestamp":
+                const tsBytes = new Uint8Array(9);
+                tsBytes[0] = 8;
+                tsBytes.set(Int64.fromNumber(header.value.valueOf()).bytes, 1);
+                return tsBytes;
+            case "uuid":
+                if (!UUID_PATTERN.test(header.value)) {
+                    throw new Error(`Invalid UUID received: ${header.value}`);
+                }
+                const uuidBytes = new Uint8Array(17);
+                uuidBytes[0] = 9;
+                uuidBytes.set(fromHex$1(header.value.replace(/-/g, "")), 1);
+                return uuidBytes;
+        }
+    }
+    parse(headers) {
+        const out = {};
+        let position = 0;
+        while (position < headers.byteLength) {
+            const nameLength = headers.getUint8(position++);
+            const name = this.toUtf8(new Uint8Array(headers.buffer, headers.byteOffset + position, nameLength));
+            position += nameLength;
+            switch (headers.getUint8(position++)) {
+                case 0:
+                    out[name] = {
+                        type: BOOLEAN_TAG,
+                        value: true,
+                    };
+                    break;
+                case 1:
+                    out[name] = {
+                        type: BOOLEAN_TAG,
+                        value: false,
+                    };
+                    break;
+                case 2:
+                    out[name] = {
+                        type: BYTE_TAG,
+                        value: headers.getInt8(position++),
+                    };
+                    break;
+                case 3:
+                    out[name] = {
+                        type: SHORT_TAG,
+                        value: headers.getInt16(position, false),
+                    };
+                    position += 2;
+                    break;
+                case 4:
+                    out[name] = {
+                        type: INT_TAG,
+                        value: headers.getInt32(position, false),
+                    };
+                    position += 4;
+                    break;
+                case 5:
+                    out[name] = {
+                        type: LONG_TAG,
+                        value: new Int64(new Uint8Array(headers.buffer, headers.byteOffset + position, 8)),
+                    };
+                    position += 8;
+                    break;
+                case 6:
+                    const binaryLength = headers.getUint16(position, false);
+                    position += 2;
+                    out[name] = {
+                        type: BINARY_TAG,
+                        value: new Uint8Array(headers.buffer, headers.byteOffset + position, binaryLength),
+                    };
+                    position += binaryLength;
+                    break;
+                case 7:
+                    const stringLength = headers.getUint16(position, false);
+                    position += 2;
+                    out[name] = {
+                        type: STRING_TAG,
+                        value: this.toUtf8(new Uint8Array(headers.buffer, headers.byteOffset + position, stringLength)),
+                    };
+                    position += stringLength;
+                    break;
+                case 8:
+                    out[name] = {
+                        type: TIMESTAMP_TAG,
+                        value: new Date(new Int64(new Uint8Array(headers.buffer, headers.byteOffset + position, 8)).valueOf()),
+                    };
+                    position += 8;
+                    break;
+                case 9:
+                    const uuidBytes = new Uint8Array(headers.buffer, headers.byteOffset + position, 16);
+                    position += 16;
+                    out[name] = {
+                        type: UUID_TAG,
+                        value: `${toHex$1(uuidBytes.subarray(0, 4))}-${toHex$1(uuidBytes.subarray(4, 6))}-${toHex$1(uuidBytes.subarray(6, 8))}-${toHex$1(uuidBytes.subarray(8, 10))}-${toHex$1(uuidBytes.subarray(10))}`,
+                    };
+                    break;
+                default:
+                    throw new Error(`Unrecognized header type tag`);
+            }
+        }
+        return out;
+    }
+}
+var HEADER_VALUE_TYPE;
+(function (HEADER_VALUE_TYPE) {
+    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["boolTrue"] = 0] = "boolTrue";
+    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["boolFalse"] = 1] = "boolFalse";
+    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["byte"] = 2] = "byte";
+    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["short"] = 3] = "short";
+    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["integer"] = 4] = "integer";
+    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["long"] = 5] = "long";
+    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["byteArray"] = 6] = "byteArray";
+    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["string"] = 7] = "string";
+    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["timestamp"] = 8] = "timestamp";
+    HEADER_VALUE_TYPE[HEADER_VALUE_TYPE["uuid"] = 9] = "uuid";
+})(HEADER_VALUE_TYPE || (HEADER_VALUE_TYPE = {}));
+const BOOLEAN_TAG = "boolean";
+const BYTE_TAG = "byte";
+const SHORT_TAG = "short";
+const INT_TAG = "integer";
+const LONG_TAG = "long";
+const BINARY_TAG = "binary";
+const STRING_TAG = "string";
+const TIMESTAMP_TAG = "timestamp";
+const UUID_TAG = "uuid";
+const UUID_PATTERN = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+
+const PRELUDE_MEMBER_LENGTH = 4;
+const PRELUDE_LENGTH = PRELUDE_MEMBER_LENGTH * 2;
+const CHECKSUM_LENGTH = 4;
+const MINIMUM_MESSAGE_LENGTH = PRELUDE_LENGTH + CHECKSUM_LENGTH * 2;
+function splitMessage({ byteLength, byteOffset, buffer }) {
+    if (byteLength < MINIMUM_MESSAGE_LENGTH) {
+        throw new Error("Provided message too short to accommodate event stream message overhead");
+    }
+    const view = new DataView(buffer, byteOffset, byteLength);
+    const messageLength = view.getUint32(0, false);
+    if (byteLength !== messageLength) {
+        throw new Error("Reported message length does not match received message length");
+    }
+    const headerLength = view.getUint32(PRELUDE_MEMBER_LENGTH, false);
+    const expectedPreludeChecksum = view.getUint32(PRELUDE_LENGTH, false);
+    const expectedMessageChecksum = view.getUint32(byteLength - CHECKSUM_LENGTH, false);
+    const checksummer = new Crc32Node();
+    checksummer.update(new Uint8Array(buffer, byteOffset, PRELUDE_LENGTH));
+    if (expectedPreludeChecksum !== checksummer.digestSync()) {
+        throw new Error(`The prelude checksum specified in the message (${expectedPreludeChecksum}) does not match the calculated CRC32 checksum (${checksummer.digestSync()})`);
+    }
+    checksummer.update(new Uint8Array(buffer, byteOffset + PRELUDE_LENGTH, byteLength - (PRELUDE_LENGTH + CHECKSUM_LENGTH)));
+    if (expectedMessageChecksum !== checksummer.digestSync()) {
+        throw new Error(`The message checksum (${checksummer.digestSync()}) did not match the expected value of ${expectedMessageChecksum}`);
+    }
+    return {
+        headers: new DataView(buffer, byteOffset + PRELUDE_LENGTH + CHECKSUM_LENGTH, headerLength),
+        body: new Uint8Array(buffer, byteOffset + PRELUDE_LENGTH + CHECKSUM_LENGTH + headerLength, messageLength - headerLength - (PRELUDE_LENGTH + CHECKSUM_LENGTH + CHECKSUM_LENGTH)),
+    };
+}
+
+class EventStreamCodec {
+    headerMarshaller;
+    messageBuffer;
+    isEndOfStream;
+    constructor(toUtf8, fromUtf8) {
+        this.headerMarshaller = new HeaderMarshaller(toUtf8, fromUtf8);
+        this.messageBuffer = [];
+        this.isEndOfStream = false;
+    }
+    feed(message) {
+        this.messageBuffer.push(this.decode(message));
+    }
+    endOfStream() {
+        this.isEndOfStream = true;
+    }
+    getMessage() {
+        const message = this.messageBuffer.pop();
+        const isEndOfStream = this.isEndOfStream;
+        return {
+            getMessage() {
+                return message;
+            },
+            isEndOfStream() {
+                return isEndOfStream;
+            },
+        };
+    }
+    getAvailableMessages() {
+        const messages = this.messageBuffer;
+        this.messageBuffer = [];
+        const isEndOfStream = this.isEndOfStream;
+        return {
+            getMessages() {
+                return messages;
+            },
+            isEndOfStream() {
+                return isEndOfStream;
+            },
+        };
+    }
+    encode({ headers: rawHeaders, body }) {
+        const headers = this.headerMarshaller.format(rawHeaders);
+        const length = headers.byteLength + body.byteLength + 16;
+        const out = new Uint8Array(length);
+        const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
+        const checksum = new Crc32Node();
+        view.setUint32(0, length, false);
+        view.setUint32(4, headers.byteLength, false);
+        checksum.update(out.subarray(0, 8));
+        view.setUint32(8, checksum.digestSync(), false);
+        out.set(headers, 12);
+        out.set(body, headers.byteLength + 12);
+        checksum.update(out.subarray(8, length - 4));
+        view.setUint32(length - 4, checksum.digestSync(), false);
+        return out;
+    }
+    decode(message) {
+        const { headers, body } = splitMessage(message);
+        return { headers: this.headerMarshaller.parse(headers), body };
+    }
+    formatHeaders(rawHeaders) {
+        return this.headerMarshaller.format(rawHeaders);
+    }
+}
+
+class MessageDecoderStream {
+    options;
+    constructor(options) {
+        this.options = options;
+    }
+    [Symbol.asyncIterator]() {
+        return this.asyncIterator();
+    }
+    async *asyncIterator() {
+        for await (const bytes of this.options.inputStream) {
+            const decoded = this.options.decoder.decode(bytes);
+            yield decoded;
+        }
+    }
+}
+
+class MessageEncoderStream {
+    options;
+    constructor(options) {
+        this.options = options;
+    }
+    [Symbol.asyncIterator]() {
+        return this.asyncIterator();
+    }
+    async *asyncIterator() {
+        for await (const msg of this.options.messageStream) {
+            const encoded = this.options.encoder.encode(msg);
+            yield encoded;
+        }
+        if (this.options.includeEndFrame) {
+            yield new Uint8Array(0);
+        }
+    }
+}
+
+class SmithyMessageDecoderStream {
+    options;
+    constructor(options) {
+        this.options = options;
+    }
+    [Symbol.asyncIterator]() {
+        return this.asyncIterator();
+    }
+    async *asyncIterator() {
+        for await (const message of this.options.messageStream) {
+            const deserialized = await this.options.deserializer(message);
+            if (deserialized === undefined)
+                continue;
+            yield deserialized;
+        }
+    }
+}
+
+class SmithyMessageEncoderStream {
+    options;
+    constructor(options) {
+        this.options = options;
+    }
+    [Symbol.asyncIterator]() {
+        return this.asyncIterator();
+    }
+    async *asyncIterator() {
+        for await (const chunk of this.options.inputStream) {
+            const payloadBuf = this.options.serializer(chunk);
+            yield payloadBuf;
+        }
+    }
+}
+
+function getChunkedStream(source) {
+    let currentMessageTotalLength = 0;
+    let currentMessagePendingLength = 0;
+    let currentMessage = null;
+    let messageLengthBuffer = null;
+    const allocateMessage = (size) => {
+        if (typeof size !== "number") {
+            throw new Error("Attempted to allocate an event message where size was not a number: " + size);
+        }
+        currentMessageTotalLength = size;
+        currentMessagePendingLength = 4;
+        currentMessage = new Uint8Array(size);
+        const currentMessageView = new DataView(currentMessage.buffer);
+        currentMessageView.setUint32(0, size, false);
+    };
+    const iterator = async function* () {
+        const sourceIterator = source[Symbol.asyncIterator]();
+        while (true) {
+            const { value, done } = await sourceIterator.next();
+            if (done) {
+                if (!currentMessageTotalLength) {
+                    return;
+                }
+                else if (currentMessageTotalLength === currentMessagePendingLength) {
+                    yield currentMessage;
+                }
+                else {
+                    throw new Error("Truncated event message received.");
+                }
+                return;
+            }
+            const chunkLength = value.length;
+            let currentOffset = 0;
+            while (currentOffset < chunkLength) {
+                if (!currentMessage) {
+                    const bytesRemaining = chunkLength - currentOffset;
+                    if (!messageLengthBuffer) {
+                        messageLengthBuffer = new Uint8Array(4);
+                    }
+                    const numBytesForTotal = Math.min(4 - currentMessagePendingLength, bytesRemaining);
+                    messageLengthBuffer.set(value.slice(currentOffset, currentOffset + numBytesForTotal), currentMessagePendingLength);
+                    currentMessagePendingLength += numBytesForTotal;
+                    currentOffset += numBytesForTotal;
+                    if (currentMessagePendingLength < 4) {
+                        break;
+                    }
+                    allocateMessage(new DataView(messageLengthBuffer.buffer).getUint32(0, false));
+                    messageLengthBuffer = null;
+                }
+                const numBytesToWrite = Math.min(currentMessageTotalLength - currentMessagePendingLength, chunkLength - currentOffset);
+                currentMessage.set(value.slice(currentOffset, currentOffset + numBytesToWrite), currentMessagePendingLength);
+                currentMessagePendingLength += numBytesToWrite;
+                currentOffset += numBytesToWrite;
+                if (currentMessageTotalLength && currentMessageTotalLength === currentMessagePendingLength) {
+                    yield currentMessage;
+                    currentMessage = null;
+                    currentMessageTotalLength = 0;
+                    currentMessagePendingLength = 0;
+                }
+            }
+        }
+    };
+    return {
+        [Symbol.asyncIterator]: iterator,
+    };
+}
+
+function getMessageUnmarshaller(deserializer, toUtf8) {
+    return async function (message) {
+        const { value: messageType } = message.headers[":message-type"];
+        if (messageType === "error") {
+            const unmodeledError = new Error(message.headers[":error-message"].value || "UnknownError");
+            unmodeledError.name = message.headers[":error-code"].value;
+            throw unmodeledError;
+        }
+        else if (messageType === "exception") {
+            const code = message.headers[":exception-type"].value;
+            const exception = { [code]: message };
+            const deserializedException = await deserializer(exception);
+            if (deserializedException.$unknown) {
+                const error = new Error(toUtf8(message.body));
+                error.name = code;
+                throw error;
+            }
+            throw deserializedException[code];
+        }
+        else if (messageType === "event") {
+            const event = {
+                [message.headers[":event-type"].value]: message,
+            };
+            const deserialized = await deserializer(event);
+            if (deserialized.$unknown)
+                return;
+            return deserialized;
+        }
+        else {
+            throw Error(`Unrecognizable event type: ${message.headers[":event-type"].value}`);
+        }
+    };
+}
+
+let EventStreamMarshaller$1 = class EventStreamMarshaller {
+    eventStreamCodec;
+    utfEncoder;
+    constructor({ utf8Encoder, utf8Decoder }) {
+        this.eventStreamCodec = new EventStreamCodec(utf8Encoder, utf8Decoder);
+        this.utfEncoder = utf8Encoder;
+    }
+    deserialize(body, deserializer) {
+        const inputStream = getChunkedStream(body);
+        return new SmithyMessageDecoderStream({
+            messageStream: new MessageDecoderStream({ inputStream, decoder: this.eventStreamCodec }),
+            deserializer: getMessageUnmarshaller(deserializer, this.utfEncoder),
+        });
+    }
+    serialize(inputStream, serializer) {
+        return new MessageEncoderStream({
+            messageStream: new SmithyMessageEncoderStream({ inputStream, serializer }),
+            encoder: this.eventStreamCodec,
+            includeEndFrame: true,
+        });
+    }
+};
+
+class EventStreamMarshaller {
+    universalMarshaller;
+    constructor({ utf8Encoder, utf8Decoder }) {
+        this.universalMarshaller = new EventStreamMarshaller$1({
+            utf8Decoder,
+            utf8Encoder,
+        });
+    }
+    deserialize(body, deserializer) {
+        const bodyIterable = typeof body[Symbol.asyncIterator] === "function" ? body : readableToIterable(body);
+        return this.universalMarshaller.deserialize(bodyIterable, deserializer);
+    }
+    serialize(input, serializer) {
+        return Readable.from(this.universalMarshaller.serialize(input, serializer));
+    }
+}
+const eventStreamSerdeProvider = (options) => new EventStreamMarshaller(options);
+async function* readableToIterable(readStream) {
+    let streamEnded = false;
+    let generationEnded = false;
+    const records = new Array();
+    readStream.on("error", (err) => {
+        if (!streamEnded) {
+            streamEnded = true;
+        }
+        if (err) {
+            throw err;
+        }
+    });
+    readStream.on("data", (data) => {
+        records.push(data);
+    });
+    readStream.on("end", () => {
+        streamEnded = true;
+    });
+    while (!generationEnded) {
+        const value = await new Promise((resolve) => setTimeout(() => resolve(records.shift()), 0));
+        if (value) {
+            yield value;
+        }
+        generationEnded = streamEnded && records.length === 0;
+    }
+}
+
 class EventStreamSerde {
     marshaller;
     serializer;
     deserializer;
     serdeContext;
     defaultContentType;
-    constructor({ marshaller, serializer, deserializer, serdeContext, defaultContentType, }) {
+    compositeErrorRegistry;
+    constructor({ marshaller, serializer, deserializer, serdeContext, defaultContentType, compositeErrorRegistry, }) {
         this.marshaller = marshaller;
         this.serializer = serializer;
         this.deserializer = deserializer;
         this.serdeContext = serdeContext;
         this.defaultContentType = defaultContentType;
+        this.compositeErrorRegistry = compositeErrorRegistry;
     }
-    async serializeEventStream({ eventStream, requestSchema, initialRequest, }) {
+    async serializeEventStream({ eventStream, requestSchema, initialRequest, initialMessageType, }) {
         const marshaller = this.marshaller;
         const eventStreamMember = requestSchema.getEventStreamMember();
         const unionSchema = requestSchema.getMemberSchema(eventStreamMember);
@@ -20110,7 +21801,7 @@ class EventStreamSerde {
             async *[Symbol.asyncIterator]() {
                 if (initialRequest) {
                     const headers = {
-                        ":event-type": { type: "string", value: "initial-request" },
+                        ":event-type": { type: "string", value: initialMessageType ?? "initial-request" },
                         ":message-type": { type: "string", value: "event" },
                         ":content-type": { type: "string", value: defaultContentType },
                     };
@@ -20134,9 +21825,15 @@ class EventStreamSerde {
                     body: event.body,
                 };
             }
-            const unionMember = Object.keys(event).find((key) => {
-                return key !== "__type";
-            }) ?? "";
+            let unionMember = "";
+            for (const key in event) {
+                if (!hasOwn(event, key))
+                    continue;
+                if (key !== "__type") {
+                    unionMember = key;
+                    break;
+                }
+            }
             const { additionalHeaders, body, eventType, explicitPayloadContentType } = this.writeEventBody(unionMember, unionSchema, event);
             const headers = {
                 ":event-type": { type: "string", value: eventType },
@@ -20150,18 +21847,24 @@ class EventStreamSerde {
             };
         });
     }
-    async deserializeEventStream({ response, responseSchema, initialResponseContainer, }) {
+    async deserializeEventStream({ response, responseSchema, initialResponseContainer, initialMessageType, }) {
         const marshaller = this.marshaller;
         const eventStreamMember = responseSchema.getEventStreamMember();
         const unionSchema = responseSchema.getMemberSchema(eventStreamMember);
         const memberSchemas = unionSchema.getMemberSchemas();
         const initialResponseMarker = Symbol("initialResponseMarker");
         const asyncIterable = marshaller.deserialize(response.body, async (event) => {
-            const unionMember = Object.keys(event).find((key) => {
-                return key !== "__type";
-            }) ?? "";
+            let unionMember = "";
+            for (const key in event) {
+                if (!hasOwn(event, key))
+                    continue;
+                if (key !== "__type") {
+                    unionMember = key;
+                    break;
+                }
+            }
             const body = event[unionMember].body;
-            if (unionMember === "initial-response") {
+            if (unionMember === (initialMessageType ?? "initial-response")) {
                 const dataObject = await this.deserializer.read(responseSchema, body);
                 delete dataObject[eventStreamMember];
                 return {
@@ -20182,7 +21885,7 @@ class EventStreamSerde {
                                 out[name] = body;
                             }
                             else if (member.isStringSchema()) {
-                                out[name] = (this.serdeContext?.utf8Encoder ?? toUtf8)(body);
+                                out[name] = (this.serdeContext?.utf8Encoder ?? toUtf8$2)(body);
                             }
                             else if (member.isStructSchema()) {
                                 out[name] = await this.deserializer.read(member, body);
@@ -20205,16 +21908,9 @@ class EventStreamSerde {
                             }
                         }
                     }
-                    if (hasBindings) {
-                        return {
-                            [unionMember]: out,
-                        };
-                    }
-                    if (body.byteLength === 0) {
-                        return {
-                            [unionMember]: {},
-                        };
-                    }
+                    return {
+                        [unionMember]: await this.readEventMember(eventStreamSchema, body, hasBindings, out),
+                    };
                 }
                 return {
                     [unionMember]: await this.deserializer.read(eventStreamSchema, body),
@@ -20235,8 +21931,10 @@ class EventStreamSerde {
             if (!responseSchema) {
                 throw new Error("@smithy::core/protocols - initial-response event encountered in event stream but no response schema given.");
             }
-            for (const [key, value] of Object.entries(firstEvent.value)) {
-                initialResponseContainer[key] = value;
+            for (const key in firstEvent.value) {
+                if (!hasOwn(firstEvent.value, key))
+                    continue;
+                initialResponseContainer[key] = firstEvent.value[key];
             }
         }
         return {
@@ -20253,6 +21951,33 @@ class EventStreamSerde {
                 }
             },
         };
+    }
+    async readEventMember(eventStreamSchema, body, hasBindings, out) {
+        let ErrCtor;
+        const staticStructuralSchema = eventStreamSchema.getSchema();
+        if (Array.isArray(staticStructuralSchema) && staticStructuralSchema[0] === -3) {
+            const namespace = staticStructuralSchema[1];
+            const nsRegistry = TypeRegistry.for(namespace);
+            this.compositeErrorRegistry?.copyFrom(nsRegistry);
+            ErrCtor = (this.compositeErrorRegistry ?? nsRegistry)?.getErrorCtor(staticStructuralSchema);
+        }
+        const dataObject = hasBindings
+            ? out
+            : body.byteLength === 0
+                ? {}
+                : await this.deserializer.read(eventStreamSchema, body);
+        if (ErrCtor) {
+            const message = dataObject.message ?? dataObject.Message ?? "Unknown";
+            const metadata = {};
+            const $fault = eventStreamSchema.getMergedTraits().error;
+            if ($fault) {
+                metadata.$fault = $fault;
+            }
+            return Object.assign(new ErrCtor({}), metadata, {
+                message,
+            }, dataObject);
+        }
+        return dataObject;
     }
     writeEventBody(unionMember, unionSchema, event) {
         const serializer = this.serializer;
@@ -20320,13 +22045,16 @@ class EventStreamSerde {
                     serializer.write(eventSchema, event[unionMember]);
                 }
             }
+            else if (eventSchema.isUnitSchema()) {
+                serializer.write(eventSchema, {});
+            }
             else {
                 throw new Error("@smithy/core/event-streams - non-struct member not supported in event stream union.");
             }
         }
-        const messageSerialization = serializer.flush();
+        const messageSerialization = serializer.flush() ?? new Uint8Array();
         const body = typeof messageSerialization === "string"
-            ? (this.serdeContext?.utf8Decoder ?? fromUtf8$2)(messageSerialization)
+            ? (this.serdeContext?.utf8Decoder ?? fromUtf8$4)(messageSerialization)
             : messageSerialization;
         return {
             body,
@@ -20339,7 +22067,19 @@ class EventStreamSerde {
 
 var index$9 = /*#__PURE__*/Object.freeze({
     __proto__: null,
-    EventStreamSerde: EventStreamSerde
+    EventStreamCodec: EventStreamCodec,
+    EventStreamMarshaller: EventStreamMarshaller,
+    EventStreamSerde: EventStreamSerde,
+    HeaderMarshaller: HeaderMarshaller,
+    Int64: Int64,
+    MessageDecoderStream: MessageDecoderStream,
+    MessageEncoderStream: MessageEncoderStream,
+    SmithyMessageDecoderStream: SmithyMessageDecoderStream,
+    SmithyMessageEncoderStream: SmithyMessageEncoderStream,
+    UniversalEventStreamMarshaller: EventStreamMarshaller$1,
+    eventStreamSerdeProvider: eventStreamSerdeProvider,
+    getChunkedStream: getChunkedStream,
+    getMessageUnmarshaller: getMessageUnmarshaller
 });
 
 function httpRequest(options) {
@@ -20751,7 +22491,7 @@ const checkUrl = (url, logger) => {
 };
 
 function createGetRequest(url) {
-    return new HttpRequest({
+    return new HttpRequest$1({
         protocol: url.protocol,
         hostname: url.hostname,
         port: Number(url.port),
@@ -21451,10 +23191,10 @@ class LoginCredentialsFetcher {
         await promises$1.writeFile(tokenFilePath, JSON.stringify(token, null, 2), "utf8");
     }
     getTokenFilePath() {
-        const directory = process.env.AWS_LOGIN_CACHE_DIRECTORY ?? join$1(homedir$1(), ".aws", "login", "cache");
+        const directory = process.env.AWS_LOGIN_CACHE_DIRECTORY ?? join(homedir(), ".aws", "login", "cache");
         const loginSessionBytes = Buffer.from(this.loginSession, "utf8");
         const loginSessionSha256 = createHash$1("sha256").update(loginSessionBytes).digest("hex");
-        return join$1(directory, `${loginSessionSha256}.json`);
+        return join(directory, `${loginSessionSha256}.json`);
     }
     derToRawSignature(derSignature) {
         let offset = 2;
@@ -21479,7 +23219,7 @@ class LoginCredentialsFetcher {
     }
     createDPoPInterceptor(middlewareStack) {
         middlewareStack.add((next) => async (args) => {
-            if (HttpRequest.isInstance(args.request)) {
+            if (HttpRequest$1.isInstance(args.request)) {
                 const request = args.request;
                 const actualEndpoint = `${request.protocol}//${request.hostname}${request.port ? `:${request.port}` : ""}${request.path}`;
                 const dpop = await this.generateDpop(request.method, actualEndpoint);
@@ -21813,7 +23553,7 @@ var index$3 = /*#__PURE__*/Object.freeze({
 const defaultSSOOIDCHttpAuthSchemeParametersProvider = async (config, context, input) => {
     return {
         operation: getSmithyContext(context).operation,
-        region: (await normalizeProvider$1(config.region)()) ||
+        region: (await normalizeProvider(config.region)()) ||
             (() => {
                 throw new Error("expected `region` to be configured for `aws.auth#sigv4`");
             })(),
@@ -21855,7 +23595,7 @@ const defaultSSOOIDCHttpAuthSchemeProvider = (authParameters) => {
 const resolveHttpAuthSchemeConfig$3 = (config) => {
     const config_0 = resolveAwsSdkSigV4Config(config);
     return Object.assign(config_0, {
-        authSchemePreference: normalizeProvider$1(config.authSchemePreference ?? []),
+        authSchemePreference: normalizeProvider(config.authSchemePreference ?? []),
     });
 };
 
@@ -22566,7 +24306,7 @@ var index$2 = /*#__PURE__*/Object.freeze({
 const defaultSSOHttpAuthSchemeParametersProvider = async (config, context, input) => {
     return {
         operation: getSmithyContext(context).operation,
-        region: await normalizeProvider$1(config.region)() || (() => {
+        region: await normalizeProvider(config.region)() || (() => {
             throw new Error("expected `region` to be configured for `aws.auth#sigv4`");
         })(),
     };
@@ -22623,7 +24363,7 @@ const defaultSSOHttpAuthSchemeProvider = (authParameters) => {
 const resolveHttpAuthSchemeConfig$2 = (config) => {
     const config_0 = resolveAwsSdkSigV4Config(config);
     return Object.assign(config_0, {
-        authSchemePreference: normalizeProvider$1(config.authSchemePreference ?? []),
+        authSchemePreference: normalizeProvider(config.authSchemePreference ?? []),
     });
 };
 
@@ -23081,7 +24821,7 @@ var loadSso = /*#__PURE__*/Object.freeze({
 const defaultSTSHttpAuthSchemeParametersProvider = async (config, context, input) => {
     return {
         operation: getSmithyContext(context).operation,
-        region: (await normalizeProvider$1(config.region)()) ||
+        region: (await normalizeProvider(config.region)()) ||
             (() => {
                 throw new Error("expected `region` to be configured for `aws.auth#sigv4`");
             })(),
@@ -23127,7 +24867,7 @@ const resolveHttpAuthSchemeConfig$1 = (config) => {
     const config_0 = resolveStsAuthConfig(config);
     const config_1 = resolveAwsSdkSigV4Config(config_0);
     return Object.assign(config_1, {
-        authSchemePreference: normalizeProvider$1(config.authSchemePreference ?? []),
+        authSchemePreference: normalizeProvider(config.authSchemePreference ?? []),
     });
 };
 
@@ -23796,7 +25536,7 @@ var index$1 = /*#__PURE__*/Object.freeze({
 const defaultSigninHttpAuthSchemeParametersProvider = async (config, context, input) => {
     return {
         operation: getSmithyContext(context).operation,
-        region: (await normalizeProvider$1(config.region)()) ||
+        region: (await normalizeProvider(config.region)()) ||
             (() => {
                 throw new Error("expected `region` to be configured for `aws.auth#sigv4`");
             })(),
@@ -23838,7 +25578,7 @@ const defaultSigninHttpAuthSchemeProvider = (authParameters) => {
 const resolveHttpAuthSchemeConfig = (config) => {
     const config_0 = resolveAwsSdkSigV4Config(config);
     return Object.assign(config_0, {
-        authSchemePreference: normalizeProvider$1(config.authSchemePreference ?? []),
+        authSchemePreference: normalizeProvider(config.authSchemePreference ?? []),
     });
 };
 
