@@ -20324,6 +20324,66 @@ async function grabFrameWithFallback(args) {
   }
 }
 
+function parseList(value) {
+  return String(value ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+}
+function getFileFilterConfig(env) {
+  const storages = parseList(env["THUMBNAILS_STORAGES"]);
+  return {
+    storages: storages.length > 0 ? storages : null,
+    skipFolders: parseList(env["THUMBNAILS_SKIP_FOLDERS"])
+  };
+}
+function isFilterEnabled(cfg) {
+  return cfg.storages !== null || cfg.skipFolders.length > 0;
+}
+const FOLDER_CACHE_TTL_MS = 3e4;
+let folderCache = null;
+async function resolveSkippedFolders(database, roots) {
+  if (roots.length === 0)
+    return /* @__PURE__ */ new Set();
+  const key = roots.join(",");
+  if (folderCache && folderCache.key === key && Date.now() - folderCache.at < FOLDER_CACHE_TTL_MS) {
+    return folderCache.ids;
+  }
+  const all = new Set(roots);
+  let frontier = [...roots];
+  while (frontier.length > 0) {
+    const children = await database("directus_folders").whereIn("parent", frontier).select("id");
+    frontier = [];
+    for (const c of children) {
+      if (!all.has(c.id)) {
+        all.add(c.id);
+        frontier.push(c.id);
+      }
+    }
+  }
+  folderCache = { key, at: Date.now(), ids: all };
+  return all;
+}
+async function getSkipReason(database, env, file) {
+  const cfg = getFileFilterConfig(env);
+  if (!isFilterEnabled(cfg))
+    return null;
+  let { storage, folder } = file;
+  if (storage === void 0 || folder === void 0) {
+    const row = await database("directus_files").where("id", file.id).select("storage", "folder").first();
+    if (storage === void 0)
+      storage = row?.storage;
+    if (folder === void 0)
+      folder = row?.folder;
+  }
+  if (cfg.storages && !(storage && cfg.storages.includes(storage))) {
+    return "storage";
+  }
+  if (cfg.skipFolders.length > 0 && folder) {
+    const skipped = await resolveSkippedFolders(database, cfg.skipFolders);
+    if (skipped.has(folder))
+      return "folder";
+  }
+  return null;
+}
+
 const oldFileDataCache = /* @__PURE__ */ new Map();
 function cacheOldFileData(fileId, data) {
   oldFileDataCache.set(fileId, data);
@@ -20337,6 +20397,13 @@ function popOldFileData(fileId) {
 }
 async function generateThumbnailsForFile(file, context, options = {}) {
   const { database, env, logger, services, getSchema } = context;
+  const skipReason = await getSkipReason(database, env, file);
+  if (skipReason) {
+    if (env["THUMBNAILS_VERBOSE"] === "true") {
+      logger.info(`[thumbnails] Skipped by ${skipReason} filter: ${file.id}`);
+    }
+    return { generated: 0, skipped: 0, skippedByStorage: 1 };
+  }
   if (isVideo(file.type)) {
     if (!getVideoConfig(env).enabled) {
       return { generated: 0, skipped: 0 };
@@ -20404,7 +20471,7 @@ function createUploadHandler(context) {
       const file = { ...payload, id: key };
       const result = isVideo(file.type) ? await generateThumbnailsForFile(file, context) : await withRetry(() => generateThumbnailsForFile(file, context));
       logger.info(
-        `[thumbnails] Completed: ${payload.filename_disk} (generated: ${result.generated}, skipped: ${result.skipped})`
+        `[thumbnails] Completed: ${payload.filename_disk} (generated: ${result.generated}, skipped: ${result.skipped}, skippedByStorage: ${result.skippedByStorage ?? 0})`
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -20634,6 +20701,7 @@ function registerRegenerateEndpoint(router, context) {
         total: totalFiles,
         generated: 0,
         skipped: 0,
+        skippedByStorage: 0,
         errors: 0,
         percent: 0
       },
@@ -20746,7 +20814,7 @@ function registerRegenerateEndpoint(router, context) {
     let hasMore = true;
     try {
       while (hasMore && !signal.aborted) {
-        let query = database2("directus_files").select("id", "filename_disk", "filename_download", "type").where(function() {
+        let query = database2("directus_files").select("id", "filename_disk", "filename_download", "type", "storage", "folder").where(function() {
           this.where("type", "like", "image/%");
           if (includeVideo)
             this.orWhere("type", "like", "video/%");
@@ -20772,7 +20840,9 @@ function registerRegenerateEndpoint(router, context) {
                       id: file.id,
                       filename_disk: file.filename_disk,
                       filename_download: file.filename_download,
-                      type: file.type
+                      type: file.type,
+                      storage: file.storage ?? null,
+                      folder: file.folder ?? null
                     },
                     ctx,
                     { force, presets }
@@ -20792,6 +20862,7 @@ function registerRegenerateEndpoint(router, context) {
               if (success && result) {
                 currentJob.progress.generated += result.generated;
                 currentJob.progress.skipped += result.skipped;
+                currentJob.progress.skippedByStorage += result.skippedByStorage ?? 0;
                 if (result.errors) {
                   currentJob.progress.errors++;
                   currentJob.failed.push({ id: file.id, error: "video poster failed (see server log)" });
@@ -20816,7 +20887,7 @@ function registerRegenerateEndpoint(router, context) {
         currentJob.status = "completed";
         currentJob.completedAt = /* @__PURE__ */ new Date();
         logger.info(
-          `[thumbnails] Job ${currentJob.id} completed: ${currentJob.progress.processed} files, ${currentJob.progress.generated} generated, ${currentJob.progress.errors} errors`
+          `[thumbnails] Job ${currentJob.id} completed: ${currentJob.progress.processed} files, ${currentJob.progress.generated} generated, ${currentJob.progress.skippedByStorage} skipped by filter, ${currentJob.progress.errors} errors`
         );
       }
     } catch (error) {
