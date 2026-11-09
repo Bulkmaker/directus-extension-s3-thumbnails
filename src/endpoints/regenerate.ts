@@ -30,6 +30,7 @@ interface JobProgress {
 	total: number;
 	generated: number;
 	skipped: number;
+	skippedByStorage: number;
 	errors: number;
 	percent: number;
 }
@@ -123,6 +124,7 @@ export function registerRegenerateEndpoint(router: Router, context: HookContext)
 				total: totalFiles,
 				generated: 0,
 				skipped: 0,
+				skippedByStorage: 0,
 				errors: 0,
 				percent: 0,
 			},
@@ -264,7 +266,7 @@ export function registerRegenerateEndpoint(router: Router, context: HookContext)
 			while (hasMore && !signal.aborted) {
 				// Fetch page of files
 				let query = database('directus_files')
-					.select('id', 'filename_disk', 'filename_download', 'type')
+					.select('id', 'filename_disk', 'filename_download', 'type', 'storage', 'folder')
 					.where(function () {
 						this.where('type', 'like', 'image/%');
 						if (includeVideo) this.orWhere('type', 'like', 'video/%');
@@ -302,6 +304,8 @@ export function registerRegenerateEndpoint(router: Router, context: HookContext)
 												filename_disk: file.filename_disk,
 												filename_download: file.filename_download,
 												type: file.type,
+												storage: file.storage ?? null,
+												folder: file.folder ?? null,
 											},
 											ctx,
 											{ force, presets }
@@ -325,6 +329,7 @@ export function registerRegenerateEndpoint(router: Router, context: HookContext)
 							if (success && result) {
 								currentJob!.progress.generated += result.generated;
 								currentJob!.progress.skipped += result.skipped;
+								currentJob!.progress.skippedByStorage += result.skippedByStorage ?? 0;
 								// видео-постер: ошибка ffmpeg не бросает, а возвращается счётчиком
 								if (result.errors) {
 									currentJob!.progress.errors++;
@@ -357,7 +362,7 @@ export function registerRegenerateEndpoint(router: Router, context: HookContext)
 
 				logger.info(
 					`[thumbnails] Job ${currentJob.id} completed: ${currentJob.progress.processed} files, ` +
-					`${currentJob.progress.generated} generated, ${currentJob.progress.errors} errors`
+					`${currentJob.progress.generated} generated, ${currentJob.progress.skippedByStorage} skipped by filter, ${currentJob.progress.errors} errors`
 				);
 			}
 		} catch (error: unknown) {

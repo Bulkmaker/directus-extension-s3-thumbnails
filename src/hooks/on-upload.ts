@@ -5,6 +5,7 @@ import { createS3Client, uploadToS3, existsInS3, withRetry, deleteS3Prefix } fro
 import { generateThumbnail } from '../services/thumbnail.js';
 import { ensurePresetConfigSaved } from '../services/preset-sync.js';
 import { generateVideoPostersForFile } from '../services/video-poster.js';
+import { getSkipReason } from '../utils/file-filter.js';
 
 // Cache for old file data between filter and action hooks
 // Key: fileId, Value: { filename_disk, type }
@@ -33,6 +34,8 @@ interface FilePayload {
 	filename_disk: string;
 	filename_download: string;
 	type: string;
+	storage?: string | null;
+	folder?: string | null;
 	[key: string]: unknown;
 }
 
@@ -57,8 +60,17 @@ export async function generateThumbnailsForFile(
 	file: FilePayload,
 	context: HookContext,
 	options: { force?: boolean; presets?: ThumbnailPreset[] } = {}
-): Promise<{ generated: number; skipped: number; errors?: number }> {
+): Promise<{ generated: number; skipped: number; errors?: number; skippedByStorage?: number }> {
 	const { database, env, logger, services, getSchema } = context;
+
+	// Фильтр по локации хранения / папкам (THUMBNAILS_STORAGES, THUMBNAILS_SKIP_FOLDERS)
+	const skipReason = await getSkipReason(database, env, file);
+	if (skipReason) {
+		if (env['THUMBNAILS_VERBOSE'] === 'true') {
+			logger.info(`[thumbnails] Skipped by ${skipReason} filter: ${file.id}`);
+		}
+		return { generated: 0, skipped: 0, skippedByStorage: 1 };
+	}
 
 	// Видео: постер ffmpeg-кадром (только при THUMBNAILS_VIDEO_POSTERS=true)
 	if (isVideo(file.type)) {
@@ -165,7 +177,7 @@ export function createUploadHandler(context: HookContext) {
 				: await withRetry(() => generateThumbnailsForFile(file, context));
 
 			logger.info(
-				`[thumbnails] Completed: ${payload.filename_disk} (generated: ${result.generated}, skipped: ${result.skipped})`
+				`[thumbnails] Completed: ${payload.filename_disk} (generated: ${result.generated}, skipped: ${result.skipped}, skippedByStorage: ${result.skippedByStorage ?? 0})`
 			);
 		} catch (error: unknown) {
 			const message = error instanceof Error ? error.message : String(error);
