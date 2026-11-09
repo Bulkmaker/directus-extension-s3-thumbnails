@@ -1,6 +1,6 @@
 {
   "name": "directus-extension-s3-thumbnails",
-  "version": "0.5.0",
+  "version": "0.6.1",
   "description": "Auto-generate image thumbnails on upload and store them in S3 for static site generation. Serve images directly from S3 without Directus.",
   "icon": "photo_size_select_large",
   "keywords": [
